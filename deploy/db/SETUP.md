@@ -41,6 +41,9 @@ docker exec -i investplatform-mysql mysql --default-character-set=utf8mb4 \
 # 4g) 独立开发者角色(仅 feedback.annotate);账号在 setup_accounts.py 里建。见 docs/DEVELOPER-ACCOUNT.md
 docker exec -i investplatform-mysql mysql --default-character-set=utf8mb4 \
   -uroot -p"$PASS" capitalos < db/patch_developer_role.sql
+# 4h) 演示数据打磨:修正不真实的种子值(Growth Fund I 净资产 12.3万→16.8亿)
+docker exec -i investplatform-mysql mysql --default-character-set=utf8mb4 \
+  -uroot -p"$PASS" capitalos < db/patch_demo_polish.sql
 
 # 5) 账户与演示数据(bcrypt 口令 + demo.user;可选第二租户)
 cd backend && . .venv/bin/activate && pip install -r requirements.txt

@@ -647,4 +647,17 @@ export const dashboardMetrics = [
 
 export const stageNames = ['入库', '立项', 'TS', '尽调', '内审', '投决', '投资协议', '打款', '投后服务']
 
+// 工作台「项目阶段分布」漏斗(概览统计,比按 mock 逐条 count 更真实:早期宽、末期是累计投后)。
+export const pipelineDistribution: Array<{ stage: string; count: number }> = [
+  { stage: '入库', count: 24 },
+  { stage: '立项', count: 17 },
+  { stage: 'TS', count: 13 },
+  { stage: '尽调', count: 11 },
+  { stage: '内审', count: 7 },
+  { stage: '投决', count: 5 },
+  { stage: '投资协议', count: 4 },
+  { stage: '打款', count: 3 },
+  { stage: '投后服务', count: 21 },
+]
+
 export const chartSeries = [42, 64, 58, 82, 73, 91, 76, 88, 96, 84, 102, 118]

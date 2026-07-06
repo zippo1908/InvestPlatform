@@ -54,6 +54,7 @@ import {
   managementOrgs,
   messages,
   permissions,
+  pipelineDistribution,
   postDataRows,
   projects,
   researchRows,
@@ -1076,10 +1077,8 @@ function PageRenderer({
 }
 
 function DashboardPage({ onToast }: { onToast: (toast: Toast) => void }) {
-  const stageCounts = stageNames.map((stage) => ({
-    stage,
-    count: projects.filter((project) => project.stage === stage).length,
-  }))
+  const stageCounts = pipelineDistribution
+  const maxCount = Math.max(1, ...stageCounts.map((s) => s.count))
   // 柱状图入场:柱子从底部 scaleY 0→1 依次长出(GSAP)。
   const chartRef = useRef<HTMLDivElement>(null)
   useLayoutEffect(() => {
@@ -1117,11 +1116,11 @@ function DashboardPage({ onToast }: { onToast: (toast: Toast) => void }) {
           }
         />
         <div className="pipeline-chart" ref={chartRef}>
-          {stageCounts.map((item, index) => (
+          {stageCounts.map((item) => (
             <div className="pipeline-bar" key={item.stage}>
               <span>{item.stage}</span>
               <div>
-                <i style={{ height: `${22 + item.count * 28 + index * 2}px` }} />
+                <i style={{ height: `${Math.round(20 + (item.count / maxCount) * 130)}px` }} />
               </div>
               <strong>{item.count}</strong>
             </div>
