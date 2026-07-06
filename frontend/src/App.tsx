@@ -224,6 +224,25 @@ function goTo(id: string) {
   window.location.hash = `/${id}`
 }
 
+// 带实体 id 的导航(如从列表行打开某条记录的详情):#/screen?id=5
+function goToEntity(screenId: string, entityId: number) {
+  window.location.hash = `/${screenId}?id=${entityId}`
+}
+
+// 从当前 hash 读 ?id=(detail 屏用它预选实体)
+function readRouteId(): number | null {
+  const q = window.location.hash.split('?')[1]
+  if (!q) return null
+  const m = new URLSearchParams(q).get('id')
+  return m ? Number(m) : null
+}
+
+// 列表屏 → 对应详情屏(用于行点击打开)
+const LIST_DETAIL_TARGET: Record<string, string> = {
+  'project-list': 'project-detail-overview',
+  'fund-list': 'fund-detail-overview',
+}
+
 function classNames(...parts: Array<string | false | undefined>) {
   return parts.filter(Boolean).join(' ')
 }
@@ -1488,11 +1507,17 @@ function DetailPage({
   const nameKey = fields[0].key
 
   const [entities, setEntities] = useState<Array<Record<string, unknown>>>([])
-  const [selectedId, setSelectedId] = useState<number | null>(null)
+  const [selectedId, setSelectedId] = useState<number | null>(() => readRouteId()) // 支持从列表行 ?id= 预选
   const [form, setForm] = useState<Record<string, string>>({})
   const [loadedAt, setLoadedAt] = useState<string | null>(null) // 乐观锁:加载时的 updated_at
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
+
+  // 路由带 ?id= 时预选该实体(从列表行「打开」进来)。
+  useEffect(() => {
+    const urlId = readRouteId()
+    if (urlId != null) setSelectedId(urlId)
+  }, [screen.id])
 
   // 载入实体列表(供选择)。
   useEffect(() => {
@@ -1555,6 +1580,23 @@ function DetailPage({
     }
   }
 
+  const advance = async () => {
+    if (selectedId == null) return
+    setSaving(true)
+    try {
+      const result = await apiPost<{ stage?: string }>(`${listPath}/${selectedId}/advance`)
+      onToast({ title: `阶段已推进${result.stage ? ' → ' + result.stage : ''}`, detail: auditDetail(result), action: 'project.advance', entity: 'cap_projects', result })
+      // 重取详情反映新阶段
+      const d = await apiGet<Record<string, unknown>>(`${listPath}/${selectedId}`)
+      setForm((prev) => ({ ...prev, stage_label: d.stage_label ? String(d.stage_label) : prev.stage_label }))
+      setLoadedAt(d.updated_at ? String(d.updated_at) : null)
+    } catch (error) {
+      onToast({ title: '推进失败', detail: error instanceof Error ? error.message : 'API 调用失败' })
+    } finally {
+      setSaving(false)
+    }
+  }
+
   const del = async () => {
     if (selectedId == null) return
     const label = form[nameKey] || `#${selectedId}`
@@ -1600,6 +1642,18 @@ function DetailPage({
               ))}
             </select>
           </label>
+          {kind === 'project' && (
+            <button
+              type="button"
+              className="secondary-button"
+              disabled={!canWrite || saving || selectedId == null}
+              data-testid="detail-advance"
+              onClick={advance}
+            >
+              <GitBranch size={16} />
+              推进阶段
+            </button>
+          )}
           <button
             type="button"
             className="danger-button"
@@ -2257,7 +2311,10 @@ function ListPage({
         <PanelTitle icon={ListIcon(screen.id)} title={`${screen.title}台账`} />
         <DataSourceBadge source={source} />
         <ListControls canWrite={canWrite} onToast={onToast} screen={screen} onImported={() => { setPage(1); setReloadKey((k) => k + 1) }} />
-        <DataTable rows={rows} />
+        <DataTable
+          rows={rows}
+          onRowOpen={LIST_DETAIL_TARGET[screen.id] ? (id) => goToEntity(LIST_DETAIL_TARGET[screen.id], id) : undefined}
+        />
         {totalPages != null && (
           <div className="pager" data-testid="pager">
             <span className="pager-info">共 {total} 条 · 第 {page}/{totalPages} 页</span>
@@ -2404,12 +2461,13 @@ function ListControls({
   )
 }
 
-function DataTable({ rows, compact = false }: { rows: DataRow[]; compact?: boolean }) {
+function DataTable({ rows, compact = false, onRowOpen }: { rows: DataRow[]; compact?: boolean; onRowOpen?: (id: number) => void }) {
   const [query, setQuery] = useState('')
   const [selected, setSelected] = useState<Set<number>>(new Set())
   const columns = Object.keys(rows[0] ?? {}).filter((c) => !c.startsWith('__')) // __ 前缀为隐藏元数据(如 __id)
   const filtered = rows.filter((row) => Object.values(row).join(' ').toLowerCase().includes(query.toLowerCase()))
   const allSelected = filtered.length > 0 && filtered.every((_, index) => selected.has(index))
+  const canOpen = !!onRowOpen && rows.some((r) => r['__id'] != null && r['__id'] !== '')
 
   return (
     <div className={classNames('table-wrap', compact && 'is-compact')} data-testid="records-table">
@@ -2450,6 +2508,7 @@ function DataTable({ rows, compact = false }: { rows: DataRow[]; compact?: boole
             {columns.map((column) => (
               <th key={column}>{column}</th>
             ))}
+            {canOpen && <th>操作</th>}
           </tr>
         </thead>
         <tbody>
@@ -2479,11 +2538,20 @@ function DataTable({ rows, compact = false }: { rows: DataRow[]; compact?: boole
                   )}
                 </td>
               ))}
+              {canOpen && (
+                <td>
+                  {row['__id'] != null && row['__id'] !== '' ? (
+                    <button type="button" className="link-button" onClick={() => onRowOpen?.(Number(row['__id']))}>
+                      打开 <ChevronRight size={14} />
+                    </button>
+                  ) : null}
+                </td>
+              )}
             </tr>
           ))}
           {filtered.length === 0 && (
             <tr>
-              <td colSpan={columns.length + (compact ? 0 : 1)}>
+              <td colSpan={columns.length + (compact ? 0 : 1) + (canOpen ? 1 : 0)}>
                 <div className="empty-state">暂无匹配记录，清空筛选后重试。</div>
               </td>
             </tr>

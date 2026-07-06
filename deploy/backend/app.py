@@ -4,7 +4,7 @@ import csv
 import io
 import os
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from json import dumps
 from typing import Any
 
@@ -283,7 +283,7 @@ LEDGER_QUERIES: dict[str, str] = {
         ORDER BY message_id DESC
         """,
     "project-list": """
-        SELECT p.short_name AS '项目名称', p.stage_label AS '阶段', p.opportunity_status AS '状态',
+        SELECT p.project_id AS '__id', p.short_name AS '项目名称', p.stage_label AS '阶段', p.opportunity_status AS '状态',
                COALESCE(u.display_name, '-') AS '负责人', p.city AS '城市',
                p.industry_group AS '行业方向', p.updated_at AS '更新时间'
         FROM cap_projects p
@@ -292,7 +292,7 @@ LEDGER_QUERIES: dict[str, str] = {
         ORDER BY p.project_id DESC
         """,
     "fund-list": """
-        SELECT f.fund_name AS '基金简称', f.fund_status AS '状态', f.raise_method AS '募集方式',
+        SELECT f.fund_id AS '__id', f.fund_name AS '基金简称', f.fund_status AS '状态', f.raise_method AS '募集方式',
                f.committed_size AS '认缴规模', f.paid_in_size AS '实缴总额',
                f.net_asset_value AS '净资产', f.unit_nav AS '单位净值',
                COALESCE(m.org_name, '-') AS '管理人'
@@ -391,7 +391,7 @@ LEDGER_QUERIES: dict[str, str] = {
         ORDER BY entity_type, display_order
         """,
     "recycle-bin": """
-        SELECT object_label AS '对象', object_type AS '类型', delete_reason AS '删除原因',
+        SELECT recycle_item_id AS '__id', object_label AS '对象', object_type AS '类型', delete_reason AS '删除原因',
                purge_status AS '状态', deleted_at AS '删除时间',
                recoverable_until AS '保留到期'
         FROM cap_recycle_items
@@ -1195,6 +1195,42 @@ def update_project(
     return {"ok": True, "project_id": project_id, "updated_fields": list(fields), "audit_id": audit_id}
 
 
+def _soft_delete(cursor, *, table: str, id_col: str, obj_type: str, obj_id: int, label: str, user: "AuthedUser") -> None:
+    """软删除:置 deleted_at + 写回收站行(可 30 天内恢复)。"""
+    now = datetime.now()
+    tid = tenant_of(user)
+    cursor.execute(f"UPDATE {table} SET deleted_at=%s WHERE {id_col}=%s AND tenant_id=%s", (now, obj_id, tid))
+    cursor.execute(
+        """
+        INSERT INTO cap_recycle_items
+          (object_type, object_id, object_label, purge_status, deleted_by, deleted_at, recoverable_until, tenant_id)
+        VALUES (%s, %s, %s, 'recoverable', %s, %s, %s, %s)
+        """,
+        (obj_type, obj_id, label, user.user_id, now, now + timedelta(days=30), tid),
+    )
+
+
+@app.delete("/api/projects/{project_id}")
+def delete_project(project_id: int, user: AuthedUser = Depends(require_permission("project.edit"))) -> dict[str, Any]:
+    """软删除项目 → 进回收站(租户内 + project.edit)。"""
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT short_name FROM cap_projects WHERE project_id=%s AND tenant_id=%s AND deleted_at IS NULL",
+                (project_id, tenant_of(user)),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail="Project not found")
+            _soft_delete(cursor, table="cap_projects", id_col="project_id", obj_type="project", obj_id=project_id, label=row["short_name"], user=user)
+            audit_id = write_audit(cursor, user.user_id, "project.delete", "project", project_id, row["short_name"], risk_level="high")
+        connection.commit()
+    finally:
+        connection.close()
+    return {"ok": True, "project_id": project_id, "audit_id": audit_id}
+
+
 @app.get("/api/funds")
 def list_funds(user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
     connection = connect_db()
@@ -1287,6 +1323,27 @@ def update_fund(
     finally:
         connection.close()
     return {"ok": True, "fund_id": fund_id, "updated_fields": list(fields), "audit_id": audit_id}
+
+
+@app.delete("/api/funds/{fund_id}")
+def delete_fund(fund_id: int, user: AuthedUser = Depends(require_roles("system_admin", "managing_partner", "fund_operator"))) -> dict[str, Any]:
+    """软删除基金 → 进回收站。"""
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT fund_name FROM cap_funds WHERE fund_id=%s AND tenant_id=%s AND deleted_at IS NULL",
+                (fund_id, tenant_of(user)),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail="Fund not found")
+            _soft_delete(cursor, table="cap_funds", id_col="fund_id", obj_type="fund", obj_id=fund_id, label=row["fund_name"], user=user)
+            audit_id = write_audit(cursor, user.user_id, "fund.delete", "fund", fund_id, row["fund_name"], risk_level="high")
+        connection.commit()
+    finally:
+        connection.close()
+    return {"ok": True, "fund_id": fund_id, "audit_id": audit_id}
 
 
 @app.get("/api/risks")
@@ -1535,18 +1592,24 @@ def create_import_export_task(payload: ImportExportPayload, user: AuthedUser = D
     return {"ok": True, "task_id": task_id, "audit_id": audit_id}
 
 
+_RECYCLE_TABLES = {"project": ("cap_projects", "project_id"), "fund": ("cap_funds", "fund_id")}
+
+
 @app.post("/api/recycle/{recycle_item_id}/restore")
-def restore_recycle_item(recycle_item_id: int, user: AuthedUser = Depends(require_permission("system.manage"))) -> dict[str, Any]:
+def restore_recycle_item(recycle_item_id: int, user: AuthedUser = Depends(require_roles("system_admin", "managing_partner"))) -> dict[str, Any]:
+    """恢复回收站条目:标记 restored 并把对应实体 deleted_at 置空(真回滚软删除)。"""
     connection = connect_db()
     try:
         with connection.cursor() as cursor:
             cursor.execute(
-                "SELECT object_label, purge_status FROM cap_recycle_items WHERE recycle_item_id=%s AND tenant_id=%s",
+                "SELECT object_label, object_type, object_id, purge_status FROM cap_recycle_items WHERE recycle_item_id=%s AND tenant_id=%s",
                 (recycle_item_id, tenant_of(user)),
             )
             row = cursor.fetchone()
             if row is None:
                 raise HTTPException(status_code=404, detail="Recycle item not found")
+            if row["purge_status"] != "recoverable":
+                raise HTTPException(status_code=409, detail="该条目不可恢复(已恢复或已彻底删除)")
             cursor.execute(
                 """
                 UPDATE cap_recycle_items
@@ -1555,6 +1618,12 @@ def restore_recycle_item(recycle_item_id: int, user: AuthedUser = Depends(requir
                 """,
                 (user.user_id, datetime.now(), recycle_item_id, tenant_of(user)),
             )
+            tbl = _RECYCLE_TABLES.get(row["object_type"])
+            if tbl:
+                cursor.execute(
+                    f"UPDATE {tbl[0]} SET deleted_at=NULL WHERE {tbl[1]}=%s AND tenant_id=%s",
+                    (row["object_id"], tenant_of(user)),
+                )
             audit_id = write_audit(
                 cursor,
                 user.user_id,
