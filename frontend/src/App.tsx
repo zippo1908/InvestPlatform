@@ -26,6 +26,7 @@ import {
   LogOut,
   Menu,
   MessageSquare,
+  Palette,
   Plus,
   Search,
   Send,
@@ -402,7 +403,7 @@ function FeedbackWidget({ onToast }: { onToast: (t: Toast) => void }) {
     const onMove = (e: MouseEvent) => {
       const t = e.target as HTMLElement
       if (!t || t.closest('.fb-widget')) return
-      if (hovered !== t) { clear(); hovered = t; t.style.outline = '2px solid #0f766e'; t.style.outlineOffset = '1px' }
+      if (hovered !== t) { clear(); hovered = t; t.style.outline = '2px solid var(--accent)'; t.style.outlineOffset = '1px' }
     }
     const onClick = (e: MouseEvent) => {
       const t = e.target as HTMLElement
@@ -570,6 +571,32 @@ function FeedbackWidget({ onToast }: { onToast: (t: Toast) => void }) {
   )
 }
 
+// 主题:模块加载时同步套用已存主题,避免首屏闪一下默认色。
+if (typeof document !== 'undefined') {
+  const saved = localStorage.getItem('capitalos-theme')
+  if (saved) document.documentElement.setAttribute('data-theme', saved)
+}
+
+// 品牌标识:随主题变色的渐变徽标(上升柱=资本/增长)。
+function BrandMark() {
+  return (
+    <span className="brand-mark" aria-hidden="true">
+      <svg viewBox="0 0 32 32" width="32" height="32">
+        <defs>
+          <linearGradient id="bm-g" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0" stopColor="var(--accent)" />
+            <stop offset="1" stopColor="var(--accent-2)" />
+          </linearGradient>
+        </defs>
+        <rect width="32" height="32" rx="8" fill="url(#bm-g)" />
+        <rect x="8" y="17" width="3.6" height="7" rx="1.2" fill="#fff" opacity="0.82" />
+        <rect x="14.2" y="13" width="3.6" height="11" rx="1.2" fill="#fff" opacity="0.92" />
+        <rect x="20.4" y="9" width="3.6" height="15" rx="1.2" fill="#fff" />
+      </svg>
+    </span>
+  )
+}
+
 // 全局命令面板(Cmd/Ctrl+K):搜页面 + 项目/基金/投资人,键盘上下选择、回车跳转。
 type CmdItem = { type: string; label: string; sub: string; run: () => void }
 function CommandPalette({ open, onClose }: { open: boolean; onClose: () => void }) {
@@ -651,6 +678,11 @@ function App() {
   const [perms, setPermsState] = useState<string[]>(() => getPerms())
   const [sidebarOpen, setSidebarOpen] = useState(() => window.innerWidth > 860)
   const [cmdkOpen, setCmdkOpen] = useState(false)
+  const [theme, setTheme] = useState<string>(() => localStorage.getItem('capitalos-theme') || 'teal')
+  useEffect(() => {
+    document.documentElement.setAttribute('data-theme', theme)
+    localStorage.setItem('capitalos-theme', theme)
+  }, [theme])
   // 全局命令面板快捷键:Cmd/Ctrl+K 开关。
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -783,7 +815,7 @@ function App() {
             {sidebarOpen ? <X size={17} /> : <Menu size={17} />}
           </button>
           <div className="brand-copy">
-            <span className="brand-mark">C</span>
+            <BrandMark />
             <div>
               <strong>CapitalOS</strong>
               <small>投资运营中台</small>
@@ -869,6 +901,16 @@ function App() {
             <span className={classNames('api-status', backendStatus === 'connected' && 'is-online', backendStatus === 'error' && 'is-error')}>
               API {backendStatus === 'connected' ? '已连接' : backendStatus === 'error' ? '未连接' : '检查中'}
             </span>
+            <button
+              className="icon-button theme-toggle"
+              type="button"
+              data-testid="theme-toggle"
+              title={theme === 'blue' ? '主题:蓝橙(点切换青绿)' : '主题:青绿(点切换蓝橙)'}
+              aria-label="切换主题"
+              onClick={() => setTheme((t) => (t === 'blue' ? 'teal' : 'blue'))}
+            >
+              <Palette size={17} />
+            </button>
             <label className="role-select">
               <span>角色</span>
               <select
