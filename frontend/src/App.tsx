@@ -660,7 +660,7 @@ function App() {
     return () => window.removeEventListener('keydown', onKey)
   }, [])
   const [role, setRole] = useState(roles[0])
-  const [navSearch, setNavSearch] = useState('')
+  const [navSearch] = useState('') // 侧栏 nav 内联过滤已由命令面板取代;保留空串走默认展开逻辑
   const [toast, setToast] = useState<Toast | null>(null)
   const [backendReceipt, setBackendReceipt] = useState<BackendReceipt | null>(null)
   const [backendStatus, setBackendStatus] = useState<'checking' | 'connected' | 'error'>('checking')
@@ -791,15 +791,12 @@ function App() {
           </div>
         </div>
 
-        <label className="nav-search">
+        {/* 命令面板入口:点开或按 ⌘K / Ctrl+K,搜页面 + 项目/基金/投资人 */}
+        <button type="button" className="nav-search nav-search-btn" onClick={() => setCmdkOpen(true)} data-testid="cmdk-trigger" aria-label="打开命令面板">
           <Search size={15} />
-          <input
-            value={navSearch}
-            onChange={(event) => setNavSearch(event.target.value)}
-            placeholder="搜索页面"
-            aria-label="搜索页面"
-          />
-        </label>
+          <span className="nav-search-ph">搜索页面 / 项目 / 基金…</span>
+          <kbd>{navigator.platform.includes('Mac') ? '⌘K' : 'Ctrl K'}</kbd>
+        </button>
 
         <nav className="nav-groups">
           {navTree.map(({ domain, groups }) => {
