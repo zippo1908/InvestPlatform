@@ -45,7 +45,6 @@ import {
   chartSeries,
   customFields,
   dashboardMetrics,
-  documents,
   equityChanges,
   financialRows,
   funds,
@@ -68,7 +67,7 @@ import {
 import type { DataRow, Project, Screen } from './data'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
-import { apiDelete, apiDownload, apiGet, apiPatch, apiPost, auditDetail, getPerms, setPerms, streamPost, setToken } from './api'
+import { API_BASE, apiDelete, apiDownload, apiGet, apiPatch, apiPost, auditDetail, getPerms, getToken, setPerms, streamPost, setToken } from './api'
 
 marked.setOptions({ breaks: true, gfm: true })
 
@@ -1870,82 +1869,100 @@ function DocumentsPage({
   canWrite: boolean
   onToast: (toast: Toast) => void
 }) {
-  const folders = ['项目文件', '基金文件', '共享文件', '流程文件', '回收站']
-  const [activeFolder, setActiveFolder] = useState(screen.id === 'process-files' ? '流程文件' : '项目文件')
+  const kind = screen.id === 'process-files' ? 'workflow' : 'shared'
+  const [docs, setDocs] = useState<Array<Record<string, unknown>>>([])
+  const [reloadKey, setReloadKey] = useState(0)
+  const [uploading, setUploading] = useState(false)
+  const fileRef = useRef<HTMLInputElement>(null)
+
+  useEffect(() => {
+    let active = true
+    apiGet<{ items: Array<Record<string, unknown>> }>('/api/documents')
+      .then((r) => { if (active) setDocs(r.items ?? []) })
+      .catch(() => { if (active) setDocs([]) })
+    return () => { active = false }
+  }, [reloadKey])
+
+  const uploadViaForm = async (f: File) => {
+    setUploading(true)
+    try {
+      const fd = new FormData()
+      fd.append('file', f)
+      const token = getToken()
+      const res = await fetch(`${API_BASE}/api/files/upload`, { method: 'POST', headers: token ? { Authorization: `Bearer ${token}` } : {}, body: fd })
+      if (!res.ok) throw new Error((await res.text()) || `HTTP ${res.status}`)
+      const up = await res.json() as { storage_uri: string; file_name: string; mime_type: string; size: number }
+      // 2) 用真 storage_uri 建文档记录
+      const result = await apiPost('/api/documents', {
+        title: up.file_name,
+        document_kind: kind,
+        file_name: up.file_name,
+        storage_uri: up.storage_uri,
+        file_size_bytes: up.size,
+      })
+      onToast({ title: '已上传', detail: auditDetail(result), action: 'document.upload', entity: 'cap_documents', result })
+      setReloadKey((k) => k + 1)
+    } catch (error) {
+      onToast({ title: '上传失败', detail: error instanceof Error ? error.message : 'API 调用失败' })
+    } finally {
+      setUploading(false)
+    }
+  }
+
+  const download = async (doc: Record<string, unknown>) => {
+    const uri = String(doc.storage_uri ?? '')
+    if (uri.startsWith('file://')) {
+      try {
+        await apiDownload(`/api/files/download?uri=${encodeURIComponent(uri)}`, String(doc.file_name ?? 'file'))
+        // 记一次下载审计
+        void apiPost(`/api/documents/${doc.id}/download`).catch(() => undefined)
+      } catch (error) {
+        onToast({ title: '下载失败', detail: error instanceof Error ? error.message : 'API 调用失败' })
+      }
+    } else {
+      onToast({ title: '该文档为占位/外链', detail: '仅新上传的真实文件可下载(file://)' })
+    }
+  }
 
   return (
-    <div className="document-layout motion-item">
-      <aside className="doc-tree">
-        {folders.map((item) => (
-          <button
-            className={classNames(activeFolder === item && 'is-selected')}
-            key={item}
-            type="button"
-            onClick={() => {
-              setActiveFolder(item)
-              void runBackendAction(onToast, `${item}目录`, {
-                action: 'document.folder.open',
-                entity_type: 'document_folder',
-                entity_label: item,
-                after: { folder: item },
-              })
-            }}
-          >
-            <Folder size={16} />
-            {item}
-          </button>
-        ))}
-      </aside>
-      <section className="panel doc-main">
-        <PanelTitle
-          icon={FileText}
-          title={screen.id === 'process-files' ? '流程归档文件' : '文档中心'}
-          action="二次鉴权"
-          onAction={async () => {
-            try {
-              const result = await apiPost('/api/documents/1/download')
-              onToast({ title: '二次鉴权通过', detail: auditDetail(result) })
-            } catch (error) {
-              onToast({ title: '二次鉴权失败', detail: error instanceof Error ? error.message : 'API 调用失败' })
-            }
-          }}
-        />
-        <div className="doc-permissions">
-          {['预览', '下载', '编辑', '删除', '分享', '水印', '版本', '审计'].map((item) => (
-            <span key={item}>{item}</span>
-          ))}
-        </div>
-        <DataTable rows={documents} />
-        <button
-          className="primary-button"
-          type="button"
-          disabled={!canWrite}
-          onClick={async () => {
-            try {
-              const result = await apiPost('/api/documents', {
-                title: `${activeFolder}上传文件`,
-                document_kind: activeFolder === '流程文件' ? 'workflow' : activeFolder === '基金文件' ? 'fund' : 'shared',
-                file_name: 'frontend-upload-placeholder.pdf',
-                storage_uri: `mock://documents/${activeFolder}/frontend-upload-placeholder.pdf`,
-                file_size_bytes: 2048,
-              })
-              onToast({
-                title: screen.primaryAction,
-                detail: auditDetail(result),
-                action: 'document.upload',
-                entity: 'cap_documents',
-                result,
-              })
-            } catch (error) {
-              onToast({ title: '上传失败', detail: error instanceof Error ? error.message : 'API 调用失败' })
-            }
-          }}
-        >
-          <Upload size={16} />
-          {screen.primaryAction}
+    <section className="panel doc-main motion-item">
+      <PanelTitle icon={FileText} title={screen.id === 'process-files' ? '流程归档文件' : '文档中心'} />
+      <input
+        ref={fileRef}
+        type="file"
+        style={{ display: 'none' }}
+        onChange={(e) => { const f = e.target.files?.[0]; if (f) void uploadViaForm(f); e.target.value = '' }}
+      />
+      <div className="button-row" style={{ marginBottom: 12 }}>
+        <button className="primary-button" type="button" disabled={!canWrite || uploading} onClick={() => fileRef.current?.click()}>
+          <Upload size={16} /> {uploading ? '上传中…' : '上传文件'}
         </button>
-      </section>
-    </div>
+      </div>
+      <div className="table-wrap">
+        <table>
+          <thead><tr><th>标题</th><th>文件名</th><th>类型</th><th>版本</th><th>操作</th></tr></thead>
+          <tbody>
+            {docs.map((d, i) => {
+              const real = String(d.storage_uri ?? '').startsWith('file://')
+              return (
+                <tr key={i}>
+                  <td>{String(d.title ?? '')}</td>
+                  <td>{String(d.file_name ?? '')}</td>
+                  <td>{String(d.document_kind ?? '')}</td>
+                  <td>v{String(d.current_version_no ?? 1)}</td>
+                  <td>
+                    <button className="link-button" type="button" onClick={() => download(d)} disabled={!real} title={real ? '下载真实文件' : '占位/外链文档不可下载'}>
+                      <Download size={14} /> 下载
+                    </button>
+                  </td>
+                </tr>
+              )
+            })}
+            {docs.length === 0 && <tr><td colSpan={5} style={{ color: 'var(--muted)', padding: 16 }}>暂无文档,点「上传文件」添加。</td></tr>}
+          </tbody>
+        </table>
+      </div>
+    </section>
   )
 }
 

@@ -3,14 +3,19 @@ from __future__ import annotations
 import csv
 import io
 import os
+import re
 import uuid
 from datetime import datetime, timedelta
 from json import dumps
 from typing import Any
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
+
+# 上传文件落盘目录(可用 UPLOAD_DIR 覆盖);按租户分目录。
+UPLOAD_DIR = os.path.abspath(os.getenv("UPLOAD_DIR", os.path.join(os.path.dirname(__file__), "..", "uploads")))
+MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50MB
 from pydantic import BaseModel, Field, field_validator
 
 # 数据校验共用枚举/常量(与 DB enum 对齐)。
@@ -1501,7 +1506,7 @@ def list_documents(user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
             cursor.execute(
                 """
                 SELECT document_id AS id, title, document_kind, file_name, access_level,
-                       watermark_policy, current_version_no, fulltext_status
+                       watermark_policy, current_version_no, fulltext_status, storage_uri
                 FROM cap_documents
                 WHERE deleted_at IS NULL AND tenant_id=%s
                 ORDER BY document_id DESC
@@ -2335,6 +2340,54 @@ def ai_analyze_stream(payload: AiAnalyzePayload, user: AuthedUser = Depends(curr
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
     )
+
+
+# ── 真文件上传 / 下载 ──────────────────────────────────────────────────────
+@app.post("/api/files/upload")
+async def upload_file(file: UploadFile = File(...), user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
+    """真上传:落盘到 UPLOAD_DIR/tenant_<tid>/,返回可入库的 storage_uri。"""
+    tid = tenant_of(user)
+    safe = re.sub(r"[^\w.\-]", "_", os.path.basename(file.filename or "file"))[:120] or "file"
+    rel = f"tenant_{tid}/{uuid.uuid4().hex}__{safe}"
+    dest = os.path.join(UPLOAD_DIR, rel)
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    size = 0
+    try:
+        with open(dest, "wb") as out:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > MAX_UPLOAD_BYTES:
+                    out.close()
+                    os.remove(dest)
+                    raise HTTPException(status_code=413, detail="文件过大(上限 50MB)")
+                out.write(chunk)
+    finally:
+        await file.close()
+    return {
+        "ok": True,
+        "storage_uri": f"file://{rel}",
+        "file_name": file.filename or safe,
+        "mime_type": file.content_type or "application/octet-stream",
+        "size": size,
+    }
+
+
+@app.get("/api/files/download")
+def download_file(uri: str, user: AuthedUser = Depends(current_user)) -> FileResponse:
+    """下载:仅允许下本租户目录下的文件(防越权 / 路径穿越)。"""
+    tid = tenant_of(user)
+    if not uri.startswith("file://"):
+        raise HTTPException(status_code=400, detail="bad uri")
+    rel = uri[len("file://"):]
+    if not rel.startswith(f"tenant_{tid}/") or ".." in rel:
+        raise HTTPException(status_code=403, detail="无权访问该文件")
+    path = os.path.join(UPLOAD_DIR, rel)
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="文件不存在")
+    return FileResponse(path, filename=os.path.basename(rel).split("__", 1)[-1])
 
 
 @app.get("/api/db/ping")
