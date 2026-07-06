@@ -84,6 +84,10 @@ export function apiPatch<T = ApiResult>(path: string, body: unknown = {}): Promi
   })
 }
 
+export function apiDelete<T = ApiResult>(path: string): Promise<T> {
+  return request<T>(path, { method: 'DELETE' })
+}
+
 // SSE 流式 POST:逐帧解析 `data: {...}`,把文本增量回调给 onDelta,实现边吞吐边渲染。
 export async function streamPost(
   path: string,

@@ -57,7 +57,6 @@ import {
   permissions,
   postDataRows,
   projects,
-  recycleRows,
   researchRows,
   risks,
   roles,
@@ -69,7 +68,7 @@ import {
 import type { DataRow, Project, Screen } from './data'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
-import { apiDownload, apiGet, apiPatch, apiPost, auditDetail, getPerms, setPerms, streamPost, setToken } from './api'
+import { apiDelete, apiDownload, apiGet, apiPatch, apiPost, auditDetail, getPerms, setPerms, streamPost, setToken } from './api'
 
 marked.setOptions({ breaks: true, gfm: true })
 
@@ -133,7 +132,8 @@ function requiredPermsForScreen(screenId: string): string[] {
   if (screenId === 'burst-risk' || screenId === 'risk-clauses') return ['risk.manage']
   if (screenId === 'document-center' || screenId === 'process-files') return ['document.download']
   if (screenId === 'import-export') return ['report.export', 'fund.export']
-  if (['system-users', 'roles-permissions', 'field-config', 'recycle-bin'].includes(screenId)) return ['system.manage']
+  if (['system-users', 'roles-permissions', 'field-config'].includes(screenId)) return ['system.manage']
+  // 回收站恢复:后端限 system_admin/managing_partner;前端用编辑类权限放行(后端最终裁决)。
   return EDITOR_PERMS
 }
 import type { ApiResult } from './api'
@@ -1555,6 +1555,26 @@ function DetailPage({
     }
   }
 
+  const del = async () => {
+    if (selectedId == null) return
+    const label = form[nameKey] || `#${selectedId}`
+    if (!window.confirm(`确认删除「${label}」?删除后可在「回收站」恢复。`)) return
+    setSaving(true)
+    try {
+      const result = await apiDelete(`${listPath}/${selectedId}`)
+      onToast({ title: '已删除(可在回收站恢复)', detail: auditDetail(result), action: `${kind}.delete`, entity: kind === 'project' ? 'cap_projects' : 'cap_funds', result })
+      // 从列表移除并切到下一个
+      const rest = entities.filter((e) => e.id !== selectedId)
+      setEntities(rest)
+      setSelectedId((rest[0]?.id as number | undefined) ?? null)
+      if (rest.length === 0) setForm({})
+    } catch (error) {
+      onToast({ title: '删除失败', detail: error instanceof Error ? error.message : 'API 调用失败' })
+    } finally {
+      setSaving(false)
+    }
+  }
+
   const entityName = form[nameKey] || (loading ? '加载中…' : '（无数据）')
 
   return (
@@ -1580,6 +1600,16 @@ function DetailPage({
               ))}
             </select>
           </label>
+          <button
+            type="button"
+            className="danger-button"
+            disabled={!canWrite || saving || selectedId == null}
+            data-testid="detail-delete"
+            onClick={del}
+          >
+            <Trash size={16} />
+            删除
+          </button>
         </div>
       </section>
 
@@ -2138,48 +2168,68 @@ function RecyclePage({
   canWrite: boolean
   onToast: (toast: Toast) => void
 }) {
-  const fallbackRows = useMemo(() => recycleRows, [])
-  const { rows, source } = useBackendRows('recycle-bin', fallbackRows)
+  const [rows, setRows] = useState<DataRow[]>([])
+  const [source, setSource] = useState<'loading' | 'mysql' | 'mock'>('loading')
+  const [reloadKey, setReloadKey] = useState(0)
+  const [busyId, setBusyId] = useState<number | null>(null)
+
+  useEffect(() => {
+    let active = true
+    setSource('loading')
+    apiGet<LedgerResponse>('/api/ledger/recycle-bin?page=1&page_size=50')
+      .then((r) => { if (active) { setRows(normalizeRows(r.items)); setSource(r.source === 'mysql' ? 'mysql' : 'mock') } })
+      .catch(() => { if (active) { setRows([]); setSource('mock') } })
+    return () => { active = false }
+  }, [reloadKey])
+
+  const restore = async (id: number) => {
+    setBusyId(id)
+    try {
+      const result = await apiPost(`/api/recycle/${id}/restore`)
+      onToast({ title: '已恢复', detail: auditDetail(result), action: 'recycle.restore', entity: 'cap_recycle_items', result })
+      setReloadKey((k) => k + 1)
+    } catch (error) {
+      onToast({ title: '恢复失败', detail: error instanceof Error ? error.message : 'API 调用失败' })
+    } finally {
+      setBusyId(null)
+    }
+  }
+
+  const cols = rows[0] ? Object.keys(rows[0]).filter((c) => !c.startsWith('__')) : []
 
   return (
     <section className="panel motion-item">
       <PanelTitle icon={Trash} title="回收站对象" />
       <DataSourceBadge source={source} />
-      <DataTable rows={rows} />
-      <div className="button-row">
-        <button
-          className="primary-button"
-          type="button"
-          disabled={!canWrite}
-          onClick={async () => {
-            try {
-              const result = await apiPost('/api/recycle/1/restore')
-              onToast({ title: '已批量恢复', detail: auditDetail(result) })
-            } catch (error) {
-              onToast({ title: '恢复失败', detail: error instanceof Error ? error.message : 'API 调用失败' })
-            }
-          }}
-        >
-          <CheckCircle size={16} />
-          批量恢复
-        </button>
-        <button
-          className="danger-button"
-          type="button"
-          disabled={!canWrite}
-          onClick={() =>
-            runBackendAction(onToast, '彻底删除已提交', {
-              action: 'recycle.purge.submit',
-              entity_type: 'recycle_item',
-              entity_id: 1,
-              entity_label: '批量回收站对象',
-              after: { purge_mode: 'hard_delete', count: rows.length },
-            })
-          }
-        >
-          <Trash size={16} />
-          彻底删除
-        </button>
+      <div className="table-wrap" data-testid="recycle-table">
+        <table>
+          <thead>
+            <tr>{cols.map((c) => <th key={c}>{c}</th>)}<th>操作</th></tr>
+          </thead>
+          <tbody>
+            {rows.map((r, i) => {
+              const id = Number(r['__id'])
+              const recoverable = String(r['状态']) === 'recoverable'
+              return (
+                <tr key={i}>
+                  {cols.map((c) => <td key={c}>{String(r[c] ?? '')}</td>)}
+                  <td>
+                    {recoverable ? (
+                      <button className="secondary-button" type="button" disabled={!canWrite || busyId === id} onClick={() => restore(id)}>
+                        <CheckCircle size={14} /> {busyId === id ? '恢复中…' : '恢复'}
+                      </button>
+                    ) : (
+                      <span className="muted">—</span>
+                    )}
+                  </td>
+                </tr>
+              )
+            })}
+            {rows.length === 0 && source !== 'loading' && (
+              <tr><td colSpan={cols.length + 1} style={{ color: 'var(--muted)', padding: 16 }}>回收站为空</td></tr>
+            )}
+          </tbody>
+        </table>
       </div>
     </section>
   )
@@ -2357,7 +2407,7 @@ function ListControls({
 function DataTable({ rows, compact = false }: { rows: DataRow[]; compact?: boolean }) {
   const [query, setQuery] = useState('')
   const [selected, setSelected] = useState<Set<number>>(new Set())
-  const columns = Object.keys(rows[0] ?? {})
+  const columns = Object.keys(rows[0] ?? {}).filter((c) => !c.startsWith('__')) // __ 前缀为隐藏元数据(如 __id)
   const filtered = rows.filter((row) => Object.values(row).join(' ').toLowerCase().includes(query.toLowerCase()))
   const allSelected = filtered.length > 0 && filtered.every((_, index) => selected.has(index))
 
