@@ -193,6 +193,10 @@ class AiAnalyzePayload(BaseModel):
     instruction: str | None = None
 
 
+class ExtractClausesPayload(BaseModel):
+    text: str = Field(min_length=1)
+
+
 class AiJobPayload(BaseModel):
     screen_id: str = Field(min_length=1, max_length=64)
     text: str = Field(min_length=1)
@@ -1431,6 +1435,82 @@ def project_valuations(project_id: int, user: AuthedUser = Depends(current_user)
     finally:
         connection.close()
     return {"count": len(rows), "items": rows}
+
+
+_CLAUSE_KINDS = {"redemption", "anti_dilution", "veto", "information_right", "milestone", "liquidation_preference", "other"}
+
+
+@app.get("/api/projects/{project_id}/clauses")
+def project_clauses(project_id: int, user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
+    """协议条款 section:本项目已抽取的关键条款(cap_risk_clauses)。"""
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            _assert_project(cursor, project_id, tid)
+            cursor.execute(
+                """SELECT clause_kind, round_label, clause_summary, clause_status, reminder_on
+                   FROM cap_risk_clauses WHERE project_id=%s AND deleted_at IS NULL ORDER BY risk_clause_id DESC""",
+                (project_id,),
+            )
+            rows = cursor.fetchall()
+    finally:
+        connection.close()
+    return {"count": len(rows), "items": rows}
+
+
+@app.post("/api/projects/{project_id}/clauses/extract")
+def extract_project_clauses(project_id: int, payload: ExtractClausesPayload, user: AuthedUser = Depends(require_permission("project.edit"))) -> dict[str, Any]:
+    """协议条款(AI):把协议文本交给大模型抽取关键条款,结构化入库 cap_risk_clauses。"""
+    if not llm.is_configured():
+        raise HTTPException(status_code=503, detail="AI 未配置:请在 deploy/.env 配置 LLM_*")
+    text = payload.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text required")
+    messages = [
+        {"role": "system", "content": "你是投资协议条款抽取助手。只输出 JSON,不要多余文字。"},
+        {"role": "user", "content": (
+            "从下面的投资协议/条款清单文本中抽取关键条款,输出 JSON:\n"
+            '{"clauses":[{"clause_kind":"以下之一 redemption|anti_dilution|veto|information_right|milestone|liquidation_preference|other",'
+            '"round_label":"轮次如 A+/空","clause_summary":"一句话中文摘要(≤60字)","clause_body":"条款要点中文(≤200字)"}]}\n'
+            "只抽取真实出现的条款,没有就返回空数组。\n\n协议文本:\n" + text[:16000]
+        )},
+    ]
+    try:
+        data = llm.chat_json(messages)
+    except (llm.LLMError, llm.LLMNotConfigured) as exc:
+        raise HTTPException(status_code=502, detail=f"AI 抽取失败:{exc}") from exc
+    clauses = data.get("clauses", []) if isinstance(data, dict) else []
+    if not isinstance(clauses, list):
+        clauses = []
+
+    tid = tenant_of(user)
+    inserted = 0
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            _assert_project(cursor, project_id, tid)
+            for c in clauses[:30]:
+                if not isinstance(c, dict):
+                    continue
+                kind = str(c.get("clause_kind", "other")).strip()
+                if kind not in _CLAUSE_KINDS:
+                    kind = "other"
+                summary = str(c.get("clause_summary", "")).strip()[:500]
+                body = str(c.get("clause_body", "")).strip()
+                if not summary and not body:
+                    continue
+                cursor.execute(
+                    """INSERT INTO cap_risk_clauses (project_id, clause_code, round_label, clause_kind, clause_status, clause_summary, clause_body, created_by)
+                       VALUES (%s, %s, %s, %s, 'draft', %s, %s, %s)""",
+                    (project_id, f"CL-AI-{uuid.uuid4().hex[:8].upper()}", str(c.get("round_label", ""))[:80] or None, kind, summary or body[:120], body, user.user_id),
+                )
+                inserted += 1
+            audit_id = write_audit(cursor, user.user_id, "project.clauses.extract", "project", project_id, f"AI 抽取 {inserted} 条条款", after={"inserted": inserted})
+        connection.commit()
+    finally:
+        connection.close()
+    return {"ok": True, "inserted": inserted, "audit_id": audit_id}
 
 
 @app.get("/api/projects/{project_id}/meetings")

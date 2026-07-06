@@ -1856,6 +1856,8 @@ const MEETING_RESULT_CN: Record<string, string> = { pending: '待决', approved:
 const CONFIRM_CN: Record<string, string> = { ai_draft: 'AI 草稿', human_confirmed: '人工确认', archived: '已归档' }
 const EVENT_KIND_CN: Record<string, string> = { project: '项目', fund: '基金', meeting: '会议', workflow: '流程', personal: '个人', risk: '风控', other: '其他' }
 const dtmin = (v: unknown): string => (v ? String(v).replace('T', ' ').slice(0, 16) : '—') // ISO → YYYY-MM-DD HH:MM
+const CLAUSE_KIND_CN: Record<string, string> = { redemption: '回购', anti_dilution: '反稀释', veto: '一票否决', information_right: '信息权', milestone: '里程碑', liquidation_preference: '优先清算', other: '其他' }
+const CLAUSE_STATUS_CN: Record<string, string> = { draft: '待确认', active: '生效', triggered: '已触发', waived: '已豁免', closed: '已关闭' }
 // 各 section → 端点 + 行映射(转中文键给 DataTable)。仅列出接真数据的 section。
 const SECTION_DATA: Record<string, { path: string; map: (r: Record<string, unknown>) => DataRow }> = {
   基金投资情况: {
@@ -1935,6 +1937,58 @@ type InvestSummary = {
 const wan = (v: number | null | undefined): string => (v == null ? '—' : `${(v / 1e4).toLocaleString('zh-CN', { maximumFractionDigits: 1 })} 万`)
 const pct = (v: number | null | undefined): string => (v == null ? '—' : `${(v * 100).toFixed(2)}%`)
 const num = (v: number | null | undefined): string => (v == null ? '—' : String(v))
+
+// 协议条款(AI):粘贴协议文本 → 大模型抽取关键条款入库 → 表格展示(cap_risk_clauses)。
+function ProjectClausesSection({ projectId, canWrite, onToast }: { projectId: number | null; canWrite: boolean; onToast: (t: Toast) => void }) {
+  const [rows, setRows] = useState<Array<Record<string, unknown>>>([])
+  const [text, setText] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [reloadKey, setReloadKey] = useState(0)
+  useEffect(() => {
+    if (projectId == null) { setRows([]); return }
+    let ignore = false
+    apiGet<{ items: Array<Record<string, unknown>> }>(`/api/projects/${projectId}/clauses`)
+      .then((r) => { if (!ignore) setRows(r.items ?? []) })
+      .catch(() => { if (!ignore) setRows([]) })
+    return () => { ignore = true }
+  }, [projectId, reloadKey])
+  const extract = async () => {
+    if (!text.trim() || projectId == null) return
+    setBusy(true)
+    try {
+      const r = await apiPost<{ inserted: number }>(`/api/projects/${projectId}/clauses/extract`, { text })
+      onToast({ title: `已抽取 ${r.inserted} 条条款`, detail: '大模型结构化入库,见下方列表', action: 'project.clauses.extract', entity: 'cap_risk_clauses' })
+      setText(''); setReloadKey((k) => k + 1)
+    } catch (error) {
+      onToast({ title: '抽取失败', detail: error instanceof Error ? error.message.replace(/^\{"detail":"?|"?\}$/g, '') : 'API 调用失败' })
+    } finally { setBusy(false) }
+  }
+  const tableRows: DataRow[] = rows.map((r) => ({
+    类型: CLAUSE_KIND_CN[String(r.clause_kind)] ?? String(r.clause_kind ?? '—'),
+    轮次: String(r.round_label ?? '—'),
+    摘要: String(r.clause_summary ?? '—'),
+    状态: CLAUSE_STATUS_CN[String(r.clause_status)] ?? String(r.clause_status ?? '—'),
+  }))
+  return (
+    <section className="panel full-span motion-item" data-testid="section-clauses">
+      <PanelTitle icon={Bot} title="协议条款(AI)" />
+      <div className="upload-zone" style={{ marginBottom: 14 }}>
+        <textarea className="ai-bp-input" placeholder="粘贴投资协议 / 条款清单文本,AI 抽取优先清算、反稀释、回购、一票否决、信息权等关键条款并入库…"
+          value={text} readOnly={!canWrite} onChange={(e) => setText(e.target.value)} rows={5} data-testid="clause-input" />
+        <div className="button-row" style={{ marginTop: 10 }}>
+          <button className="primary-button" type="button" disabled={!canWrite || busy || !text.trim()} onClick={extract} data-testid="clause-extract">
+            <Bot size={15} /> {busy ? 'AI 抽取中…' : 'AI 抽取条款'}
+          </button>
+        </div>
+      </div>
+      {tableRows.length === 0 ? (
+        <p className="muted-note">暂无已抽取条款。粘贴协议文本点「AI 抽取条款」即可结构化入库。</p>
+      ) : (
+        <DataTable rows={tableRows} compact />
+      )}
+    </section>
+  )
+}
 
 // 项目卡片右侧协作面板:评论 / 小组问答(真写 cap_project_comments)。
 function ProjectCommentPanel({ projectId, canWrite, onToast }: { projectId: number | null; canWrite: boolean; onToast: (t: Toast) => void }) {
@@ -2405,6 +2459,8 @@ function DetailPage({
 
           <ProjectCommentPanel projectId={selectedId} canWrite={canWrite} onToast={onToast} />
           </>
+          ) : section === '协议条款(AI)' ? (
+            <ProjectClausesSection projectId={selectedId} canWrite={canWrite} onToast={onToast} />
           ) : SECTION_DATA[section] ? (
             <section className="panel full-span motion-item" data-testid="section-data">
               <PanelTitle icon={FileText} title={section} />
