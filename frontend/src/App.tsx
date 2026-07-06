@@ -2407,6 +2407,8 @@ function DetailPage({
     const ctx = gsap.context(() => {
       gsap.from('.stage-flow .stage-node', { autoAlpha: 0, y: 10, scale: 0.8, duration: 0.4, ease: 'back.out(1.7)', stagger: 0.045, delay: 0.12 })
       gsap.from('.stage-flow .stage-arrow', { scaleX: 0, transformOrigin: 'left center', duration: 0.3, ease: 'power2.out', stagger: 0.045, delay: 0.18 })
+      // 当前阶段圆点持续轻微脉冲,引导视线到"项目所处阶段"。
+      gsap.to('.stage-node.is-current .stage-node-dot', { scale: 1.12, repeat: -1, yoyo: true, duration: 1.1, ease: 'sine.inOut', delay: 0.7 })
     }, stageRef)
     return () => ctx.revert()
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -2714,25 +2716,25 @@ function DetailPage({
                   <>
                     <fieldset className="form-section"><legend>业绩指标</legend>
                       <div className="metric-grid">
-                        <div><span>DPI</span><strong>{num(summary.performance.DPI)}</strong></div>
-                        <div><span>MOIC</span><strong>{num(summary.performance.MOIC)}</strong></div>
-                        <div><span>IRR</span><strong>{summary.performance.IRR == null ? '—' : pct(summary.performance.IRR)}</strong></div>
+                        <div><span>DPI</span><CountUp value={num(summary.performance.DPI)} /></div>
+                        <div><span>MOIC</span><CountUp value={num(summary.performance.MOIC)} /></div>
+                        <div><span>IRR</span><CountUp value={summary.performance.IRR == null ? '—' : pct(summary.performance.IRR)} /></div>
                       </div>
                     </fieldset>
                     <fieldset className="form-section"><legend>投资信息</legend>
                       <div className="metric-grid">
-                        <div><span>累计协议签署金额</span><strong>{wan(summary.investment.agreement_total)}</strong></div>
-                        <div><span>累计打款金额</span><strong>{wan(summary.investment.paid_total)}</strong></div>
+                        <div><span>累计协议签署金额</span><CountUp value={wan(summary.investment.agreement_total)} /></div>
+                        <div><span>累计打款金额</span><CountUp value={wan(summary.investment.paid_total)} /></div>
                         <div><span>首次打款时间</span><strong>{summary.investment.first_payment_on ?? '—'}</strong></div>
-                        <div><span>最新持股比例</span><strong>{pct(summary.investment.ownership_ratio)}</strong></div>
-                        <div><span>项目最新投后估值</span><strong>{wan(summary.investment.latest_valuation)}</strong></div>
+                        <div><span>最新持股比例</span><CountUp value={pct(summary.investment.ownership_ratio)} /></div>
+                        <div><span>项目最新投后估值</span><CountUp value={wan(summary.investment.latest_valuation)} /></div>
                         <div><span>投资轮次</span><strong>{summary.investment.round_label ?? '—'}</strong></div>
                         <div><span>投资状态</span><strong>{summary.investment.investment_status ?? '—'}</strong></div>
                       </div>
                     </fieldset>
                     <fieldset className="form-section"><legend>回款信息</legend>
                       <div className="metric-grid">
-                        <div><span>累计退出收益</span><strong>{wan(summary.realized.realized_total)}</strong></div>
+                        <div><span>累计退出收益</span><CountUp value={wan(summary.realized.realized_total)} /></div>
                         <div><span>退出状态</span><strong>{summary.realized.exit_status ?? '—'}</strong></div>
                       </div>
                     </fieldset>
