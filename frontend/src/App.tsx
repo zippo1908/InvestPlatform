@@ -1069,6 +1069,7 @@ function AiPage({
   const workspace = screen.id === 'ai-workspace' // 通用工作台:自定义指令 + 自由文本分析
   // 纪要解析与工作台统一走 SSE 流式 Markdown:边吞吐边渲染,配处理中动效。
   const [text, setText] = useState('')
+  const [extracting, setExtracting] = useState(false)
   const matFileRef = useRef<HTMLInputElement>(null)
   const [instruction, setInstruction] = useState('')
   const [answer, setAnswer] = useState<string | null>(null)
@@ -1124,16 +1125,30 @@ function AiPage({
           <input
             ref={matFileRef}
             type="file"
-            accept=".txt,.md,.markdown,text/plain,text/markdown"
+            accept=".txt,.md,.markdown,.pdf,.docx"
             style={{ display: 'none' }}
             onChange={async (event) => {
               const f = event.target.files?.[0]
               event.target.value = ''
               if (!f) return
-              if (f.size > 2 * 1024 * 1024) { onToast({ title: '文件过大', detail: '材料文本上限 2MB' }); return }
-              const content = await f.text()
-              setText(content)
-              onToast({ title: '已载入材料', detail: `${f.name}(${content.length} 字),可直接分析` })
+              if (f.size > 20 * 1024 * 1024) { onToast({ title: '文件过大', detail: '上限 20MB' }); return }
+              setExtracting(true)
+              try {
+                // 统一走后端抽取:txt/md 直读、PDF 用 pypdf、docx 用 python-docx。
+                const fd = new FormData()
+                fd.append('file', f)
+                const token = getToken()
+                const res = await fetch(`${API_BASE}/api/ai/extract-text`, { method: 'POST', headers: token ? { Authorization: `Bearer ${token}` } : {}, body: fd })
+                if (!res.ok) throw new Error((await res.text()) || `HTTP ${res.status}`)
+                const out = await res.json() as { text: string; chars: number; file_name: string }
+                setText(out.text)
+                onToast({ title: '已解析并载入', detail: `${out.file_name}(${out.chars} 字),可直接分析` })
+              } catch (error) {
+                const msg = error instanceof Error ? error.message : '解析失败'
+                onToast({ title: '文件解析失败', detail: msg.replace(/^\{"detail":"?|"?\}$/g, '') })
+              } finally {
+                setExtracting(false)
+              }
             }}
           />
           <div className="button-row" style={{ marginTop: 10 }}>
@@ -1141,8 +1156,8 @@ function AiPage({
               <Bot size={16} />
               {aiBusy ? (workspace ? 'AI 分析中…' : 'AI 解析中…') : (workspace ? '运行分析' : 'AI 解析')}
             </button>
-            <button className="secondary-button" type="button" disabled={!canWrite || aiBusy} onClick={() => matFileRef.current?.click()} title="读取 txt/md 文本到材料框(PDF/Word 抽取待接入)">
-              <Upload size={16} /> 上传材料文件
+            <button className="secondary-button" type="button" disabled={!canWrite || aiBusy || extracting} onClick={() => matFileRef.current?.click()} title="支持 txt/md/PDF/Word(.docx),自动抽取文本到材料框">
+              <Upload size={16} /> {extracting ? '解析文件中…' : '上传材料文件'}
             </button>
           </div>
           {aiError && (

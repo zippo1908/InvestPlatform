@@ -6,3 +6,5 @@ cryptography>=42  # pymysql 连 MySQL 8 caching_sha2_password 必需
 pyjwt==2.10.1
 bcrypt==4.2.1
 python-multipart==0.0.20  # FastAPI 文件上传(UploadFile)
+pypdf==5.1.0  # PDF 文本抽取
+python-docx==1.1.2  # Word(.docx)文本抽取

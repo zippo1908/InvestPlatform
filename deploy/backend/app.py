@@ -2459,6 +2459,55 @@ def test_ai_config(user: AuthedUser = Depends(require_roles("system_admin", "man
     return {"ok": True, "model": llm.status()["model"], "reply": reply.strip()[:100]}
 
 
+# ── 文件文本抽取(txt/md/pdf/docx → 纯文本,供 AI 分析)──────────────────────
+def _extract_pdf(data: bytes) -> str:
+    from pypdf import PdfReader
+
+    reader = PdfReader(io.BytesIO(data))
+    return "\n".join((page.extract_text() or "") for page in reader.pages[:200])
+
+
+def _extract_docx(data: bytes) -> str:
+    import docx
+
+    document = docx.Document(io.BytesIO(data))
+    parts = [p.text for p in document.paragraphs]
+    for table in document.tables:
+        for row in table.rows:
+            parts.append(" | ".join(cell.text for cell in row.cells))
+    return "\n".join(parts)
+
+
+@app.post("/api/ai/extract-text")
+async def extract_text(file: UploadFile = File(...), user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
+    """把上传文件抽成纯文本(txt/md 直读、pdf 用 pypdf、docx 用 python-docx),供 AI 分析。"""
+    name = file.filename or "file"
+    ext = os.path.splitext(name)[1].lower()
+    data = await file.read(20 * 1024 * 1024 + 1)  # 20MB 上限
+    await file.close()
+    if len(data) > 20 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="文件过大(上限 20MB)")
+    try:
+        if ext in (".txt", ".md", ".markdown"):
+            text = data.decode("utf-8", "ignore")
+        elif ext == ".pdf":
+            text = _extract_pdf(data)
+        elif ext == ".docx":
+            text = _extract_docx(data)
+        elif ext == ".doc":
+            raise HTTPException(status_code=415, detail="旧版 .doc 不支持,请另存为 .docx 或 PDF")
+        else:
+            raise HTTPException(status_code=415, detail=f"不支持的文件类型:{ext or '未知'}")
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001 —— 抽取失败(损坏/加密等)统一提示
+        raise HTTPException(status_code=422, detail=f"文件解析失败:{exc}")
+    text = text.strip()[:50000]  # 抽取文本上限,防超模型上下文
+    if not text:
+        raise HTTPException(status_code=422, detail="未抽取到文本(可能是扫描件/图片型 PDF,需 OCR)")
+    return {"ok": True, "file_name": name, "chars": len(text), "text": text}
+
+
 # ── 真文件上传 / 下载 ──────────────────────────────────────────────────────
 @app.post("/api/files/upload")
 async def upload_file(file: UploadFile = File(...), user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
