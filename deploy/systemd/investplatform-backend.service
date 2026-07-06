@@ -1,0 +1,16 @@
+[Unit]
+Description=InvestPlatform CapitalOS Backend (FastAPI)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/tinci/InvestPlatform/deploy/backend
+EnvironmentFile=/home/tinci/InvestPlatform/deploy/.env
+ExecStart=/home/tinci/InvestPlatform/deploy/backend/.venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 7997
+Restart=always
+RestartSec=3
+StandardOutput=append:/home/tinci/InvestPlatform/deploy/backend/backend.log
+StandardError=append:/home/tinci/InvestPlatform/deploy/backend/backend.log
+
+[Install]
+WantedBy=default.target

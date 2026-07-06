@@ -128,6 +128,26 @@ status_one() {
   fi
 }
 
+# 生产化后由 systemd 托管(自动重启 + 开机自启)。若单元存在则统一走 systemctl,
+# 避免 nohup 与 systemd 争抢 7997/8089 端口。旧的 nohup 逻辑仅在无 systemd 时兜底。
+SYSTEMD_UNITS="investplatform-backend investplatform-frontend"
+have_systemd_units() {
+  systemctl --user list-unit-files investplatform-backend.service >/dev/null 2>&1 \
+    && systemctl --user cat investplatform-backend.service >/dev/null 2>&1
+}
+
+if have_systemd_units; then
+  case "$ACTION" in
+    start)   systemctl --user start $SYSTEMD_UNITS ;;
+    stop)    systemctl --user stop $SYSTEMD_UNITS ;;
+    restart) systemctl --user restart $SYSTEMD_UNITS ;;
+    status)  systemctl --user --no-pager status $SYSTEMD_UNITS ;;
+    *) echo "Usage: $0 {start|stop|restart|status} (systemd 托管)" >&2; exit 1 ;;
+  esac
+  systemctl --user is-active $SYSTEMD_UNITS
+  exit 0
+fi
+
 case "$ACTION" in
   start)
     load_env_file

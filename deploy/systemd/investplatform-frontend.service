@@ -1,0 +1,13 @@
+[Unit]
+Description=InvestPlatform CapitalOS Frontend (static)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/tinci/InvestPlatform/deploy/frontend/dist
+ExecStart=/home/tinci/InvestPlatform/deploy/backend/.venv/bin/python -m http.server 8089 --bind 0.0.0.0 --directory /home/tinci/InvestPlatform/deploy/frontend/dist
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

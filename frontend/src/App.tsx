@@ -21,7 +21,6 @@ import {
   Folder,
   GitBranch,
   Home,
-  Layers,
   LineChart,
   Lock,
   LogOut,
@@ -68,7 +67,75 @@ import {
   workflows,
 } from './data'
 import type { DataRow, Project, Screen } from './data'
-import { apiGet, apiPost, auditDetail } from './api'
+import { marked } from 'marked'
+import DOMPurify from 'dompurify'
+import { apiDownload, apiGet, apiPatch, apiPost, auditDetail, getPerms, setPerms, streamPost, setToken } from './api'
+
+marked.setOptions({ breaks: true, gfm: true })
+
+// 有些模型会把整段输出用 ```markdown ... ``` 包裹,去掉外层围栏再解析,避免整体被当代码块。
+function stripCodeFence(text: string): string {
+  const t = text.trim()
+  if (t.startsWith('```')) {
+    return t.replace(/^```[a-zA-Z]*\r?\n?/, '').replace(/```\s*$/, '')
+  }
+  return text
+}
+
+// 安全的 Markdown 渲染:marked 解析 + DOMPurify 消毒(防 LLM 输出里的注入)。
+function Markdown({ text }: { text: string }) {
+  const html = useMemo(() => DOMPurify.sanitize(marked.parse(stripCodeFence(text), { async: false }) as string), [text])
+  return <div className="markdown-body" dangerouslySetInnerHTML={{ __html: html }} />
+}
+
+// 处理中动效:GSAP 无限旋转 spinner + 轮播状态文字(交叉淡入),让观众感知"正在处理"。
+function AiProcessing({ messages }: { messages: string[] }) {
+  const [idx, setIdx] = useState(0)
+  const spinRef = useRef<SVGSVGElement>(null)
+  const textRef = useRef<HTMLSpanElement>(null)
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setIdx((v) => (v + 1) % messages.length), 1500)
+    return () => window.clearInterval(timer)
+  }, [messages.length])
+
+  useEffect(() => {
+    if (!spinRef.current) return
+    const tween = gsap.to(spinRef.current, { rotation: 360, transformOrigin: '50% 50%', repeat: -1, duration: 0.9, ease: 'none' })
+    return () => { tween.kill() }
+  }, [])
+
+  useEffect(() => {
+    if (textRef.current) gsap.fromTo(textRef.current, { autoAlpha: 0, y: 8 }, { autoAlpha: 1, y: 0, duration: 0.45, ease: 'power2.out' })
+  }, [idx])
+
+  return (
+    <div className="ai-processing" data-testid="ai-processing">
+      <Bot ref={spinRef} size={30} className="ai-processing-spin" />
+      <span className="ai-processing-text" ref={textRef}>{messages[idx]}</span>
+      <div className="ai-processing-dots"><i /><i /><i /></div>
+    </div>
+  )
+}
+
+const MEETING_MSGS = ['正在通读会议纪要…', '提取关键决策与结论…', '识别待办与负责人…', '整理风险提示…', '生成结构化摘要…']
+const WORKSPACE_MSGS = ['正在通读材料…', '套用投资分析框架…', '提炼要点与风险…', '组织结论与建议…']
+const BP_MSGS = ['正在读取 BP…', '识别企业与行业…', '提取融资与亮点…', '评估核心风险…', '生成回填建议…']
+const MEETING_INSTRUCTION =
+  '请把以下会议纪要整理为 Markdown,包含三个小标题:## 核心摘要(一段话)、## 关键要点(无序列表)、## 待办事项(无序列表,每条注明负责人与时限)。直接输出 Markdown 正文,不要用代码块或 ``` 包裹。'
+
+// 屏 → 该屏写操作所需权限(与后端 require_permission/require_roles 口径一致)。
+// 命中任一权限即可写;返回空数组表示"任意编辑类权限"皆可。
+const EDITOR_PERMS = ['project.edit', 'risk.manage', 'fund.export', 'document.download', 'report.export', 'system.manage']
+function requiredPermsForScreen(screenId: string): string[] {
+  if (screenId.startsWith('project')) return ['project.edit']
+  if (screenId.startsWith('fund') || screenId === 'investment-info' || screenId === 'equity-change') return ['fund.export']
+  if (screenId === 'burst-risk' || screenId === 'risk-clauses') return ['risk.manage']
+  if (screenId === 'document-center' || screenId === 'process-files') return ['document.download']
+  if (screenId === 'import-export') return ['report.export', 'fund.export']
+  if (['system-users', 'roles-permissions', 'field-config', 'recycle-bin'].includes(screenId)) return ['system.manage']
+  return EDITOR_PERMS
+}
 import type { ApiResult } from './api'
 
 type Toast = {
@@ -129,39 +196,24 @@ async function auditThenNavigate(
 
 const appScreens = screens.filter((screen) => screen.id !== 'login')
 
-const groupOrder = [
-  '工作台',
-  '协同工具',
-  '流程中心',
-  '项目管理',
-  '基金管理',
-  '投资人',
-  '投后管理',
-  '风险管理',
-  '文档管理',
-  'AI 数据库',
-  '报表驾驶舱',
-  '通用能力',
-  '系统管理',
-  '账户',
+// 二级导航:顶层「域」聚合原有分组,把 14 个扁平分组收敛为 6 个业务域,层次分明。
+const navDomains: { domain: string; groups: string[] }[] = [
+  { domain: '工作台', groups: ['工作台'] },
+  { domain: '投资业务', groups: ['项目管理', '基金管理', '投资人', '投后管理'] },
+  { domain: '风控与文档', groups: ['风险管理', '文档管理'] },
+  { domain: '协作与流程', groups: ['协同工具', '流程中心'] },
+  { domain: '智能与报表', groups: ['AI 数据库', '报表驾驶舱'] },
+  { domain: '系统与账户', groups: ['通用能力', '系统管理', '账户'] },
 ]
-
-const groupIcons: Record<string, LucideIcon> = {
+const domainIcons: Record<string, LucideIcon> = {
   工作台: Home,
-  协同工具: Bell,
-  流程中心: GitBranch,
-  项目管理: Briefcase,
-  基金管理: Database,
-  投资人: Users,
-  投后管理: LineChart,
-  风险管理: Shield,
-  文档管理: Folder,
-  'AI 数据库': Bot,
-  报表驾驶舱: BarChart,
-  通用能力: Layers,
-  系统管理: Settings,
-  账户: User,
+  投资业务: Briefcase,
+  风控与文档: Shield,
+  协作与流程: GitBranch,
+  智能与报表: Bot,
+  系统与账户: Settings,
 }
+
 
 function readRoute() {
   const clean = window.location.hash.replace(/^#\/?/, '').split('?')[0]
@@ -229,38 +281,44 @@ function mapBackendStage(stage: string) {
   return stageMap[stage] ?? stage
 }
 
-function useBackendRows(screenId: string, fallbackRows: DataRow[]) {
+const PAGE_SIZE = 20
+
+function useBackendRows(screenId: string, fallbackRows: DataRow[], page = 1, reloadKey = 0) {
   const [rows, setRows] = useState<DataRow[]>(fallbackRows)
   const [source, setSource] = useState<'loading' | 'mysql' | 'mock'>('loading')
+  const [total, setTotal] = useState<number | null>(null)
 
   useEffect(() => {
     let active = true
     setRows(fallbackRows)
     setSource('loading')
 
-    apiGet<LedgerResponse>(`/api/ledger/${screenId}`)
+    apiGet<LedgerResponse & { total?: number }>(`/api/ledger/${screenId}?page=${page}&page_size=${PAGE_SIZE}`)
       .then((result) => {
         if (!active) return
         setRows(normalizeRows(result.items))
         setSource(result.source === 'mysql' ? 'mysql' : 'mock')
+        setTotal(typeof result.total === 'number' ? result.total : null)
       })
       .catch(() => {
         if (!active) return
         setRows(fallbackRows)
         setSource('mock')
+        setTotal(null)
       })
 
     return () => {
       active = false
     }
-  }, [screenId, fallbackRows])
+  }, [screenId, fallbackRows, page, reloadKey])
 
-  return { rows, source }
+  return { rows, source, total, pageSize: PAGE_SIZE }
 }
 
 function App() {
   const [route, setRoute] = useState(readRoute)
   const [authed, setAuthed] = useState(() => sessionStorage.getItem('capitalos-session') === 'active')
+  const [perms, setPermsState] = useState<string[]>(() => getPerms())
   const [sidebarOpen, setSidebarOpen] = useState(() => window.innerWidth > 860)
   const [role, setRole] = useState(roles[0])
   const [navSearch, setNavSearch] = useState('')
@@ -305,7 +363,9 @@ function App() {
   }, [route, authed])
 
   const current = appScreens.find((screen) => screen.id === route) ?? appScreens[0]
-  const canWrite = role !== '只读审计'
+  // 真实 RBAC:当前屏的写权限由登录用户的实际权限码决定(与后端一致),
+  // 而非客户端角色下拉。无权 → 隐藏/禁用写操作并提示只读。
+  const canWrite = requiredPermsForScreen(current.id).some((p) => perms.includes(p))
   const showToast = (nextToast: Toast) => {
     setToast(nextToast)
     const receipt = receiptFromToast(nextToast)
@@ -314,18 +374,37 @@ function App() {
     }
   }
 
-  const navGroups = useMemo(() => {
+  // 二级导航:域 → 分组 → 屏。搜索时只保留命中项,并自动展开命中的域。
+  const navTree = useMemo(() => {
     const query = navSearch.trim().toLowerCase()
-    return groupOrder
-      .map((group) => ({
-        group,
-        items: appScreens.filter((screen) => {
-          const haystack = `${screen.title} ${screen.description} ${screen.group}`.toLowerCase()
-          return screen.group === group && (!query || haystack.includes(query))
-        }),
+    return navDomains
+      .map((d) => ({
+        domain: d.domain,
+        groups: d.groups
+          .map((group) => ({
+            group,
+            items: appScreens.filter((screen) => {
+              const haystack = `${screen.title} ${screen.description} ${screen.group}`.toLowerCase()
+              return screen.group === group && (!query || haystack.includes(query))
+            }),
+          }))
+          .filter((g) => g.items.length > 0),
       }))
-      .filter((entry) => entry.items.length > 0)
+      .filter((d) => d.groups.length > 0)
   }, [navSearch])
+
+  // 折叠状态:默认只展开当前屏所在的域,其余收起,保持侧栏干净。
+  // collapsedDomains[domain]: true=收起 / false=展开 / 缺省=按是否活跃域。搜索时强制全展开。
+  const activeDomain = navDomains.find((d) => d.groups.includes(current.group))?.domain
+  const [collapsedDomains, setCollapsedDomains] = useState<Record<string, boolean>>({})
+  const openIgnoringSearch = (domain: string) =>
+    collapsedDomains[domain] === false || (collapsedDomains[domain] === undefined && domain === activeDomain)
+  const isDomainOpen = (domain: string) => navSearch.trim() !== '' || openIgnoringSearch(domain)
+  const toggleDomain = (domain: string) =>
+    setCollapsedDomains((prev) => {
+      const openNow = prev[domain] === false || (prev[domain] === undefined && domain === activeDomain)
+      return { ...prev, [domain]: openNow } // openNow→收起(true);否则展开(false)
+    })
 
   const showLogin = !authed || route === 'login'
 
@@ -334,6 +413,10 @@ function App() {
       <LoginScreen
         onLogin={async (account, password) => {
           const result = await apiPost('/api/auth/login', { account, password })
+          setToken(String((result as { token?: string }).token ?? ''))
+          const loginPerms = ((result.user as { perms?: string[] } | undefined)?.perms) ?? []
+          setPerms(loginPerms)
+          setPermsState(loginPerms)
           sessionStorage.setItem('capitalos-session', 'active')
           sessionStorage.setItem('capitalos-user-id', String((result.user as { id?: number } | undefined)?.id ?? 1))
           setAuthed(true)
@@ -377,30 +460,50 @@ function App() {
         </label>
 
         <nav className="nav-groups">
-          {navGroups.map(({ group, items }) => {
-            const Icon = groupIcons[group] ?? Folder
+          {navTree.map(({ domain, groups }) => {
+            const DomainIcon = domainIcons[domain] ?? Folder
+            const open = isDomainOpen(domain)
+            const domainActive = domain === activeDomain
             return (
-              <section className="nav-group" key={group}>
-                <div className="nav-group-title">
-                  <Icon size={15} />
-                  <span>{group}</span>
-                </div>
-                {items.map((screen) => (
-                  <button
-                    key={screen.id}
-                    type="button"
-                    data-testid={`nav-link-${screen.id}`}
-                    className={classNames('nav-link', screen.id === current.id && 'is-active')}
-                    title={screen.title}
-                    aria-label={screen.title}
-                    onClick={() => goTo(screen.id)}
-                  >
-                    <span className="nav-label">{screen.title}</span>
-                    <span className="nav-short" aria-hidden="true">{navShortLabel(screen.title)}</span>
-                    {screen.id === current.id && <ChevronRight size={15} />}
-                  </button>
-                ))}
-              </section>
+              <div className={classNames('nav-domain', open && 'is-open')} key={domain}>
+                <button
+                  type="button"
+                  className={classNames('nav-domain-title', domainActive && 'is-active')}
+                  onClick={() => toggleDomain(domain)}
+                  aria-expanded={open}
+                >
+                  <DomainIcon size={16} />
+                  <span className="nav-domain-name">{domain}</span>
+                  <ChevronRight size={14} className={classNames('nav-domain-caret', open && 'is-open')} />
+                </button>
+                {open && (
+                  <div className="nav-domain-body">
+                    {groups.map(({ group, items }) => {
+                      const showGroupLabel = domain !== group // 单分组域(如「工作台」)不重复标题
+                      return (
+                        <section className="nav-group" key={group}>
+                          {showGroupLabel && <div className="nav-group-title"><span>{group}</span></div>}
+                          {items.map((screen) => (
+                            <button
+                              key={screen.id}
+                              type="button"
+                              data-testid={`nav-link-${screen.id}`}
+                              className={classNames('nav-link', screen.id === current.id && 'is-active')}
+                              title={screen.title}
+                              aria-label={screen.title}
+                              onClick={() => goTo(screen.id)}
+                            >
+                              <span className="nav-label">{screen.title}</span>
+                              <span className="nav-short" aria-hidden="true">{navShortLabel(screen.title)}</span>
+                              {screen.id === current.id && <ChevronRight size={15} />}
+                            </button>
+                          ))}
+                        </section>
+                      )
+                    })}
+                  </div>
+                )}
+              </div>
             )
           })}
         </nav>
@@ -475,6 +578,9 @@ function App() {
                   after: { route: current.id },
                 })
                 sessionStorage.removeItem('capitalos-session')
+                setToken(null)
+                setPerms(null)
+                setPermsState([])
                 setAuthed(false)
                 goTo('login')
               }}
@@ -866,55 +972,87 @@ function AiPage({
 }) {
   const [confirmed, setConfirmed] = useState(false)
   const meeting = screen.id === 'meeting-ai'
+  const workspace = screen.id === 'ai-workspace' // 通用工作台:自定义指令 + 自由文本分析
+  // 纪要解析与工作台统一走 SSE 流式 Markdown:边吞吐边渲染,配处理中动效。
+  const [text, setText] = useState('')
+  const [instruction, setInstruction] = useState('')
+  const [answer, setAnswer] = useState<string | null>(null)
+  const [aiBusy, setAiBusy] = useState(false)
+  const [aiError, setAiError] = useState<string | null>(null)
+
+  const run = async () => {
+    if (!text.trim()) return
+    setAiBusy(true); setAiError(null); setAnswer(''); setConfirmed(false)
+    try {
+      // 纪要用固定结构化指令;工作台用自定义指令。均流式累加,逐帧重渲染 Markdown。
+      const instr = workspace ? instruction : MEETING_INSTRUCTION
+      await streamPost('/api/ai/analyze/stream', { text, instruction: instr }, (delta) => {
+        setAnswer((prev) => (prev ?? '') + delta)
+      })
+      onToast({ title: 'AI 解析完成', detail: '流式生成结束', action: 'ai.analyze', entity: 'ai_parse_job' })
+    } catch (error) {
+      setAiError(error instanceof Error ? error.message : 'AI 调用失败')
+    } finally {
+      setAiBusy(false)
+    }
+  }
 
   return (
     <div className="page-grid">
       <section className="panel motion-item">
-        <PanelTitle icon={Upload} title={meeting ? '会议纪要上传' : '文件解析入口'} />
+        <PanelTitle icon={Upload} title={workspace ? '材料与分析指令' : meeting ? '会议纪要输入' : '材料解析输入'} />
         <div className="upload-zone">
-          <Upload size={34} />
-          <strong>{meeting ? '拖入会议音频、纪要或投委会材料' : '拖入 BP、协议、财报或行业报告'}</strong>
-          <span>支持 PDF、DOCX、PPTX、XLSX；解析任务通过后端登记，人工确认后才写入审计。</span>
-          <button
-            className="primary-button"
-            type="button"
-            disabled={!canWrite}
-            onClick={async () => {
-              try {
-                const result = await apiPost(`/api/screens/${screen.id}/primary-action`)
-                onToast({
-                  title: '解析任务已创建',
-                  detail: auditDetail(result),
-                  action: 'ai.parse.create',
-                  entity: 'cap_ai_parse_jobs',
-                  result,
-                })
-              } catch (error) {
-                onToast({ title: '后端写入失败', detail: error instanceof Error ? error.message : 'API 调用失败' })
-              }
-            }}
-          >
+          <strong>{workspace ? '自定义指令 + 材料,做通用投资分析' : meeting ? '粘贴会议纪要 / 投委会记录文本' : '粘贴 BP、协议、财报或行业报告文本'}</strong>
+          <span>
+            {workspace
+              ? '写一句分析指令(可留空用默认),粘贴材料,大模型给出投资视角的自由分析。'
+              : '由后端配置的大模型生成结构化摘要、关键要点与待办事项；人工确认后才写入审计。'}
+          </span>
+          {workspace && (
+            <input
+              className="ai-bp-input"
+              style={{ minHeight: 'auto' }}
+              placeholder="分析指令,如:评估这家公司的投资价值与主要风险(留空用默认)"
+              value={instruction}
+              readOnly={!canWrite}
+              onChange={(event) => setInstruction(event.target.value)}
+            />
+          )}
+          <textarea
+            className="ai-bp-input"
+            placeholder={workspace ? '在此粘贴待分析材料…' : meeting ? '在此粘贴会议纪要正文…' : '在此粘贴材料正文…'}
+            value={text}
+            readOnly={!canWrite}
+            onChange={(event) => setText(event.target.value)}
+            rows={7}
+          />
+          <button className="primary-button" type="button" disabled={!canWrite || aiBusy || !text.trim()} onClick={run}>
             <Bot size={16} />
-            创建解析任务
+            {aiBusy ? (workspace ? 'AI 分析中…' : 'AI 解析中…') : (workspace ? '运行分析' : 'AI 解析')}
           </button>
+          {aiError && (
+            <div className="ai-hint is-error">
+              <AlertTriangle size={14} />
+              <span>{aiError}</span>
+            </div>
+          )}
         </div>
       </section>
 
       <section className="panel two-thirds motion-item">
-        <PanelTitle icon={Bot} title={meeting ? '纪要解析结果' : 'AI 输出工作台'} />
-        <div className="ai-result-grid">
-          {[
-            ['核心摘要', meeting ? '会议确认继续推进投决材料，补充临床路径和资金用途。' : '项目增长来自头部客户复购，毛利率提升但现金回款存在周期压力。'],
-            ['关键条款', '优先清算权、反稀释、董事席位、信息权和回购触发条件需要法务复核。'],
-            ['下一步计划', '2 个工作日内补齐底稿，形成审批流程附件，并同步风险条款提醒。'],
-            ['来源引用', '第 3、7、12 页；会议 00:12:30 至 00:27:45；财务模型 Sheet B。'],
-          ].map(([title, detail]) => (
-            <article className="ai-result-card" key={title}>
-              <span>{title}</span>
-              <p>{detail}</p>
-            </article>
-          ))}
-        </div>
+        <PanelTitle icon={Bot} title={meeting ? '纪要解析结果(真模型)' : 'AI 输出工作台(真模型)'} />
+        {aiBusy && !answer ? (
+          <AiProcessing messages={meeting ? MEETING_MSGS : WORKSPACE_MSGS} />
+        ) : answer ? (
+          <div className="ai-answer" data-testid="ai-answer">
+            <Markdown text={answer} />
+            {aiBusy && <span className="stream-cursor" aria-hidden="true" />}
+          </div>
+        ) : (
+          <p className="muted-copy">
+            {meeting ? '粘贴会议纪要并点「AI 解析」,摘要/要点/待办将流式生成。' : '填写指令与材料并点「运行分析」,分析结果将流式生成。'}
+          </p>
+        )}
         <div className="confirm-strip">
           <div>
             <strong>{confirmed ? '已人工确认，可入库' : '等待人工确认'}</strong>
@@ -923,18 +1061,17 @@ function AiPage({
           <button
             className="primary-button"
             type="button"
-            disabled={!canWrite}
+            disabled={!canWrite || !answer || aiBusy}
             onClick={async () => {
               setConfirmed(true)
               try {
-                const result = await apiPost('/api/actions', {
+                const res = await apiPost('/api/actions', {
                   action: 'ai.output.confirm',
                   entity_type: 'ai_parse_output',
-                  entity_id: 3,
                   entity_label: screen.title,
-                  after: { human_status: 'accepted' },
+                  after: { human_status: 'accepted', excerpt: (answer ?? '').slice(0, 200) },
                 })
-                onToast({ title: 'AI 结果已确认', detail: auditDetail(result) })
+                onToast({ title: 'AI 结果已确认', detail: auditDetail(res) })
               } catch (error) {
                 onToast({ title: '后端写入失败', detail: error instanceof Error ? error.message : 'API 调用失败' })
               }
@@ -1104,41 +1241,101 @@ function FormPage({
   onToast: (toast: Toast) => void
 }) {
   const isFund = screen.id === 'fund-add'
-  const groups: Array<[string, string[]]> = isFund
+  const formRef = useRef<HTMLFormElement>(null)
+  // AI 解析(仅项目):BP 文本 → 真模型 → 结构化字段 → 一键回填表单。
+  const [bpText, setBpText] = useState('')
+  const [aiFields, setAiFields] = useState<Record<string, unknown> | null>(null)
+  const [aiBusy, setAiBusy] = useState(false)
+  const [aiError, setAiError] = useState<string | null>(null)
+
+  const runAiParse = async () => {
+    if (!bpText.trim()) return
+    setAiBusy(true); setAiError(null); setAiFields(null)
+    try {
+      const res = await apiPost<{ fields: Record<string, unknown>; model: string }>('/api/ai/parse-bp', { text: bpText })
+      setAiFields(res.fields)
+      onToast({ title: 'AI 解析完成', detail: `模型 ${res.model} 已返回结构化字段`, action: 'ai.parse_bp', entity: 'ai_parse_job' })
+    } catch (error) {
+      setAiError(error instanceof Error ? error.message : 'AI 调用失败')
+    } finally {
+      setAiBusy(false)
+    }
+  }
+
+  const applyAi = () => {
+    if (!aiFields || !formRef.current) return
+    const setInput = (name: string, value: unknown) => {
+      const el = formRef.current?.querySelector<HTMLInputElement>(`input[name="${name}"]`)
+      if (el && value != null && String(value) !== '') {
+        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set
+        setter?.call(el, String(value))
+        el.dispatchEvent(new Event('input', { bubbles: true }))
+      }
+    }
+    setInput('short_name', aiFields.short_name)
+    setInput('legal_name', aiFields.legal_name)
+    setInput('industry_group', aiFields.industry_group)
+    setInput('city', aiFields.city)
+    setInput('summary', aiFields.summary)
+    onToast({ title: 'AI 建议已回填', detail: '已写入企业名/行业/城市/摘要等字段,可再手工调整', action: 'form.ai_prefill.apply', entity: 'project' })
+  }
+
+  // 字段 → 后端 payload 键的映射(有键的字段会真正入库;无键的仅展示)。
+  // required 只标在实体名上,避免 BP 文件等无法填写的字段卡住提交。
+  type Field = { label: string; key?: string; kind?: 'number'; required?: boolean; placeholder?: string }
+  const groups: Array<[string, Field[]]> = isFund
     ? [
-        ['基础信息', ['基金简称', '基金全称', '备案编号', '管理人', '托管行', '组织形式']],
-        ['规模期限', ['目标规模', '首关规模', '投资期', '退出期', '管理费率', '收益分配']],
-        ['治理披露', ['投委会成员', '观察员', '关键人士', '关联交易规则', 'LP 披露频率', '审计安排']],
+        ['基础信息', [
+          { label: '基金简称', key: 'fund_name', required: true },
+          { label: '基金全称', key: 'legal_name' },
+          { label: '备案编号' }, { label: '管理人' }, { label: '托管行' }, { label: '组织形式' },
+        ]],
+        ['规模期限', [
+          { label: '目标规模', key: 'target_size', kind: 'number', placeholder: '如 500000000' },
+          { label: '首关规模', key: 'committed_size', kind: 'number' },
+          { label: '实缴总额', key: 'paid_in_size', kind: 'number' },
+          { label: '投资期' }, { label: '退出期' }, { label: '管理费率' },
+        ]],
+        ['治理披露', [
+          { label: '投委会成员' }, { label: '观察员' }, { label: '关键人士' },
+          { label: '关联交易规则' }, { label: 'LP 披露频率' }, { label: '审计安排' },
+        ]],
       ]
     : [
-        ['BP 与 AI 回填', ['BP 文件', 'AI 解析状态', '企业简称', '企业全称', '统一信用代码', '项目亮点']],
-        ['基础信息', ['负责人', '城市', '行业方向', '注册地', '融资轮次', '预估投资额']],
-        ['描述字段', ['产品服务', '商业模式', '主要客户', '竞争优势', '风险摘要', '下一步计划']],
+        ['基础信息', [
+          { label: '企业简称', key: 'short_name', required: true },
+          { label: '企业全称', key: 'legal_name' },
+          { label: '行业方向', key: 'industry_group' },
+          { label: '城市', key: 'city' },
+          { label: '统一信用代码' }, { label: '注册地' },
+        ]],
+        ['描述字段', [
+          { label: '项目亮点 / 摘要', key: 'summary' },
+          { label: '产品服务' }, { label: '商业模式' }, { label: '主要客户' },
+          { label: '竞争优势' }, { label: '下一步计划' },
+        ]],
       ]
 
   return (
     <form
+      ref={formRef}
       className="form-layout motion-item"
       onSubmit={async (event) => {
         event.preventDefault()
+        // 从表单真实输入构建 payload(只取有 key 的字段),数字字段做类型转换。
+        const fd = new FormData(event.currentTarget)
+        const allFields = groups.flatMap(([, fields]) => fields)
+        const payload: Record<string, unknown> = {}
+        for (const f of allFields) {
+          if (!f.key) continue
+          const raw = String(fd.get(f.key) ?? '').trim()
+          if (raw === '') continue
+          payload[f.key] = f.kind === 'number' ? Number(raw) : raw
+        }
         try {
-          const result =
-            screen.id === 'project-add'
-              ? await apiPost('/api/projects', {
-                  short_name: 'API Created Project',
-                  legal_name: 'API Created Project Co',
-                  industry_group: 'Enterprise Software',
-                  city: 'Shanghai',
-                  summary: 'Created from frontend form submit.',
-                })
-              : await apiPost('/api/funds', {
-                  fund_name: 'API Created Fund',
-                  legal_name: 'API Created Fund Partnership',
-                  target_size: 100000000,
-                  committed_size: 20000000,
-                  paid_in_size: 5000000,
-                  fund_status: 'raising',
-                })
+          const result = screen.id === 'project-add'
+            ? await apiPost('/api/projects', payload)
+            : await apiPost('/api/funds', payload)
           onToast({
             title: `${screen.title}已提交`,
             detail: auditDetail(result),
@@ -1156,16 +1353,19 @@ function FormPage({
           <fieldset className="form-section" key={group}>
             <legend>{group}</legend>
             <div className="form-grid">
-              {fields.map((field, index) => (
-                <label key={field}>
+              {fields.map((field) => (
+                <label key={field.label}>
                   <span>
-                    {field}
-                    {index < 3 && <i>必填</i>}
+                    {field.label}
+                    {field.required && <i>必填</i>}
+                    {field.key && !field.required && <i className="field-persisted">入库</i>}
                   </span>
                   <input
-                    required={index < 3}
+                    name={field.key}
+                    type={field.kind === 'number' ? 'number' : 'text'}
+                    required={field.required}
                     readOnly={!canWrite}
-                    placeholder={field.includes('文件') ? '选择或拖入附件' : `请输入${field}`}
+                    placeholder={field.placeholder ?? `请输入${field.label}`}
                   />
                 </label>
               ))}
@@ -1174,32 +1374,54 @@ function FormPage({
         ))}
       </section>
       <aside className="form-side">
-        <PanelTitle icon={Bot} title="AI 回填预览" />
-        <p>识别到 18 个字段建议，其中 11 个高置信度、5 个需人工复核、2 个不建议写入。</p>
-        <div className="review-list">
-          {['公司简称', '行业方向', '融资轮次', '核心风险'].map((item) => (
-            <div key={item}>
-              <CheckCircle size={15} />
-              <span>{item}</span>
-              <strong>可采纳</strong>
-            </div>
-          ))}
-        </div>
-        <button
-          className="secondary-button full-width"
-          type="button"
-          disabled={!canWrite}
-          onClick={() =>
-            runBackendAction(onToast, 'AI 建议已应用', {
-              action: 'form.ai_prefill.apply',
-              entity_type: screen.id.includes('fund') ? 'fund' : 'project',
-              entity_label: screen.title,
-              after: { screen_id: screen.id, accepted_fields: 4 },
-            })
-          }
-        >
-          应用 AI 建议
-        </button>
+        <PanelTitle icon={Bot} title="AI 回填(真模型)" />
+        {isFund ? (
+          <p>基金主档暂无 AI 抽取;项目「新增项目」支持粘贴 BP 文本由大模型抽取字段。</p>
+        ) : (
+          <>
+            <p>粘贴 BP / 项目介绍文本,由后端配置的大模型抽取结构化字段,一键回填左侧表单。</p>
+            <textarea
+              className="ai-bp-input"
+              placeholder="在此粘贴商业计划书或项目介绍…"
+              value={bpText}
+              readOnly={!canWrite}
+              onChange={(event) => setBpText(event.target.value)}
+              rows={5}
+            />
+            <button className="secondary-button full-width" type="button" disabled={!canWrite || aiBusy || !bpText.trim()} onClick={runAiParse}>
+              <Bot size={15} />
+              {aiBusy ? 'AI 解析中…' : 'AI 解析'}
+            </button>
+            {aiBusy && !aiFields && <AiProcessing messages={BP_MSGS} />}
+            {aiError && (
+              <div className="ai-hint is-error">
+                <AlertTriangle size={14} />
+                <span>{aiError}</span>
+              </div>
+            )}
+            {aiFields && (
+              <>
+                <div className="review-list">
+                  {[
+                    ['企业简称', aiFields.short_name],
+                    ['行业方向', aiFields.industry_group],
+                    ['城市', aiFields.city],
+                    ['融资轮次', aiFields.funding_round],
+                  ].map(([label, val]) => (
+                    <div key={String(label)}>
+                      <CheckCircle size={15} />
+                      <span>{String(label)}</span>
+                      <strong>{val ? String(val) : '—'}</strong>
+                    </div>
+                  ))}
+                </div>
+                <button className="secondary-button full-width" type="button" disabled={!canWrite} onClick={applyAi}>
+                  应用到表单
+                </button>
+              </>
+            )}
+          </>
+        )}
         <button
           className="secondary-button full-width"
           type="button"
@@ -1222,7 +1444,182 @@ function FormPage({
   )
 }
 
+// detail 屏可编辑的主档字段(与后端 PATCH 白名单一致)。
+const DETAIL_FIELDS: Record<'project' | 'fund', { key: string; label: string; kind?: 'number' }[]> = {
+  project: [
+    { key: 'short_name', label: '项目简称' },
+    { key: 'legal_name', label: '企业全称' },
+    { key: 'industry_group', label: '行业方向' },
+    { key: 'city', label: '城市' },
+    { key: 'stage_label', label: '阶段' },
+    { key: 'summary', label: '项目摘要' },
+  ],
+  fund: [
+    { key: 'fund_name', label: '基金简称' },
+    { key: 'legal_name', label: '基金全称' },
+    { key: 'fund_status', label: '状态' },
+    { key: 'target_size', label: '目标规模', kind: 'number' },
+    { key: 'committed_size', label: '认缴规模', kind: 'number' },
+    { key: 'paid_in_size', label: '实缴总额', kind: 'number' },
+    { key: 'net_asset_value', label: '净资产', kind: 'number' },
+  ],
+}
+
 function DetailPage({
+  screen,
+  canWrite,
+  onToast,
+}: {
+  screen: Screen
+  canWrite: boolean
+  onToast: (toast: Toast) => void
+}) {
+  const kind: 'project' | 'fund' | null = screen.id.startsWith('project-detail')
+    ? 'project'
+    : screen.id.startsWith('fund-detail')
+      ? 'fund'
+      : null
+
+  // 非 project/fund 的 detail(如投资人)暂沿用静态上下文面板。
+  if (kind === null) return <StaticDetailPage screen={screen} canWrite={canWrite} onToast={onToast} />
+
+  const listPath = kind === 'project' ? '/api/projects' : '/api/funds'
+  const fields = DETAIL_FIELDS[kind]
+  const nameKey = fields[0].key
+
+  const [entities, setEntities] = useState<Array<Record<string, unknown>>>([])
+  const [selectedId, setSelectedId] = useState<number | null>(null)
+  const [form, setForm] = useState<Record<string, string>>({})
+  const [loading, setLoading] = useState(true)
+  const [saving, setSaving] = useState(false)
+
+  // 载入实体列表(供选择)。
+  useEffect(() => {
+    let ignore = false
+    setLoading(true)
+    apiGet<{ items: Array<Record<string, unknown>> }>(listPath)
+      .then((res) => {
+        if (ignore) return
+        setEntities(res.items ?? [])
+        setSelectedId((prev) => prev ?? (res.items?.[0]?.id as number | undefined) ?? null)
+      })
+      .catch(() => !ignore && setEntities([]))
+      .finally(() => !ignore && setLoading(false))
+    return () => { ignore = true }
+  }, [listPath])
+
+  // 载入选中实体的详情 → 填充可编辑表单。
+  useEffect(() => {
+    if (selectedId == null) return
+    let ignore = false
+    apiGet<Record<string, unknown>>(`${listPath}/${selectedId}`)
+      .then((detail) => {
+        if (ignore) return
+        const next: Record<string, string> = {}
+        for (const f of fields) next[f.key] = detail[f.key] == null ? '' : String(detail[f.key])
+        setForm(next)
+      })
+      .catch(() => undefined)
+    return () => { ignore = true }
+  }, [selectedId, listPath])
+
+  const save = async () => {
+    if (selectedId == null) return
+    setSaving(true)
+    try {
+      const body: Record<string, unknown> = {}
+      for (const f of fields) {
+        const v = form[f.key]?.trim() ?? ''
+        if (v !== '') body[f.key] = f.kind === 'number' ? Number(v) : v
+      }
+      const result = await apiPatch(`${listPath}/${selectedId}`, body)
+      onToast({
+        title: '主档已保存',
+        detail: auditDetail(result),
+        action: `${kind}.update`,
+        entity: kind === 'project' ? 'cap_projects' : 'cap_funds',
+        result,
+      })
+      // 刷新列表里的名称显示
+      setEntities((prev) => prev.map((e) => (e.id === selectedId ? { ...e, [nameKey]: form[nameKey] } : e)))
+    } catch (error) {
+      onToast({ title: '保存失败', detail: error instanceof Error ? error.message : 'API 调用失败' })
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const entityName = form[nameKey] || (loading ? '加载中…' : '（无数据）')
+
+  return (
+    <div className="page-grid">
+      <section className="panel detail-hero two-thirds motion-item">
+        <div>
+          <span className="page-kicker">{screen.group}</span>
+          <h2>{entityName}</h2>
+          <p>真实主档:选择对象后加载后端数据,修改并保存直接落库(租户内 + 权限校验)。</p>
+        </div>
+        <div className="detail-actions">
+          <label className="detail-picker">
+            <span>选择{kind === 'project' ? '项目' : '基金'}</span>
+            <select
+              value={selectedId ?? ''}
+              onChange={(event) => setSelectedId(Number(event.target.value))}
+              data-testid="detail-entity-picker"
+            >
+              {entities.map((e) => (
+                <option key={String(e.id)} value={String(e.id)}>
+                  {String(e[nameKey] ?? e.name ?? e.id)}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+      </section>
+
+      <section className="panel motion-item">
+        <PanelTitle icon={Clock} title="关键时间线" />
+        <Timeline />
+      </section>
+
+      <section className="panel full-span motion-item">
+        <div className="tab-summary">
+          <strong>主档编辑</strong>
+          <span>{canWrite ? '修改字段后点「保存主档」写入后端并记审计。' : '当前角色只读,字段不可编辑。'}</span>
+        </div>
+        <div className="form-grid detail-edit-grid">
+          {fields.map((f) => (
+            <label key={f.key}>
+              <span>{f.label}</span>
+              <input
+                type={f.kind === 'number' ? 'number' : 'text'}
+                value={form[f.key] ?? ''}
+                readOnly={!canWrite}
+                data-field={f.key}
+                onChange={(event) => setForm((prev) => ({ ...prev, [f.key]: event.target.value }))}
+              />
+            </label>
+          ))}
+        </div>
+        <div className="button-row" style={{ marginTop: 14 }}>
+          <button
+            type="button"
+            className="primary-button"
+            disabled={!canWrite || saving || selectedId == null}
+            data-testid="detail-save"
+            onClick={save}
+          >
+            <CheckCircle size={16} />
+            {saving ? '保存中…' : '保存主档'}
+          </button>
+        </div>
+      </section>
+    </div>
+  )
+}
+
+// 非 project/fund 的 detail 屏(投资人等)保留原静态上下文面板。
+function StaticDetailPage({
   screen,
   canWrite,
   onToast,
@@ -1240,25 +1637,10 @@ function DetailPage({
       <section className="panel detail-hero two-thirds motion-item">
         <div>
           <span className="page-kicker">{screen.group}</span>
-          <h2>{screen.id.includes('fund') ? '成长一期基金' : screen.id.includes('investor') ? '华东产业母基金' : '澜舟机器人'}</h2>
+          <h2>{screen.id.includes('investor') ? '华东产业母基金' : screen.title}</h2>
           <p>主档、关联流程、文档、审计、权限和 AI 摘要全部使用同一对象上下文。</p>
         </div>
         <div className="detail-actions">
-          <button
-            type="button"
-            className="secondary-button"
-            onClick={() =>
-              runBackendAction(onToast, '审计日志已打开', {
-                action: 'detail.audit.open',
-                entity_type: 'detail_page',
-                entity_label: screen.title,
-                after: { screen_id: screen.id },
-              })
-            }
-          >
-            <Eye size={16} />
-            查看审计
-          </button>
           <button
             type="button"
             className="primary-button"
@@ -1807,15 +2189,28 @@ function ListPage({
   onToast: (toast: Toast) => void
 }) {
   const fallbackRows = useMemo(() => listRows(screen.id), [screen.id])
-  const { rows, source } = useBackendRows(screen.id, fallbackRows)
+  const [page, setPage] = useState(1)
+  const [reloadKey, setReloadKey] = useState(0)
+  useEffect(() => { setPage(1) }, [screen.id]) // 换屏回到第一页
+  const { rows, source, total, pageSize } = useBackendRows(screen.id, fallbackRows, page, reloadKey)
+  const totalPages = total != null ? Math.max(1, Math.ceil(total / pageSize)) : null
 
   return (
     <div className="page-grid">
       <section className="panel full-span motion-item">
         <PanelTitle icon={ListIcon(screen.id)} title={`${screen.title}台账`} />
         <DataSourceBadge source={source} />
-        <ListControls canWrite={canWrite} onToast={onToast} screen={screen} />
+        <ListControls canWrite={canWrite} onToast={onToast} screen={screen} onImported={() => { setPage(1); setReloadKey((k) => k + 1) }} />
         <DataTable rows={rows} />
+        {totalPages != null && (
+          <div className="pager" data-testid="pager">
+            <span className="pager-info">共 {total} 条 · 第 {page}/{totalPages} 页</span>
+            <div className="pager-btns">
+              <button type="button" className="secondary-button" disabled={page <= 1} onClick={() => setPage((p) => Math.max(1, p - 1))}>上一页</button>
+              <button type="button" className="secondary-button" disabled={page >= totalPages} onClick={() => setPage((p) => p + 1)}>下一页</button>
+            </div>
+          </div>
+        )}
       </section>
       <section className="panel two-thirds motion-item">
         <PanelTitle icon={Clock} title="状态与审计" />
@@ -1848,11 +2243,34 @@ function ListControls({
   screen,
   canWrite,
   onToast,
+  onImported,
 }: {
   screen: Screen
   canWrite: boolean
   onToast: (toast: Toast) => void
+  onImported?: () => void
 }) {
+  const fileRef = useRef<HTMLInputElement>(null)
+  const canImport = screen.id === 'project-list' || screen.id === 'project-board' // 导入目前落到项目表
+
+  const doImport = async (file: File) => {
+    try {
+      const text = await file.text()
+      const result = await apiPost<{ created: number; errors: unknown[] }>('/api/import/projects', { csv_text: text })
+      const errCount = Array.isArray(result.errors) ? result.errors.length : 0
+      onToast({
+        title: `导入完成:新增 ${result.created} 条${errCount ? `,${errCount} 行有误` : ''}`,
+        detail: auditDetail(result),
+        action: 'import.projects',
+        entity: 'cap_projects',
+        result,
+      })
+      onImported?.()
+    } catch (error) {
+      onToast({ title: '导入失败', detail: error instanceof Error ? error.message : 'API 调用失败' })
+    }
+  }
+
   return (
     <div className="list-controls">
       <label className="table-search">
@@ -1874,44 +2292,41 @@ function ListControls({
         <Filter size={16} />
         高级筛选
       </button>
+      <input
+        ref={fileRef}
+        type="file"
+        accept=".csv,text/csv"
+        style={{ display: 'none' }}
+        onChange={(event) => {
+          const file = event.target.files?.[0]
+          if (file) void doImport(file)
+          event.target.value = ''
+        }}
+      />
       <button
         className="secondary-button"
         type="button"
-        disabled={!canWrite}
-        onClick={async () => {
-          try {
-            const result = await apiPost('/api/import-export/tasks', {
-              task_kind: 'import',
-              entity_type: screen.id,
-              source_file_uri: `mock://uploads/${screen.id}.xlsx`,
-            })
-            onToast({ title: '导入任务已创建', detail: auditDetail(result) })
-          } catch (error) {
-            onToast({ title: '导入失败', detail: error instanceof Error ? error.message : 'API 调用失败' })
-          }
-        }}
+        disabled={!canWrite || !canImport}
+        title={canImport ? '上传 CSV 批量建项目' : '该模块暂不支持 CSV 导入'}
+        onClick={() => fileRef.current?.click()}
       >
         <Upload size={16} />
-        导入
+        导入 CSV
       </button>
       <button
         className="secondary-button"
         type="button"
-        disabled={!canWrite}
         onClick={async () => {
           try {
-            const result = await apiPost('/api/import-export/tasks', {
-              task_kind: 'export',
-              entity_type: screen.id,
-            })
-            onToast({ title: '导出任务已创建', detail: auditDetail(result) })
+            await apiDownload(`/api/export/${screen.id}`, `${screen.id}.csv`)
+            onToast({ title: '已导出 CSV', detail: `${screen.title}台账已下载` })
           } catch (error) {
             onToast({ title: '导出失败', detail: error instanceof Error ? error.message : 'API 调用失败' })
           }
         }}
       >
         <Download size={16} />
-        导出
+        导出 CSV
       </button>
       <button
         className="secondary-button"
