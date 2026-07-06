@@ -165,7 +165,8 @@ export async function apiDownload(path: string, filename: string): Promise<void>
   document.body.appendChild(a)
   a.click()
   a.remove()
-  URL.revokeObjectURL(url)
+  // 延迟释放:立即 revoke 可能在浏览器接管下载前就失效,导致下载空文件/失败。
+  setTimeout(() => URL.revokeObjectURL(url), 60_000)
 }
 
 export function auditDetail(result: ApiResult): string {

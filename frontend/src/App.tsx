@@ -808,28 +808,31 @@ function PageHeader({
           <Columns size={16} />
           显示列
         </button>
-        <button
-          type="button"
-          className="primary-button"
-          disabled={!canWrite}
-          onClick={async () => {
-            try {
-              const result = await apiPost(`/api/screens/${current.id}/primary-action`)
-              onToast({
-                title: current.primaryAction,
-                detail: auditDetail(result),
-                action: `screen.${current.id}.primary_action`,
-                entity: typeof result.affected_table === 'string' ? result.affected_table : 'screen',
-                result,
-              })
-            } catch (error) {
-              onToast({ title: '后端写入失败', detail: error instanceof Error ? error.message : 'API 调用失败' })
-            }
-          }}
-        >
-          <Plus size={16} />
-          {current.primaryAction}
-        </button>
+        {/* 文档屏的顶部通用主操作只会建占位记录,易与面板里真实「上传文件」混淆 → 隐藏。 */}
+        {current.kind !== 'documents' && (
+          <button
+            type="button"
+            className="primary-button"
+            disabled={!canWrite}
+            onClick={async () => {
+              try {
+                const result = await apiPost(`/api/screens/${current.id}/primary-action`)
+                onToast({
+                  title: current.primaryAction,
+                  detail: auditDetail(result),
+                  action: `screen.${current.id}.primary_action`,
+                  entity: typeof result.affected_table === 'string' ? result.affected_table : 'screen',
+                  result,
+                })
+              } catch (error) {
+                onToast({ title: '后端写入失败', detail: error instanceof Error ? error.message : 'API 调用失败' })
+              }
+            }}
+          >
+            <Plus size={16} />
+            {current.primaryAction}
+          </button>
+        )}
       </div>
     </section>
   )
