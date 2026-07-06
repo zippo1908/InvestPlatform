@@ -1469,6 +1469,44 @@ function FormPage({
         ]],
       ]
 
+  // 草稿:把有 key 的字段本地存草稿,下次进同一张表单自动回填;提交成功后清除。
+  const draftKey = `capitalos-draft-${screen.id}`
+  const setInputValue = (name: string, value: string) => {
+    const el = formRef.current?.querySelector<HTMLInputElement>(`input[name="${name}"], textarea[name="${name}"]`)
+    if (!el) return
+    const proto = el instanceof HTMLTextAreaElement ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype
+    const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set
+    setter?.call(el, value)
+    el.dispatchEvent(new Event('input', { bubbles: true }))
+  }
+  useEffect(() => {
+    const raw = localStorage.getItem(draftKey)
+    if (!raw) return
+    try {
+      const draft = JSON.parse(raw) as Record<string, string>
+      // 等 DOM 就绪再回填。
+      requestAnimationFrame(() => {
+        let n = 0
+        for (const [k, v] of Object.entries(draft)) { if (v) { setInputValue(k, v); n++ } }
+        if (n) onToast({ title: '已恢复上次草稿', detail: `${n} 个字段来自本地草稿,可继续编辑或直接提交` })
+      })
+    } catch { /* 坏草稿忽略 */ }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [draftKey])
+  const saveDraft = () => {
+    if (!formRef.current) return
+    const fd = new FormData(formRef.current)
+    const draft: Record<string, string> = {}
+    for (const f of groups.flatMap(([, fs]) => fs)) {
+      if (!f.key) continue
+      const v = String(fd.get(f.key) ?? '').trim()
+      if (v) draft[f.key] = v
+    }
+    if (!Object.keys(draft).length) { onToast({ title: '草稿为空', detail: '先填写至少一个入库字段再保存' }); return }
+    localStorage.setItem(draftKey, JSON.stringify(draft))
+    onToast({ title: '草稿已保存(本地)', detail: `${Object.keys(draft).length} 个字段已存在本浏览器,下次进入本表单自动回填` })
+  }
+
   return (
     <form
       ref={formRef}
@@ -1489,6 +1527,7 @@ function FormPage({
           const result = screen.id === 'project-add'
             ? await apiPost('/api/projects', payload)
             : await apiPost('/api/funds', payload)
+          localStorage.removeItem(draftKey)  // 提交成功即清草稿,避免下次误回填旧数据
           onToast({
             title: `${screen.title}已提交`,
             detail: auditDetail(result),
@@ -1589,14 +1628,7 @@ function FormPage({
         <button
           className="secondary-button full-width"
           type="button"
-          onClick={() =>
-            runBackendAction(onToast, '草稿已保存', {
-              action: 'form.draft.save',
-              entity_type: screen.id.includes('fund') ? 'fund' : 'project',
-              entity_label: screen.title,
-              after: { screen_id: screen.id, draft: true },
-            })
-          }
+          onClick={saveDraft}
         >
           保存草稿
         </button>
