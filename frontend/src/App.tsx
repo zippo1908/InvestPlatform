@@ -1849,6 +1849,84 @@ function StaticDetailPage({
   )
 }
 
+const FAMILY_LABEL: Record<string, string> = { project: '项目', fund: '基金', office: '办公', all: '全部' }
+
+// 审批委托:把某类工作流的审批权在一段时间内委托给同租户另一人(真写 cap_workflow_delegations)。
+function DelegationPanel({ canWrite, onToast, defaultFamily }: { canWrite: boolean; onToast: (t: Toast) => void; defaultFamily: string }) {
+  const [users, setUsers] = useState<Array<{ id: number; name: string }>>([])
+  const [dels, setDels] = useState<Array<Record<string, unknown>>>([])
+  const [form, setForm] = useState({ delegatee: '', family: defaultFamily, starts: '', ends: '', reason: '' })
+  const [reloadKey, setReloadKey] = useState(0)
+  const [busy, setBusy] = useState(false)
+
+  useEffect(() => { apiGet<{ items: Array<{ id: number; name: string }> }>('/api/users/simple').then((r) => setUsers(r.items || [])).catch(() => undefined) }, [])
+  useEffect(() => { apiGet<{ items: Array<Record<string, unknown>> }>('/api/delegations').then((r) => setDels(r.items || [])).catch(() => undefined) }, [reloadKey])
+
+  const save = async () => {
+    if (!form.delegatee) { onToast({ title: '请选择受托人', detail: '委托必须指定受托人' }); return }
+    setBusy(true)
+    try {
+      await apiPost('/api/delegations', {
+        delegatee_user_id: Number(form.delegatee),
+        workflow_family: form.family,
+        starts_at: form.starts || undefined,
+        ends_at: form.ends || undefined,
+        reason: form.reason || undefined,
+      })
+      onToast({ title: '委托已设置', detail: '审批权已按期委托', action: 'workflow.delegation.create', entity: 'cap_workflow_delegations' })
+      setForm((f) => ({ ...f, delegatee: '', reason: '' }))
+      setReloadKey((k) => k + 1)
+    } catch (error) {
+      onToast({ title: '设置失败', detail: error instanceof Error ? error.message : 'API 调用失败' })
+    } finally { setBusy(false) }
+  }
+  const revoke = async (id: number) => {
+    try { await apiPost(`/api/delegations/${id}/revoke`); onToast({ title: '委托已撤销', detail: '该委托已停用' }); setReloadKey((k) => k + 1) }
+    catch (error) { onToast({ title: '撤销失败', detail: error instanceof Error ? error.message : 'API 调用失败' }) }
+  }
+
+  return (
+    <section className="panel motion-item">
+      <PanelTitle icon={User} title="审批委托" />
+      <div className="delegate-card">
+        <label><span>委托给</span>
+          <select value={form.delegatee} onChange={(e) => setForm((f) => ({ ...f, delegatee: e.target.value }))} disabled={!canWrite}>
+            <option value="">选择受托人…</option>
+            {users.map((u) => <option key={u.id} value={u.id}>{u.name}</option>)}
+          </select>
+        </label>
+        <label><span>工作流类型</span>
+          <select value={form.family} onChange={(e) => setForm((f) => ({ ...f, family: e.target.value }))} disabled={!canWrite}>
+            {Object.entries(FAMILY_LABEL).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
+          </select>
+        </label>
+        <label><span>开始</span><input type="date" value={form.starts} onChange={(e) => setForm((f) => ({ ...f, starts: e.target.value }))} disabled={!canWrite} /></label>
+        <label><span>结束</span><input type="date" value={form.ends} onChange={(e) => setForm((f) => ({ ...f, ends: e.target.value }))} disabled={!canWrite} /></label>
+        <label><span>事由</span><input value={form.reason} onChange={(e) => setForm((f) => ({ ...f, reason: e.target.value }))} disabled={!canWrite} placeholder="如:出差期间代批" /></label>
+        <button className="primary-button full-width" type="button" disabled={!canWrite || busy} onClick={save} data-testid="delegate-save">{busy ? '提交中…' : '设置委托'}</button>
+      </div>
+      {dels.length > 0 && (
+        <div className="table-wrap" style={{ marginTop: 12 }} data-testid="delegation-list">
+          <table>
+            <thead><tr><th>委托人</th><th>受托人</th><th>类型</th><th>状态</th><th>操作</th></tr></thead>
+            <tbody>
+              {dels.map((d, i) => (
+                <tr key={i}>
+                  <td>{String(d.delegator ?? '')}</td>
+                  <td>{String(d.delegatee ?? '')}</td>
+                  <td>{FAMILY_LABEL[String(d.workflow_family)] || String(d.workflow_family)}</td>
+                  <td>{Number(d.is_active) ? '生效中' : '已撤销'}</td>
+                  <td>{Number(d.is_active) ? <button className="link-button" type="button" onClick={() => revoke(Number(d.id))}>撤销</button> : '—'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
+  )
+}
+
 function FlowPage({
   screen,
   canWrite,
@@ -1903,34 +1981,11 @@ function FlowPage({
         <PanelTitle icon={Clock} title="审批任务" />
         <DataTable rows={workflows} />
       </section>
-      <section className="panel motion-item">
-        <PanelTitle icon={User} title="委托设置" />
-        <div className="delegate-card">
-          <label>
-            <span>委托给</span>
-            <input readOnly={!canWrite} defaultValue="基金运营 / 赵岚" />
-          </label>
-          <label>
-            <span>有效期</span>
-            <input readOnly={!canWrite} defaultValue="2026-07-02 至 2026-07-12" />
-          </label>
-          <button
-            className="primary-button full-width"
-            type="button"
-            disabled={!canWrite}
-            onClick={() =>
-              runBackendAction(onToast, '委托已保存', {
-                action: 'workflow.delegation.save',
-                entity_type: 'workflow_delegation',
-                entity_label: screen.title,
-                after: { workflow_family: screen.id, delegatee: 'fund_operator' },
-              })
-            }
-          >
-            保存委托
-          </button>
-        </div>
-      </section>
+      <DelegationPanel
+        canWrite={canWrite}
+        onToast={onToast}
+        defaultFamily={screen.id === 'flow-project' ? 'project' : screen.id === 'flow-fund' ? 'fund' : screen.id === 'flow-oa' ? 'office' : 'all'}
+      />
     </div>
   )
 }

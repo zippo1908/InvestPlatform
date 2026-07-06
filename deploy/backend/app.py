@@ -181,6 +181,14 @@ class AiConfigPayload(BaseModel):
     timeout: int | None = None
 
 
+class DelegationPayload(BaseModel):
+    delegatee_user_id: int
+    workflow_family: str = "all"  # project | fund | office | all
+    starts_at: str | None = None  # ISO / YYYY-MM-DD;缺省=现在
+    ends_at: str | None = None    # 缺省=+30 天
+    reason: str | None = None
+
+
 SCREENS: list[dict[str, str]] = [
     {"id": "login", "title": "Login", "group": "Entry"},
     {"id": "workbench", "title": "Executive Workbench", "group": "Workspace"},
@@ -2497,6 +2505,125 @@ def download_file(uri: str, user: AuthedUser = Depends(current_user)) -> FileRes
     if not os.path.isfile(path):
         raise HTTPException(status_code=404, detail="文件不存在")
     return FileResponse(path, filename=os.path.basename(rel).split("__", 1)[-1])
+
+
+# ── 审批委托(cap_workflow_delegations)──────────────────────────────────────
+def _same_tenant_user_ids_sql() -> str:
+    # 同租户 = 组织树里 根公司(=tenant) 或其直属部门下的用户。
+    return "org_id IN (SELECT org_id FROM cap_organizations WHERE org_id=%s OR parent_org_id=%s)"
+
+
+@app.get("/api/users/simple")
+def list_users_simple(user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
+    """同租户用户(供委托等选择)。"""
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"SELECT user_id AS id, display_name AS name, login_name FROM cap_users WHERE {_same_tenant_user_ids_sql()} AND account_status='active' AND deleted_at IS NULL ORDER BY display_name",
+                (tid, tid),
+            )
+            rows = cursor.fetchall()
+    finally:
+        connection.close()
+    return {"items": rows}
+
+
+def _parse_dt(s: str | None, default: datetime) -> datetime:
+    if not s:
+        return default
+    try:
+        return datetime.fromisoformat(s.replace("Z", "").strip())
+    except ValueError:
+        return default
+
+
+@app.get("/api/delegations")
+def list_delegations(user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
+    """与我相关的委托(我委托出去的 + 委托给我的)。"""
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT d.delegation_id AS id, d.workflow_family, d.starts_at, d.ends_at, d.is_active, d.reason,
+                       du.display_name AS delegator, eu.display_name AS delegatee,
+                       d.delegator_user_id, d.delegatee_user_id
+                FROM cap_workflow_delegations d
+                LEFT JOIN cap_users du ON du.user_id=d.delegator_user_id
+                LEFT JOIN cap_users eu ON eu.user_id=d.delegatee_user_id
+                WHERE d.delegator_user_id=%s OR d.delegatee_user_id=%s
+                ORDER BY d.delegation_id DESC
+                """,
+                (user.user_id, user.user_id),
+            )
+            rows = cursor.fetchall()
+    finally:
+        connection.close()
+    return {"items": rows}
+
+
+@app.post("/api/delegations")
+def create_delegation(payload: DelegationPayload, user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
+    """设置审批委托:把某类工作流的审批权在一段时间内委托给同租户的另一人。"""
+    if payload.delegatee_user_id == user.user_id:
+        raise HTTPException(status_code=400, detail="不能委托给自己")
+    fam = payload.workflow_family if payload.workflow_family in {"project", "fund", "office", "all"} else "all"
+    now = datetime.now()
+    starts = _parse_dt(payload.starts_at, now)
+    ends = _parse_dt(payload.ends_at, now + timedelta(days=30))
+    if ends <= starts:
+        raise HTTPException(status_code=400, detail="结束时间必须晚于开始时间")
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            # 校验受托人同租户
+            cursor.execute(
+                f"SELECT display_name FROM cap_users WHERE user_id=%s AND {_same_tenant_user_ids_sql()}",
+                (payload.delegatee_user_id, tid, tid),
+            )
+            target = cursor.fetchone()
+            if target is None:
+                raise HTTPException(status_code=404, detail="受托人不存在或不在同一租户")
+            cursor.execute(
+                """
+                INSERT INTO cap_workflow_delegations
+                  (delegator_user_id, delegatee_user_id, workflow_family, starts_at, ends_at, is_active, reason)
+                VALUES (%s, %s, %s, %s, %s, 1, %s)
+                """,
+                (user.user_id, payload.delegatee_user_id, fam, starts, ends, payload.reason),
+            )
+            did = int(cursor.lastrowid)
+            audit_id = write_audit(cursor, user.user_id, "workflow.delegation.create", "delegation", did, target["display_name"], after={"family": fam})
+        connection.commit()
+    finally:
+        connection.close()
+    return {"ok": True, "delegation_id": did, "audit_id": audit_id}
+
+
+@app.post("/api/delegations/{delegation_id}/revoke")
+def revoke_delegation(delegation_id: int, user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
+    """撤销我发起的委托。"""
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT delegator_user_id FROM cap_workflow_delegations WHERE delegation_id=%s",
+                (delegation_id,),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail="委托不存在")
+            if row["delegator_user_id"] != user.user_id:
+                raise HTTPException(status_code=403, detail="只能撤销自己发起的委托")
+            cursor.execute("UPDATE cap_workflow_delegations SET is_active=0 WHERE delegation_id=%s", (delegation_id,))
+            audit_id = write_audit(cursor, user.user_id, "workflow.delegation.revoke", "delegation", delegation_id, str(delegation_id))
+        connection.commit()
+    finally:
+        connection.close()
+    return {"ok": True, "audit_id": audit_id}
 
 
 @app.get("/api/db/ping")
