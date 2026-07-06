@@ -1061,6 +1061,38 @@ function AiPage({
   const [answer, setAnswer] = useState<string | null>(null)
   const [aiBusy, setAiBusy] = useState(false)
   const [aiError, setAiError] = useState<string | null>(null)
+  const [editing, setEditing] = useState(false)
+  const [savedAt, setSavedAt] = useState<string | null>(null)
+
+  // 自动草稿:解析耗时长,切页签会丢结果 → 把「材料 + 指令 + 结果」按屏本地留存,
+  // 回到本屏自动恢复;结果可切换为可编辑草稿;清空交给显式按钮,不在自动逻辑里误删。
+  const draftKey = `capitalos-ai-draft-${screen.id}`
+  const restoredRef = useRef(false)
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(draftKey)
+      if (raw) {
+        const d = JSON.parse(raw) as { text?: string; instruction?: string; answer?: string | null; savedAt?: string }
+        if (d.text) setText(d.text)
+        if (d.instruction) setInstruction(d.instruction)
+        if (d.answer) setAnswer(d.answer)
+        if (d.savedAt) setSavedAt(d.savedAt)
+      }
+    } catch { /* 坏草稿忽略 */ }
+    restoredRef.current = true
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [draftKey])
+  useEffect(() => {
+    if (!restoredRef.current) return
+    if (!text && !instruction && !answer) return // 全空不主动写/删,清空由按钮负责
+    const ts = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
+    try { localStorage.setItem(draftKey, JSON.stringify({ text, instruction, answer, savedAt: ts })) } catch { /* 配额满忽略 */ }
+    setSavedAt(ts)
+  }, [text, instruction, answer, draftKey])
+  const clearDraft = () => {
+    setText(''); setInstruction(''); setAnswer(null); setEditing(false); setSavedAt(null); setAiError(null)
+    localStorage.removeItem(draftKey)
+  }
 
   const run = async () => {
     if (!text.trim()) return
@@ -1157,8 +1189,28 @@ function AiPage({
 
       <section className="panel two-thirds motion-item">
         <PanelTitle icon={Bot} title={meeting ? '纪要解析结果(真模型)' : 'AI 输出工作台(真模型)'} />
+        {(answer || savedAt) && (
+          <div className="ai-answer-tools" data-testid="ai-draft-bar">
+            {answer != null && !aiBusy && (
+              <button type="button" className="link-button" disabled={!canWrite} onClick={() => setEditing((e) => !e)}>
+                {editing ? '预览' : '编辑结果'}
+              </button>
+            )}
+            <button type="button" className="link-button danger" disabled={aiBusy} onClick={clearDraft}>清空草稿</button>
+            {savedAt && <span className="muted-note" data-testid="ai-draft-saved">草稿已自动保存 · {savedAt}(切页签不丢)</span>}
+          </div>
+        )}
         {aiBusy && !answer ? (
           <AiProcessing messages={meeting ? MEETING_MSGS : WORKSPACE_MSGS} />
+        ) : editing && answer != null ? (
+          <textarea
+            className="ai-bp-input"
+            data-testid="ai-answer-edit"
+            value={answer}
+            onChange={(event) => setAnswer(event.target.value)}
+            rows={14}
+            aria-label="编辑解析结果"
+          />
         ) : answer ? (
           <div className="ai-answer" data-testid="ai-answer">
             <Markdown text={answer} />
@@ -1455,6 +1507,27 @@ function FormPage({
         ]],
       ]
 
+  // BP 解析草稿:解析耗时长,切页签会丢 → 自动把 BP 正文 + AI 抽取结果按屏留存,回本屏自动恢复。
+  const bpDraftKey = `capitalos-bp-draft-${screen.id}`
+  const bpRestoredRef = useRef(false)
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(bpDraftKey)
+      if (raw) {
+        const d = JSON.parse(raw) as { bpText?: string; aiFields?: Record<string, unknown> | null }
+        if (d.bpText) setBpText(d.bpText)
+        if (d.aiFields) setAiFields(d.aiFields)
+      }
+    } catch { /* 坏草稿忽略 */ }
+    bpRestoredRef.current = true
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bpDraftKey])
+  useEffect(() => {
+    if (!bpRestoredRef.current) return
+    if (!bpText && !aiFields) return // 全空不主动写/删
+    try { localStorage.setItem(bpDraftKey, JSON.stringify({ bpText, aiFields })) } catch { /* 配额满忽略 */ }
+  }, [bpText, aiFields, bpDraftKey])
+
   // 草稿:把有 key 的字段本地存草稿,下次进同一张表单自动回填;提交成功后清除。
   const draftKey = `capitalos-draft-${screen.id}`
   const setInputValue = (name: string, value: string) => {
@@ -1514,6 +1587,7 @@ function FormPage({
             ? await apiPost('/api/projects', payload)
             : await apiPost('/api/funds', payload)
           localStorage.removeItem(draftKey)  // 提交成功即清草稿,避免下次误回填旧数据
+          localStorage.removeItem(bpDraftKey)  // BP 解析草稿同样清除
           onToast({
             title: `${screen.title}已提交`,
             detail: auditDetail(result),
@@ -1607,6 +1681,7 @@ function FormPage({
                 <button className="secondary-button full-width" type="button" disabled={!canWrite} onClick={applyAi}>
                   应用到表单
                 </button>
+                <p className="muted-note" data-testid="bp-draft-hint">解析结果已自动保存,切换页签也不会丢;提交后自动清除。</p>
               </>
             )}
           </>
