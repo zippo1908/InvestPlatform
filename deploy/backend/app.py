@@ -416,7 +416,7 @@ LEDGER_QUERIES: dict[str, str] = {
                purge_status AS '状态', deleted_at AS '删除时间',
                recoverable_until AS '保留到期'
         FROM cap_recycle_items
-        WHERE tenant_id=%s
+        WHERE tenant_id=%s AND purge_status <> 'purged'
         ORDER BY recycle_item_id DESC
         """,
 }
@@ -1656,6 +1656,40 @@ def restore_recycle_item(recycle_item_id: int, user: AuthedUser = Depends(requir
                 after={"status": "restored"},
                 risk_level="medium",
             )
+        connection.commit()
+    finally:
+        connection.close()
+    return {"ok": True, "recycle_item_id": recycle_item_id, "audit_id": audit_id}
+
+
+@app.post("/api/recycle/{recycle_item_id}/purge")
+def purge_recycle_item(recycle_item_id: int, user: AuthedUser = Depends(require_roles("system_admin", "managing_partner"))) -> dict[str, Any]:
+    """彻底删除:标记 purged(不可恢复)并硬删除底层已软删的实体,回收站列表不再显示。"""
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT object_label, object_type, object_id, purge_status FROM cap_recycle_items WHERE recycle_item_id=%s AND tenant_id=%s",
+                (recycle_item_id, tenant_of(user)),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail="Recycle item not found")
+            cursor.execute(
+                "UPDATE cap_recycle_items SET purge_status='purged' WHERE recycle_item_id=%s AND tenant_id=%s",
+                (recycle_item_id, tenant_of(user)),
+            )
+            # 硬删已软删的实体(仅当处于软删状态,避免误删已恢复的)。
+            tbl = _RECYCLE_TABLES.get(row["object_type"])
+            if tbl:
+                try:
+                    cursor.execute(
+                        f"DELETE FROM {tbl[0]} WHERE {tbl[1]}=%s AND tenant_id=%s AND deleted_at IS NOT NULL",
+                        (row["object_id"], tenant_of(user)),
+                    )
+                except Exception:  # noqa: BLE001 —— 有外键引用则保留软删,仅标 purged
+                    pass
+            audit_id = write_audit(cursor, user.user_id, "recycle.purge", "recycle_item", recycle_item_id, row["object_label"], risk_level="high")
         connection.commit()
     finally:
         connection.close()

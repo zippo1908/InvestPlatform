@@ -2467,6 +2467,20 @@ function RecyclePage({
     }
   }
 
+  const purge = async (id: number, label: string) => {
+    if (!window.confirm(`彻底删除「${label}」?此操作不可恢复。`)) return
+    setBusyId(id)
+    try {
+      const result = await apiPost(`/api/recycle/${id}/purge`)
+      onToast({ title: '已彻底删除', detail: auditDetail(result), action: 'recycle.purge', entity: 'cap_recycle_items', result })
+      setReloadKey((k) => k + 1)
+    } catch (error) {
+      onToast({ title: '彻底删除失败', detail: error instanceof Error ? error.message : 'API 调用失败' })
+    } finally {
+      setBusyId(null)
+    }
+  }
+
   const cols = rows[0] ? Object.keys(rows[0]).filter((c) => !c.startsWith('__')) : []
 
   return (
@@ -2485,11 +2499,16 @@ function RecyclePage({
               return (
                 <tr key={i}>
                   {cols.map((c) => <td key={c}>{String(r[c] ?? '')}</td>)}
-                  <td>
+                  <td style={{ display: 'flex', gap: 8 }}>
                     {recoverable ? (
-                      <button className="secondary-button" type="button" disabled={!canWrite || busyId === id} onClick={() => restore(id)}>
-                        <CheckCircle size={14} /> {busyId === id ? '恢复中…' : '恢复'}
-                      </button>
+                      <>
+                        <button className="secondary-button" type="button" disabled={!canWrite || busyId === id} onClick={() => restore(id)}>
+                          <CheckCircle size={14} /> {busyId === id ? '处理中…' : '恢复'}
+                        </button>
+                        <button className="danger-button" type="button" disabled={!canWrite || busyId === id} onClick={() => purge(id, String(r['对象'] ?? id))}>
+                          <Trash size={14} /> 彻底删除
+                        </button>
+                      </>
                     ) : (
                       <span className="muted">—</span>
                     )}
