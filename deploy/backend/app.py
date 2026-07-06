@@ -11,7 +11,10 @@ from typing import Any
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
+
+# 数据校验共用枚举/常量(与 DB enum 对齐)。
+_FUND_STATUS = {"planning", "raising", "investing", "harvesting", "extended", "closed"}
 
 import auth
 import llm
@@ -43,20 +46,43 @@ class GenericActionPayload(BaseModel):
 
 
 class CreateProjectPayload(BaseModel):
-    short_name: str
-    legal_name: str | None = None
-    industry_group: str = "Enterprise Software"
-    city: str = "Shanghai"
-    summary: str | None = None
+    short_name: str = Field(min_length=1, max_length=120)
+    legal_name: str | None = Field(default=None, max_length=200)
+    industry_group: str = Field(default="Enterprise Software", max_length=120)
+    city: str = Field(default="Shanghai", max_length=80)
+    summary: str | None = Field(default=None, max_length=2000)
+
+    @field_validator("short_name")
+    @classmethod
+    def _nonblank_name(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("项目名称不能为空")
+        return v
 
 
 class CreateFundPayload(BaseModel):
-    fund_name: str
-    legal_name: str | None = None
-    target_size: float = 100000000
-    committed_size: float = 0
-    paid_in_size: float = 0
+    fund_name: str = Field(min_length=1, max_length=180)
+    legal_name: str | None = Field(default=None, max_length=200)
+    target_size: float = Field(default=100000000, ge=0)
+    committed_size: float = Field(default=0, ge=0)
+    paid_in_size: float = Field(default=0, ge=0)
     fund_status: str = "planning"
+
+    @field_validator("fund_name")
+    @classmethod
+    def _nonblank_name(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("基金名称不能为空")
+        return v
+
+    @field_validator("fund_status")
+    @classmethod
+    def _valid_status(cls, v: str) -> str:
+        if v not in _FUND_STATUS:
+            raise ValueError(f"fund_status 必须是 {sorted(_FUND_STATUS)} 之一")
+        return v
 
 
 class CreateDocumentPayload(BaseModel):
@@ -96,22 +122,32 @@ class PreferencePayload(BaseModel):
 
 
 class UpdateProjectPayload(BaseModel):
-    short_name: str | None = None
-    legal_name: str | None = None
-    industry_group: str | None = None
-    city: str | None = None
-    summary: str | None = None
-    stage_label: str | None = None
+    short_name: str | None = Field(default=None, min_length=1, max_length=120)
+    legal_name: str | None = Field(default=None, max_length=200)
+    industry_group: str | None = Field(default=None, max_length=120)
+    city: str | None = Field(default=None, max_length=80)
+    summary: str | None = Field(default=None, max_length=2000)
+    stage_label: str | None = Field(default=None, max_length=80)
+    # 乐观锁:前端把加载时的 updated_at 回传;与库中不一致 → 409(有人先改了)。
+    expected_updated_at: str | None = None
 
 
 class UpdateFundPayload(BaseModel):
-    fund_name: str | None = None
-    legal_name: str | None = None
+    fund_name: str | None = Field(default=None, min_length=1, max_length=180)
+    legal_name: str | None = Field(default=None, max_length=200)
     fund_status: str | None = None
-    target_size: float | None = None
-    committed_size: float | None = None
-    paid_in_size: float | None = None
-    net_asset_value: float | None = None
+    target_size: float | None = Field(default=None, ge=0)
+    committed_size: float | None = Field(default=None, ge=0)
+    paid_in_size: float | None = Field(default=None, ge=0)
+    net_asset_value: float | None = Field(default=None, ge=0)
+    expected_updated_at: str | None = None
+
+    @field_validator("fund_status")
+    @classmethod
+    def _valid_status(cls, v: str | None) -> str | None:
+        if v is not None and v not in _FUND_STATUS:
+            raise ValueError(f"fund_status 必须是 {sorted(_FUND_STATUS)} 之一")
+        return v
 
 
 class ImportCsvPayload(BaseModel):
@@ -1128,18 +1164,22 @@ def update_project(
 ) -> dict[str, Any]:
     """编辑项目字段(租户内 + project.edit)—— detail 屏保存。只更新传入的字段。"""
     fields = {k: v for k, v in payload.model_dump().items() if v is not None}
+    expected = fields.pop("expected_updated_at", None)  # 乐观锁字段不入 SET
     if not fields:
         raise HTTPException(status_code=400, detail="No fields to update")
     connection = connect_db()
     try:
         with connection.cursor() as cursor:
             cursor.execute(
-                "SELECT short_name FROM cap_projects WHERE project_id=%s AND tenant_id=%s AND deleted_at IS NULL",
+                "SELECT short_name, updated_at FROM cap_projects WHERE project_id=%s AND tenant_id=%s AND deleted_at IS NULL",
                 (project_id, tenant_of(user)),
             )
             before = cursor.fetchone()
             if before is None:
                 raise HTTPException(status_code=404, detail="Project not found")
+            # 乐观锁:加载后若被他人改过,updated_at 会变,拒绝覆盖。
+            if expected and before["updated_at"] and before["updated_at"].isoformat() != expected:
+                raise HTTPException(status_code=409, detail="记录已被他人修改,请刷新后重试")
             set_clause = ", ".join(f"{col}=%s" for col in fields)
             cursor.execute(
                 f"UPDATE cap_projects SET {set_clause} WHERE project_id=%s AND tenant_id=%s",
@@ -1219,18 +1259,21 @@ def update_fund(
 ) -> dict[str, Any]:
     """编辑基金字段(租户内 + 基金运营类角色)。"""
     fields = {k: v for k, v in payload.model_dump().items() if v is not None}
+    expected = fields.pop("expected_updated_at", None)
     if not fields:
         raise HTTPException(status_code=400, detail="No fields to update")
     connection = connect_db()
     try:
         with connection.cursor() as cursor:
             cursor.execute(
-                "SELECT fund_name FROM cap_funds WHERE fund_id=%s AND tenant_id=%s AND deleted_at IS NULL",
+                "SELECT fund_name, updated_at FROM cap_funds WHERE fund_id=%s AND tenant_id=%s AND deleted_at IS NULL",
                 (fund_id, tenant_of(user)),
             )
             before = cursor.fetchone()
             if before is None:
                 raise HTTPException(status_code=404, detail="Fund not found")
+            if expected and before["updated_at"] and before["updated_at"].isoformat() != expected:
+                raise HTTPException(status_code=409, detail="记录已被他人修改,请刷新后重试")
             set_clause = ", ".join(f"{col}=%s" for col in fields)
             cursor.execute(
                 f"UPDATE cap_funds SET {set_clause} WHERE fund_id=%s AND tenant_id=%s",

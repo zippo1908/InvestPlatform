@@ -1490,6 +1490,7 @@ function DetailPage({
   const [entities, setEntities] = useState<Array<Record<string, unknown>>>([])
   const [selectedId, setSelectedId] = useState<number | null>(null)
   const [form, setForm] = useState<Record<string, string>>({})
+  const [loadedAt, setLoadedAt] = useState<string | null>(null) // 乐观锁:加载时的 updated_at
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
 
@@ -1518,6 +1519,7 @@ function DetailPage({
         const next: Record<string, string> = {}
         for (const f of fields) next[f.key] = detail[f.key] == null ? '' : String(detail[f.key])
         setForm(next)
+        setLoadedAt(detail.updated_at ? String(detail.updated_at) : null)
       })
       .catch(() => undefined)
     return () => { ignore = true }
@@ -1532,6 +1534,7 @@ function DetailPage({
         const v = form[f.key]?.trim() ?? ''
         if (v !== '') body[f.key] = f.kind === 'number' ? Number(v) : v
       }
+      if (loadedAt) body.expected_updated_at = loadedAt // 乐观锁:提交加载时的版本
       const result = await apiPatch(`${listPath}/${selectedId}`, body)
       onToast({
         title: '主档已保存',
@@ -1540,8 +1543,11 @@ function DetailPage({
         entity: kind === 'project' ? 'cap_projects' : 'cap_funds',
         result,
       })
-      // 刷新列表里的名称显示
+      // 刷新列表里的名称显示,并重取最新 updated_at(否则同一页再存会误报冲突)
       setEntities((prev) => prev.map((e) => (e.id === selectedId ? { ...e, [nameKey]: form[nameKey] } : e)))
+      apiGet<Record<string, unknown>>(`${listPath}/${selectedId}`)
+        .then((d) => setLoadedAt(d.updated_at ? String(d.updated_at) : null))
+        .catch(() => undefined)
     } catch (error) {
       onToast({ title: '保存失败', detail: error instanceof Error ? error.message : 'API 调用失败' })
     } finally {
