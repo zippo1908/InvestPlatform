@@ -1333,6 +1333,31 @@ tbody tr:hover {
   line-height: 1.55;
 }
 
+/* 流程模板卡里的有序步骤链 */
+.flow-steps {
+  margin: 0;
+  padding-left: 18px;
+  display: grid;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+.flow-steps li { list-style: decimal; }
+
+/* 审批任务行内操作(通过/驳回/转办) */
+.row-actions {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+.link-button.danger { color: var(--danger, #c0392b); }
+.link-button:disabled { opacity: 0.45; cursor: not-allowed; }
+.muted-note {
+  color: var(--muted);
+  font-size: 12.5px;
+}
+
 .delegate-card {
   display: grid;
   gap: 12px;

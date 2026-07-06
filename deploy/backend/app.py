@@ -819,16 +819,34 @@ def start_workflow_record(cursor: Any, payload: StartWorkflowPayload, actor_user
         ),
     )
     instance_id = int(cursor.lastrowid)
+    # 取模板第一步(sort_order 最小),建首步任务;若模板没配步骤则回落到笼统首节点。
+    cursor.execute(
+        """
+        SELECT workflow_step_id, step_key, step_name
+        FROM cap_workflow_steps WHERE workflow_template_id=%s
+        ORDER BY sort_order, workflow_step_id LIMIT 1
+        """,
+        (template["workflow_template_id"],),
+    )
+    first_step = cursor.fetchone()
+    step_id = first_step["workflow_step_id"] if first_step else None
+    step_name = first_step["step_name"] if first_step else "首节点审批"
+    if first_step:
+        cursor.execute(
+            "UPDATE cap_workflow_instances SET current_step_key=%s WHERE workflow_instance_id=%s",
+            (first_step["step_key"], instance_id),
+        )
     cursor.execute(
         """
         INSERT INTO cap_workflow_tasks
           (workflow_instance_id, workflow_step_id, task_code, task_name, assigned_user_id, task_status, due_at, tenant_id)
-        VALUES (%s, NULL, %s, %s, %s, 'pending', %s, %s)
+        VALUES (%s, %s, %s, %s, %s, 'pending', %s, %s)
         """,
         (
             instance_id,
+            step_id,
             f"WFT-API-{uuid.uuid4().hex[:8].upper()}",
-            f"{template['template_name']}首节点审批",
+            f"{step_name}({template['template_name']})",
             actor_user_id,
             datetime.now(),
             _tenant_for_user(cursor, actor_user_id),
@@ -1456,6 +1474,30 @@ def workflow_tasks(user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
     return {"count": len(rows), "items": rows}
 
 
+@app.get("/api/workflow/templates")
+def workflow_templates(user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
+    """流程模板 + 有序步骤(前端据此渲染真实编排链,替代写死的模板数)。"""
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT workflow_template_id AS id, workflow_family, template_name FROM cap_workflow_templates ORDER BY workflow_family, workflow_template_id"
+            )
+            templates = cursor.fetchall()
+            cursor.execute(
+                "SELECT workflow_template_id AS tid, step_key, step_name, step_type, sort_order FROM cap_workflow_steps ORDER BY workflow_template_id, sort_order"
+            )
+            steps = cursor.fetchall()
+    finally:
+        connection.close()
+    by_tpl: dict[int, list[dict[str, Any]]] = {}
+    for s in steps:
+        by_tpl.setdefault(s["tid"], []).append(s)
+    for t in templates:
+        t["steps"] = by_tpl.get(t["id"], [])
+    return {"count": len(templates), "items": templates}
+
+
 @app.post("/api/workflow/instances")
 def start_workflow(payload: StartWorkflowPayload, user: AuthedUser = Depends(require_roles("system_admin", "managing_partner", "fund_operator", "risk_legal", "investment_manager"))) -> dict[str, Any]:
     connection = connect_db()
@@ -1478,25 +1520,83 @@ def act_workflow_task(
     if payload.action not in allowed:
         raise HTTPException(status_code=400, detail="Unsupported workflow action")
 
+    tid = tenant_of(user)
+    now = datetime.now()
     connection = connect_db()
     try:
         with connection.cursor() as cursor:
+            # 连 instance/step/template 一起取,才能做流转。
             cursor.execute(
-                "SELECT task_name, task_status FROM cap_workflow_tasks WHERE workflow_task_id=%s AND tenant_id=%s",
-                (task_id, tenant_of(user)),
+                """
+                SELECT t.task_name, t.task_status, t.workflow_instance_id, t.workflow_step_id,
+                       i.title AS instance_title, i.instance_status,
+                       i.workflow_template_id, s.sort_order AS cur_order
+                FROM cap_workflow_tasks t
+                JOIN cap_workflow_instances i ON i.workflow_instance_id=t.workflow_instance_id
+                LEFT JOIN cap_workflow_steps s ON s.workflow_step_id=t.workflow_step_id
+                WHERE t.workflow_task_id=%s AND t.tenant_id=%s
+                """,
+                (task_id, tid),
             )
             row = cursor.fetchone()
             if row is None:
                 raise HTTPException(status_code=404, detail="Workflow task not found")
+            if row["task_status"] != "pending":
+                raise HTTPException(status_code=409, detail=f"任务已处理({row['task_status']}),不能重复操作")
+
             next_status = allowed[payload.action]
             cursor.execute(
-                """
-                UPDATE cap_workflow_tasks
-                SET task_status=%s, acted_at=%s, action_comment=%s
-                WHERE workflow_task_id=%s AND tenant_id=%s
-                """,
-                (next_status, datetime.now(), payload.comment, task_id, tenant_of(user)),
+                "UPDATE cap_workflow_tasks SET task_status=%s, acted_at=%s, action_comment=%s WHERE workflow_task_id=%s AND tenant_id=%s",
+                (next_status, now, payload.comment, task_id, tid),
             )
+
+            # 流转:approve → 有下一步则建下一步任务并推进实例;无则实例 approved(闭环)。
+            #       reject → 实例 rejected(终止,退回发起人)。transfer/archive 只作用于该任务。
+            instance_id = row["workflow_instance_id"]
+            flow: dict[str, Any] = {}
+            if payload.action == "approve":
+                next_step = None
+                if row["cur_order"] is not None:
+                    cursor.execute(
+                        """
+                        SELECT workflow_step_id, step_key, step_name FROM cap_workflow_steps
+                        WHERE workflow_template_id=%s AND sort_order>%s
+                        ORDER BY sort_order, workflow_step_id LIMIT 1
+                        """,
+                        (row["workflow_template_id"], row["cur_order"]),
+                    )
+                    next_step = cursor.fetchone()
+                if next_step:
+                    cursor.execute(
+                        """
+                        INSERT INTO cap_workflow_tasks
+                          (workflow_instance_id, workflow_step_id, task_code, task_name, assigned_user_id, task_status, due_at, tenant_id)
+                        VALUES (%s, %s, %s, %s, %s, 'pending', %s, %s)
+                        """,
+                        (instance_id, next_step["workflow_step_id"], f"WFT-API-{uuid.uuid4().hex[:8].upper()}",
+                         next_step["step_name"], user.user_id, now, tid),
+                    )
+                    new_task_id = int(cursor.lastrowid)
+                    cursor.execute(
+                        "UPDATE cap_workflow_instances SET current_step_key=%s WHERE workflow_instance_id=%s AND tenant_id=%s",
+                        (next_step["step_key"], instance_id, tid),
+                    )
+                    flow = {"instance_status": "running", "next_step": next_step["step_name"], "next_task_id": new_task_id}
+                else:
+                    cursor.execute(
+                        "UPDATE cap_workflow_instances SET instance_status='approved', current_step_key='end', completed_at=%s WHERE workflow_instance_id=%s AND tenant_id=%s",
+                        (now, instance_id, tid),
+                    )
+                    flow = {"instance_status": "approved", "next_step": None}
+            elif payload.action == "reject":
+                cursor.execute(
+                    "UPDATE cap_workflow_instances SET instance_status='rejected', completed_at=%s WHERE workflow_instance_id=%s AND tenant_id=%s",
+                    (now, instance_id, tid),
+                )
+                flow = {"instance_status": "rejected", "next_step": None}
+            else:
+                flow = {"instance_status": row["instance_status"], "next_step": None}
+
             audit_id = write_audit(
                 cursor,
                 user.user_id,
@@ -1505,13 +1605,13 @@ def act_workflow_task(
                 task_id,
                 row["task_name"],
                 before={"status": row["task_status"]},
-                after={"status": next_status, "comment": payload.comment},
+                after={"status": next_status, "comment": payload.comment, **flow},
                 risk_level="medium" if payload.action == "reject" else "low",
             )
         connection.commit()
     finally:
         connection.close()
-    return {"ok": True, "task_id": task_id, "status": next_status, "audit_id": audit_id}
+    return {"ok": True, "task_id": task_id, "status": next_status, "audit_id": audit_id, **flow}
 
 
 @app.get("/api/documents")

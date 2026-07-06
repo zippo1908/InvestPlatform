@@ -2016,6 +2016,10 @@ function DelegationPanel({ canWrite, onToast, defaultFamily }: { canWrite: boole
   )
 }
 
+type WfTemplate = { id: number; workflow_family: string; template_name: string; steps: Array<{ step_key: string; step_name: string; step_type: string; sort_order: number }> }
+type WfTask = { id: number; task_name: string; task_status: string; due_at: string | null; instance_title: string; instance_status: string; assignee: string | null }
+const WF_STATUS_CN: Record<string, string> = { running: '进行中', approved: '已通过', rejected: '已驳回', pending: '待办', transferred: '已转办', archived: '已归档', cancelled: '已取消', draft: '草稿' }
+
 function FlowPage({
   screen,
   canWrite,
@@ -2025,41 +2029,67 @@ function FlowPage({
   canWrite: boolean
   onToast: (toast: Toast) => void
 }) {
-  const lanes = screen.id === 'flow-center' ? ['项目类', '基金类', '日常办公'] : screen.id === 'flow-project' ? ['立项', '尽调', '投决', '协议', '付款', '退出'] : screen.id === 'flow-fund' ? ['设立', '付款', 'LP 披露', '条款变更', '财报审批'] : ['用印', '报销', '请假', '采购', '人事']
+  // flow-center 展示全部家族;子屏只展示对应家族。
+  const familyFilter = screen.id === 'flow-fund' ? 'fund' : screen.id === 'flow-oa' ? 'office' : screen.id === 'flow-project' ? 'project' : null
+  const [templates, setTemplates] = useState<WfTemplate[]>([])
+  const [tasks, setTasks] = useState<WfTask[]>([])
+  const [reloadKey, setReloadKey] = useState(0)
+  const [busyTask, setBusyTask] = useState<number | null>(null)
+
+  useEffect(() => { apiGet<{ items: WfTemplate[] }>('/api/workflow/templates').then((r) => setTemplates(r.items ?? [])).catch(() => setTemplates([])) }, [])
+  useEffect(() => { apiGet<{ items: WfTask[] }>('/api/workflow/tasks').then((r) => setTasks(r.items ?? [])).catch(() => setTasks([])) }, [reloadKey])
+
+  const shownTemplates = familyFilter ? templates.filter((t) => t.workflow_family === familyFilter) : templates
+  const shownTasks = tasks // 后端已按租户过滤;此处展示全部,含流转历史
+
+  const startFlow = async (t: WfTemplate) => {
+    try {
+      const result = await apiPost('/api/workflow/instances', {
+        title: `${t.template_name}·${new Date().toLocaleDateString('zh-CN')}`,
+        workflow_family: t.workflow_family,
+        payload: { template_id: t.id, screen: screen.id },
+      })
+      onToast({ title: `${t.template_name}已发起`, detail: auditDetail(result), action: 'workflow.start', entity: 'cap_workflow_instances', result })
+      setReloadKey((k) => k + 1)
+    } catch (error) {
+      onToast({ title: '流程发起失败', detail: error instanceof Error ? error.message : 'API 调用失败' })
+    }
+  }
+
+  const actOn = async (task: WfTask, action: 'approve' | 'reject' | 'transfer') => {
+    const verb = action === 'approve' ? '通过' : action === 'reject' ? '驳回' : '转办'
+    const comment = window.prompt(`「${task.task_name}」${verb}意见(可留空):`, '')
+    if (comment === null) return // 取消
+    setBusyTask(task.id)
+    try {
+      const result = await apiPost<{ instance_status?: string; next_step?: string | null }>(`/api/workflow/tasks/${task.id}/action`, { action, comment: comment || undefined })
+      const tail = action === 'approve'
+        ? (result.next_step ? `→ 下一步「${result.next_step}」` : '流程已闭环(通过)')
+        : action === 'reject' ? '流程已终止(驳回)' : '已转办'
+      onToast({ title: `${verb}成功`, detail: `${auditDetail(result)};${tail}`, action: `workflow.${action}`, entity: 'cap_workflow_tasks', result })
+      setReloadKey((k) => k + 1)
+    } catch (error) {
+      onToast({ title: `${verb}失败`, detail: error instanceof Error ? error.message.replace(/^\{"detail":"?|"?\}$/g, '') : 'API 调用失败' })
+    } finally {
+      setBusyTask(null)
+    }
+  }
 
   return (
     <div className="page-grid">
       <section className="panel full-span motion-item">
         <PanelTitle icon={GitBranch} title="流程模板与发起入口" />
         <div className="flow-lanes">
-          {lanes.map((lane, index) => (
-            <article className="flow-card" key={lane}>
-              <span>{lane}</span>
-              <strong>{3 + index} 个模板</strong>
-              <p>发起、审批、驳回、转办、抄送、委托、附件、归档、审计全部可追踪。</p>
-              <button
-                className="secondary-button"
-                type="button"
-                disabled={!canWrite}
-                onClick={async () => {
-                  try {
-                    const result = await apiPost('/api/workflow/instances', {
-                      title: `${lane}流程-${screen.title}`,
-                      workflow_family: screen.id === 'flow-fund' ? 'fund' : screen.id === 'flow-oa' ? 'office' : 'project',
-                      payload: { lane, screen: screen.id },
-                    })
-                    onToast({
-                      title: `${lane}流程已发起`,
-                      detail: auditDetail(result),
-                      action: 'workflow.start',
-                      entity: 'cap_workflow_instances',
-                      result,
-                    })
-                  } catch (error) {
-                    onToast({ title: '流程发起失败', detail: error instanceof Error ? error.message : 'API 调用失败' })
-                  }
-                }}
-              >
+          {shownTemplates.length === 0 && <p className="muted-note">暂无流程模板</p>}
+          {shownTemplates.map((t) => (
+            <article className="flow-card" key={t.id} data-testid={`flow-template-${t.workflow_family}`}>
+              <span>{{ project: '项目类', fund: '基金类', office: '日常办公' }[t.workflow_family] ?? t.workflow_family}</span>
+              <strong>{t.template_name}</strong>
+              {/* 真实步骤链,替代写死的「N 个模板」 */}
+              <ol className="flow-steps">
+                {t.steps.map((s) => (<li key={s.step_key}>{s.step_name}</li>))}
+              </ol>
+              <button className="secondary-button" type="button" disabled={!canWrite} data-testid={`flow-start-${t.workflow_family}`} onClick={() => startFlow(t)}>
                 发起
               </button>
             </article>
@@ -2068,7 +2098,34 @@ function FlowPage({
       </section>
       <section className="panel two-thirds motion-item">
         <PanelTitle icon={Clock} title="审批任务" />
-        <DataTable rows={workflows} />
+        <div className="table-wrap" data-testid="wf-task-table">
+          <table>
+            <thead>
+              <tr><th>流程</th><th>当前任务</th><th>任务状态</th><th>实例状态</th><th>经办</th><th>操作</th></tr>
+            </thead>
+            <tbody>
+              {shownTasks.length === 0 && <tr><td colSpan={6} className="muted-note">暂无审批任务,先从上方模板发起</td></tr>}
+              {shownTasks.map((task) => (
+                <tr key={task.id}>
+                  <td>{task.instance_title}</td>
+                  <td>{task.task_name}</td>
+                  <td><StatusBadge value={WF_STATUS_CN[task.task_status] ?? task.task_status} /></td>
+                  <td><StatusBadge value={WF_STATUS_CN[task.instance_status] ?? task.instance_status} /></td>
+                  <td>{task.assignee ?? '—'}</td>
+                  <td>
+                    {task.task_status === 'pending' ? (
+                      <div className="row-actions">
+                        <button type="button" className="link-button" disabled={!canWrite || busyTask === task.id} onClick={() => actOn(task, 'approve')}>通过</button>
+                        <button type="button" className="link-button danger" disabled={!canWrite || busyTask === task.id} onClick={() => actOn(task, 'reject')}>驳回</button>
+                        <button type="button" className="link-button" disabled={!canWrite || busyTask === task.id} onClick={() => actOn(task, 'transfer')}>转办</button>
+                      </div>
+                    ) : <span className="muted-note">已处理</span>}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       </section>
       <DelegationPanel
         canWrite={canWrite}
