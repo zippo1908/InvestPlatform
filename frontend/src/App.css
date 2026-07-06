@@ -745,6 +745,47 @@ button:disabled {
   max-width: 280px;
 }
 
+/* 列配置弹层:锚定在「显示列」按钮下方,勾选即持久化。 */
+.col-config {
+  position: relative;
+  margin-left: auto;
+}
+.col-config-menu {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 6px);
+  z-index: 20;
+  min-width: 200px;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  background: var(--surface, #fff);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
+}
+.col-config-menu label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px;
+  border-radius: 6px;
+  cursor: pointer;
+  color: var(--text, #1a1a1a);
+  font-size: 13px;
+  white-space: nowrap;
+}
+.col-config-menu label:hover {
+  background: var(--line);
+}
+.col-config-menu .link-button {
+  margin-top: 4px;
+  border-top: 1px solid var(--line);
+  padding-top: 8px;
+  text-align: left;
+}
+
 table {
   width: 100%;
   border-collapse: collapse;

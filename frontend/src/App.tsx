@@ -793,21 +793,7 @@ function PageHeader({
           <Filter size={16} />
           高级筛选
         </button>
-        <button
-          type="button"
-          className="secondary-button"
-          onClick={() =>
-            runBackendAction(onToast, '列配置已保存', {
-              action: 'screen.columns.save',
-              entity_type: 'screen',
-              entity_label: current.title,
-              after: { screen_id: current.id, columns: ['name', 'status', 'owner'] },
-            })
-          }
-        >
-          <Columns size={16} />
-          显示列
-        </button>
+        {/* 「显示列」已下沉到台账表格工具条(可勾选列 + localStorage 持久化),此处不再放解耦占位钮。 */}
         {/* 文档/AI 屏的顶部通用主操作只会建占位记录,易与面板里真实入口混淆 → 隐藏。 */}
         {current.kind !== 'documents' && current.kind !== 'ai' && (
           <button
@@ -2623,6 +2609,7 @@ function ListPage({
         <ListControls canWrite={canWrite} onToast={onToast} screen={screen} onImported={() => { setPage(1); setReloadKey((k) => k + 1) }} onSearch={(kw) => { setPage(1); setQ(kw) }} />
         <DataTable
           rows={rows}
+          storageKey={screen.id}
           onRowOpen={LIST_DETAIL_TARGET[screen.id] ? (id) => goToEntity(LIST_DETAIL_TARGET[screen.id], id) : undefined}
           onBatchDelete={deleteBase ? batchDelete : undefined}
         />
@@ -2774,10 +2761,27 @@ function ListControls({
   )
 }
 
-function DataTable({ rows, compact = false, onRowOpen, onBatchDelete }: { rows: DataRow[]; compact?: boolean; onRowOpen?: (id: number) => void; onBatchDelete?: (ids: number[]) => void }) {
+function DataTable({ rows, compact = false, onRowOpen, onBatchDelete, storageKey }: { rows: DataRow[]; compact?: boolean; onRowOpen?: (id: number) => void; onBatchDelete?: (ids: number[]) => void; storageKey?: string }) {
   const [query, setQuery] = useState('')
   const [selected, setSelected] = useState<Set<number>>(new Set())
-  const columns = Object.keys(rows[0] ?? {}).filter((c) => !c.startsWith('__')) // __ 前缀为隐藏元数据(如 __id)
+  const allColumns = Object.keys(rows[0] ?? {}).filter((c) => !c.startsWith('__')) // __ 前缀为隐藏元数据(如 __id)
+  // 列配置持久化:按屏(storageKey)记住被隐藏的列,存 localStorage,跨会话生效。
+  const colKey = storageKey ? `capitalos-cols-${storageKey}` : null
+  const [hidden, setHidden] = useState<Set<string>>(() => {
+    if (!colKey) return new Set()
+    try { return new Set(JSON.parse(localStorage.getItem(colKey) || '[]') as string[]) } catch { return new Set() }
+  })
+  const [colMenu, setColMenu] = useState(false)
+  const toggleColumn = (col: string) => {
+    setHidden((prev) => {
+      const next = new Set(prev)
+      if (next.has(col)) next.delete(col)
+      else if (allColumns.length - next.size > 1) next.add(col) // 至少保留一列
+      if (colKey) localStorage.setItem(colKey, JSON.stringify([...next]))
+      return next
+    })
+  }
+  const columns = allColumns.filter((c) => !hidden.has(c))
   const filtered = rows.filter((row) => Object.values(row).join(' ').toLowerCase().includes(query.toLowerCase()))
   const allSelected = filtered.length > 0 && filtered.every((_, index) => selected.has(index))
   const canOpen = !!onRowOpen && rows.some((r) => r['__id'] != null && r['__id'] !== '')
@@ -2810,6 +2814,24 @@ function DataTable({ rows, compact = false, onRowOpen, onBatchDelete }: { rows: 
             >
               <Trash size={14} /> 批量删除 ({selectedIds.length})
             </button>
+          )}
+          {colKey && allColumns.length > 1 && (
+            <div className="col-config">
+              <button type="button" className="secondary-button" data-testid="col-config-btn" onClick={() => setColMenu((v) => !v)}>
+                <Columns size={14} /> 显示列 ({columns.length}/{allColumns.length})
+              </button>
+              {colMenu && (
+                <div className="col-config-menu" data-testid="col-config-menu">
+                  {allColumns.map((col) => (
+                    <label key={col}>
+                      <input type="checkbox" checked={!hidden.has(col)} onChange={() => toggleColumn(col)} />
+                      <span>{col}</span>
+                    </label>
+                  ))}
+                  <button type="button" className="link-button" onClick={() => { setHidden(new Set()); if (colKey) localStorage.removeItem(colKey) }}>重置为全部显示</button>
+                </div>
+              )}
+            </div>
           )}
         </div>
       )}
