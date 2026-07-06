@@ -570,11 +570,95 @@ function FeedbackWidget({ onToast }: { onToast: (t: Toast) => void }) {
   )
 }
 
+// 全局命令面板(Cmd/Ctrl+K):搜页面 + 项目/基金/投资人,键盘上下选择、回车跳转。
+type CmdItem = { type: string; label: string; sub: string; run: () => void }
+function CommandPalette({ open, onClose }: { open: boolean; onClose: () => void }) {
+  const [q, setQ] = useState('')
+  const [sel, setSel] = useState(0)
+  const [ents, setEnts] = useState<{ projects: Array<Record<string, unknown>>; funds: Array<Record<string, unknown>>; investors: Array<Record<string, unknown>> }>({ projects: [], funds: [], investors: [] })
+  const inputRef = useRef<HTMLInputElement>(null)
+  const panelRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    if (!open) return
+    setQ(''); setSel(0)
+    Promise.all([
+      apiGet<{ items: Array<Record<string, unknown>> }>('/api/projects').catch(() => ({ items: [] })),
+      apiGet<{ items: Array<Record<string, unknown>> }>('/api/funds').catch(() => ({ items: [] })),
+      apiGet<{ items: Array<Record<string, unknown>> }>('/api/investors').catch(() => ({ items: [] })),
+    ]).then(([p, f, i]) => setEnts({ projects: p.items ?? [], funds: f.items ?? [], investors: i.items ?? [] }))
+    const t = window.setTimeout(() => inputRef.current?.focus(), 30)
+    if (panelRef.current && !prefersReducedMotion()) {
+      gsap.fromTo(panelRef.current, { autoAlpha: 0, y: -16, scale: 0.98 }, { autoAlpha: 1, y: 0, scale: 1, duration: 0.22, ease: 'power2.out' })
+    }
+    return () => window.clearTimeout(t)
+  }, [open])
+
+  const items: CmdItem[] = useMemo(() => {
+    const kw = q.trim().toLowerCase()
+    const hit = (s: string) => !kw || s.toLowerCase().includes(kw)
+    const list: CmdItem[] = []
+    appScreens.filter((s) => hit(s.title) || hit(s.group)).slice(0, kw ? 8 : 6).forEach((s) =>
+      list.push({ type: '页面', label: s.title, sub: s.group, run: () => { goTo(s.id); onClose() } }))
+    ents.projects.filter((p) => hit(String(p.name))).slice(0, 6).forEach((p) =>
+      list.push({ type: '项目', label: String(p.name), sub: String(p.sector ?? p.stage ?? ''), run: () => { goToEntity('project-detail-overview', Number(p.id)); onClose() } }))
+    ents.funds.filter((f) => hit(String(f.name))).slice(0, 6).forEach((f) =>
+      list.push({ type: '基金', label: String(f.name), sub: String(f.status ?? ''), run: () => { goToEntity('fund-detail-overview', Number(f.id)); onClose() } }))
+    ents.investors.filter((i) => hit(String(i.name))).slice(0, 6).forEach((i) =>
+      list.push({ type: '投资人', label: String(i.name), sub: String(i.investor_kind ?? ''), run: () => { goToEntity('investor-detail', Number(i.id)); onClose() } }))
+    return list
+  }, [q, ents, onClose])
+
+  useEffect(() => { if (sel >= items.length) setSel(0) }, [items.length, sel])
+
+  const onKey = (e: { key: string; preventDefault: () => void }) => {
+    if (e.key === 'ArrowDown') { e.preventDefault(); setSel((s) => Math.min(items.length - 1, s + 1)) }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); setSel((s) => Math.max(0, s - 1)) }
+    else if (e.key === 'Enter') { e.preventDefault(); items[sel]?.run() }
+    else if (e.key === 'Escape') { e.preventDefault(); onClose() }
+  }
+
+  if (!open) return null
+  return (
+    <div className="cmdk-overlay" onClick={onClose} data-testid="cmdk">
+      <div className="cmdk-panel" ref={panelRef} onClick={(e) => e.stopPropagation()}>
+        <div className="cmdk-input">
+          <Search size={17} />
+          <input ref={inputRef} value={q} onChange={(e) => setQ(e.target.value)} onKeyDown={onKey} placeholder="搜索页面、项目、基金、投资人…" data-testid="cmdk-input" />
+          <kbd>Esc</kbd>
+        </div>
+        <div className="cmdk-results" data-testid="cmdk-results">
+          {items.length === 0 ? (
+            <p className="muted-note" style={{ padding: '14px' }}>无匹配结果</p>
+          ) : items.map((it, i) => (
+            <button key={`${it.type}-${it.label}-${i}`} type="button"
+              className={classNames('cmdk-item', i === sel && 'is-active')}
+              onMouseEnter={() => setSel(i)} onClick={() => it.run()}>
+              <span className="cmdk-type">{it.type}</span>
+              <span className="cmdk-label">{it.label}</span>
+              {it.sub && <span className="cmdk-sub">{it.sub}</span>}
+            </button>
+          ))}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function App() {
   const [route, setRoute] = useState(readRoute)
   const [authed, setAuthed] = useState(() => sessionStorage.getItem('capitalos-session') === 'active')
   const [perms, setPermsState] = useState<string[]>(() => getPerms())
   const [sidebarOpen, setSidebarOpen] = useState(() => window.innerWidth > 860)
+  const [cmdkOpen, setCmdkOpen] = useState(false)
+  // 全局命令面板快捷键:Cmd/Ctrl+K 开关。
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && (e.key === 'k' || e.key === 'K')) { e.preventDefault(); setCmdkOpen((v) => !v) }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
   const [role, setRole] = useState(roles[0])
   const [navSearch, setNavSearch] = useState('')
   const [toast, setToast] = useState<Toast | null>(null)
@@ -863,6 +947,7 @@ function App() {
 
       {/* 门槛:仅持 feedback.annotate 能力位的「开发者账号」可见反馈工具 */}
       {getPerms().includes('feedback.annotate') && <FeedbackWidget onToast={showToast} />}
+      <CommandPalette open={cmdkOpen} onClose={() => setCmdkOpen(false)} />
 
       {toast && (
         <div className="toast" role="status">
