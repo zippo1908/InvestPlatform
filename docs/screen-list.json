@@ -1,0 +1,248 @@
+[
+  {
+    "id": "login",
+    "title": "登录页",
+    "group": "入口",
+    "subtitle": "账号、密码、验证码、自动登录和安全提示"
+  },
+  {
+    "id": "workbench",
+    "title": "管理层工作台",
+    "group": "工作台",
+    "subtitle": "待办、关键指标、项目阶段、基金组合和风险热区"
+  },
+  {
+    "id": "ai-workspace",
+    "title": "AI 大模型工作台",
+    "group": "工作台",
+    "subtitle": "文件解析、会议摘要、协议条款提取和投研问答"
+  },
+  {
+    "id": "announcements",
+    "title": "通知公告",
+    "group": "协同工具",
+    "subtitle": "公告列表、发布、导入、导出和阅读范围"
+  },
+  {
+    "id": "calendar",
+    "title": "日程事件",
+    "group": "协同工具",
+    "subtitle": "周日程、月日程、列表和关联项目/基金日程"
+  },
+  {
+    "id": "message-center",
+    "title": "消息中心",
+    "group": "协同工具",
+    "subtitle": "未读、全部、我的待办、我的已办、我的申请和抄送"
+  },
+  {
+    "id": "flow-center",
+    "title": "流程中心总览",
+    "group": "流程中心",
+    "subtitle": "项目类、基金类、日常办公类流程入口和委托设置"
+  },
+  {
+    "id": "flow-project",
+    "title": "项目类流程",
+    "group": "流程中心",
+    "subtitle": "立项、尽调、投决、投资协议、打款、退出流程"
+  },
+  {
+    "id": "flow-fund",
+    "title": "基金类流程",
+    "group": "流程中心",
+    "subtitle": "基金设立、付款、LP 披露、条款变更和财报审批"
+  },
+  {
+    "id": "flow-oa",
+    "title": "日常办公流程",
+    "group": "流程中心",
+    "subtitle": "行政、人事、用印、报销和请假流程"
+  },
+  {
+    "id": "project-board",
+    "title": "项目池看板",
+    "group": "项目管理",
+    "subtitle": "入库、立项、TS、尽调、内审、投决、协议、打款、投后服务"
+  },
+  {
+    "id": "project-list",
+    "title": "项目列表",
+    "group": "项目管理",
+    "subtitle": "高级搜索、显示列、导入、导出、新增和批量操作"
+  },
+  {
+    "id": "project-add",
+    "title": "新增项目",
+    "group": "项目管理",
+    "subtitle": "BP 上传、AI 解析填充、项目基础信息和描述字段"
+  },
+  {
+    "id": "project-detail-overview",
+    "title": "项目详情-概况",
+    "group": "项目管理",
+    "subtitle": "项目主档、阶段历史、负责人、摘要和关键动作"
+  },
+  {
+    "id": "project-detail-investment",
+    "title": "项目详情-投资关系",
+    "group": "项目管理",
+    "subtitle": "基金投资情况、权益变动和估值记录"
+  },
+  {
+    "id": "project-detail-postdata",
+    "title": "项目详情-投后数据",
+    "group": "项目管理",
+    "subtitle": "月度/季度经营数据、财务指标、填报状态和附件"
+  },
+  {
+    "id": "meeting-ai",
+    "title": "纪要解析",
+    "group": "项目管理",
+    "subtitle": "会议文件上传、AI 摘要、决策结果、讨论要点和下一步计划"
+  },
+  {
+    "id": "fund-list",
+    "title": "基金列表",
+    "group": "基金管理",
+    "subtitle": "基金状态、规模、净值、托管、认缴实缴和累计投资"
+  },
+  {
+    "id": "fund-add",
+    "title": "新增基金",
+    "group": "基金管理",
+    "subtitle": "基础信息、规模、期限、投资策略、管理费、分配、治理和披露"
+  },
+  {
+    "id": "fund-detail-overview",
+    "title": "基金详情-概况",
+    "group": "基金管理",
+    "subtitle": "基金条款、规模、出资节奏、组合表现和关键时间"
+  },
+  {
+    "id": "fund-detail-cashflow",
+    "title": "基金详情-现金流",
+    "group": "基金管理",
+    "subtitle": "投资人现金流、项目现金流、其他现金流和回款分配"
+  },
+  {
+    "id": "fund-detail-financials",
+    "title": "基金详情-财报数据",
+    "group": "基金管理",
+    "subtitle": "基金财务报表、净值、估值和披露材料"
+  },
+  {
+    "id": "investment-info",
+    "title": "投资信息",
+    "group": "基金管理",
+    "subtitle": "项目投资台账、协议金额、打款、持股、回款和退出状态"
+  },
+  {
+    "id": "equity-change",
+    "title": "权益变动",
+    "group": "基金管理",
+    "subtitle": "股权变更原因、协议时间、轮次、领投、投资方式和股比变化"
+  },
+  {
+    "id": "investor-list",
+    "title": "投资人列表",
+    "group": "投资人",
+    "subtitle": "LP/投资人档案、认缴实缴、联系人和披露状态"
+  },
+  {
+    "id": "investor-detail",
+    "title": "投资人详情",
+    "group": "投资人",
+    "subtitle": "档案、基金份额、现金流、联系记录和披露文件"
+  },
+  {
+    "id": "manager-orgs",
+    "title": "管理机构",
+    "group": "投资人",
+    "subtitle": "GP、管理人、执行事务合伙人和关联基金"
+  },
+  {
+    "id": "post-data-collection",
+    "title": "投后数据收集",
+    "group": "投后管理",
+    "subtitle": "外部填报、邮件发送、填报状态重置和数据回流"
+  },
+  {
+    "id": "risk-clauses",
+    "title": "项目关键条款",
+    "group": "风险管理",
+    "subtitle": "基金、项目、轮次、特殊条款、条款内容、提醒日期和状态"
+  },
+  {
+    "id": "burst-risk",
+    "title": "突发风险事务",
+    "group": "风险管理",
+    "subtitle": "风险事件登记、等级、处置方案、负责人和进展"
+  },
+  {
+    "id": "document-center",
+    "title": "文档中心",
+    "group": "文档管理",
+    "subtitle": "项目类文件、基金类文件、共享类文件、流程文件和权限水印"
+  },
+  {
+    "id": "process-files",
+    "title": "流程文件",
+    "group": "文档管理",
+    "subtitle": "从流程归档的审批文件、合同、用印材料和付款附件"
+  },
+  {
+    "id": "research-library",
+    "title": "行研智库",
+    "group": "AI数据库",
+    "subtitle": "行研摘录、标签、来源、AI 摘要和关联项目"
+  },
+  {
+    "id": "internal-research",
+    "title": "内部产研",
+    "group": "AI数据库",
+    "subtitle": "内部报告、研究文档、附件、评审和知识沉淀"
+  },
+  {
+    "id": "report-dashboard",
+    "title": "报表驾驶舱",
+    "group": "报表驾驶舱",
+    "subtitle": "IRR、DPI、TVPI、MOIC、行业分布、阶段分布和资金流"
+  },
+  {
+    "id": "import-export",
+    "title": "导入导出中心",
+    "group": "通用能力",
+    "subtitle": "模板下载、导入校验、错误回写、异步导出和任务历史"
+  },
+  {
+    "id": "system-users",
+    "title": "用户与组织",
+    "group": "系统管理",
+    "subtitle": "组织树、用户账号、状态、角色和登录审计"
+  },
+  {
+    "id": "roles-permissions",
+    "title": "角色与权限",
+    "group": "系统管理",
+    "subtitle": "菜单权限、操作权限、数据范围、字段级权限和文档权限"
+  },
+  {
+    "id": "field-config",
+    "title": "字段与表单配置",
+    "group": "系统管理",
+    "subtitle": "自定义字段、显示列、表单布局、选项集和校验规则"
+  },
+  {
+    "id": "account-settings",
+    "title": "账户与偏好设置",
+    "group": "账户",
+    "subtitle": "个人资料、密码、通知偏好、常用菜单和安全设备"
+  },
+  {
+    "id": "recycle-bin",
+    "title": "回收站",
+    "group": "系统管理",
+    "subtitle": "文件、对象、恢复、彻底删除和操作审计"
+  }
+]
