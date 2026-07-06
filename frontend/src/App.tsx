@@ -1041,6 +1041,50 @@ function AiConfigPanel({ onToast }: { onToast: (toast: Toast) => void }) {
   )
 }
 
+// ── 模块级 AI 解析管理:让流式解析脱离组件生命周期,切页签也在后台继续跑 ──
+// 组件卸载不再中断解析:run 状态存在这个 Map 里,onDelta 累加到这里并每帧持久化到
+// localStorage;组件重挂时订阅同一个 run,能看到「仍在生成」或已完成的完整结果。
+type AiRunState = { busy: boolean; answer: string; error: string | null }
+type AiRun = AiRunState & { subs: Set<(s: AiRunState) => void> }
+const aiRuns = new Map<string, AiRun>()
+function ensureAiRun(key: string): AiRun {
+  let r = aiRuns.get(key)
+  if (!r) { r = { busy: false, answer: '', error: null, subs: new Set() }; aiRuns.set(key, r) }
+  return r
+}
+function getAiRun(key: string): AiRunState | null {
+  const r = aiRuns.get(key)
+  return r ? { busy: r.busy, answer: r.answer, error: r.error } : null
+}
+function subscribeAiRun(key: string, cb: (s: AiRunState) => void): () => void {
+  const r = ensureAiRun(key)
+  r.subs.add(cb)
+  return () => { r.subs.delete(cb) }
+}
+function clearAiRun(key: string): void { aiRuns.delete(key) }
+function emitAiRun(r: AiRun): void {
+  const s: AiRunState = { busy: r.busy, answer: r.answer, error: r.error }
+  r.subs.forEach((cb) => cb(s))
+}
+async function startAiRun(key: string, body: unknown, onProgress: (answer: string, done: boolean) => void): Promise<void> {
+  const r = ensureAiRun(key)
+  if (r.busy) return // 已有在途解析,忽略重复触发
+  r.busy = true; r.answer = ''; r.error = null; emitAiRun(r)
+  try {
+    await streamPost('/api/ai/analyze/stream', body, (delta) => {
+      r.answer += delta
+      onProgress(r.answer, false) // 每帧持久化(即使组件已卸载也能存)
+      emitAiRun(r)
+    })
+  } catch (error) {
+    r.error = error instanceof Error ? error.message : 'AI 调用失败'
+  } finally {
+    r.busy = false
+    emitAiRun(r)
+    onProgress(r.answer, true)
+  }
+}
+
 function AiPage({
   screen,
   canWrite,
@@ -1089,26 +1133,42 @@ function AiPage({
     try { localStorage.setItem(draftKey, JSON.stringify({ text, instruction, answer, savedAt: ts })) } catch { /* 配额满忽略 */ }
     setSavedAt(ts)
   }, [text, instruction, answer, draftKey])
+  // 每帧把结果并入 localStorage 草稿(合并保留 text/instruction),组件卸载后仍会执行。
+  const persistAnswer = (ans: string) => {
+    try {
+      const raw = localStorage.getItem(draftKey)
+      const d = raw ? JSON.parse(raw) : {}
+      const ts = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
+      localStorage.setItem(draftKey, JSON.stringify({ ...d, answer: ans, savedAt: ts }))
+    } catch { /* 配额满忽略 */ }
+  }
+
+  // 订阅本屏在途/已完成的解析:重挂时若后台仍在生成,直接接管进度(不再「挂掉」)。
+  useEffect(() => {
+    const cur = getAiRun(screen.id)
+    if (cur && (cur.busy || cur.answer)) { setAnswer(cur.answer); setAiBusy(cur.busy); setAiError(cur.error) }
+    const unsub = subscribeAiRun(screen.id, (s) => {
+      setAnswer(s.answer); setAiBusy(s.busy); setAiError(s.error)
+    })
+    return unsub
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [screen.id])
+
   const clearDraft = () => {
     setText(''); setInstruction(''); setAnswer(null); setEditing(false); setSavedAt(null); setAiError(null)
+    clearAiRun(screen.id) // 同时清掉后台 run,避免下次重挂又被恢复
     localStorage.removeItem(draftKey)
   }
 
-  const run = async () => {
+  const run = () => {
     if (!text.trim()) return
-    setAiBusy(true); setAiError(null); setAnswer(''); setConfirmed(false)
-    try {
-      // 纪要用固定结构化指令;工作台用自定义指令。均流式累加,逐帧重渲染 Markdown。
-      const instr = workspace ? instruction : MEETING_INSTRUCTION
-      await streamPost('/api/ai/analyze/stream', { text, instruction: instr }, (delta) => {
-        setAnswer((prev) => (prev ?? '') + delta)
-      })
-      onToast({ title: 'AI 解析完成', detail: '流式生成结束', action: 'ai.analyze', entity: 'ai_parse_job' })
-    } catch (error) {
-      setAiError(error instanceof Error ? error.message : 'AI 调用失败')
-    } finally {
-      setAiBusy(false)
-    }
+    setConfirmed(false)
+    // 纪要用固定结构化指令;工作台用自定义指令。交给模块级 run —— 切页签也不中断。
+    const instr = workspace ? instruction : MEETING_INSTRUCTION
+    void startAiRun(screen.id, { text, instruction: instr }, (ans, done) => {
+      persistAnswer(ans)
+      if (done && !getAiRun(screen.id)?.error) onToast({ title: 'AI 解析完成', detail: '流式生成结束', action: 'ai.analyze', entity: 'ai_parse_job' })
+    })
   }
 
   return (
@@ -2089,13 +2149,20 @@ function DetailPage({
           {/* 项目所处阶段进度条 */}
           <section className="panel full-span motion-item">
             <PanelTitle icon={GitBranch} title="项目所处阶段" />
-            <div className="stage-bar" data-testid="stage-bar">
-              {STAGE_STEPS.map((s, i) => (
-                <div key={s} className={classNames('stage-step', i < curStage && 'is-done', i === curStage && 'is-current')}>
-                  <span className="stage-dot">{i < curStage ? '✓' : i + 1}</span>
-                  <span className="stage-name">{s}</span>
-                </div>
-              ))}
+            <div className="stage-flow" data-testid="stage-bar">
+              {STAGE_STEPS.flatMap((s, i) => {
+                const node = (
+                  <div key={`n-${i}`} className={classNames('stage-node', i < curStage && 'is-done', i === curStage && 'is-current')}>
+                    <span className="stage-node-dot">{i < curStage ? '✓' : i + 1}</span>
+                    <span className="stage-node-name">{s}</span>
+                  </div>
+                )
+                // 节点之间插入带箭头的连接线,表现流向(左→右);已过节点的入线高亮。
+                return i === 0 ? [node] : [
+                  <span key={`a-${i}`} className={classNames('stage-arrow', i <= curStage && 'is-filled')} aria-hidden="true" />,
+                  node,
+                ]
+              })}
             </div>
           </section>
 
