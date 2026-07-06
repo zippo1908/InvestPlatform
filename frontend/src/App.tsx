@@ -22,9 +22,11 @@ import {
   GitBranch,
   Home,
   LineChart,
+  Crosshair,
   Lock,
   LogOut,
   Menu,
+  MessageSquare,
   MoreHorizontal,
   Plus,
   Search,
@@ -333,6 +335,165 @@ function useBackendRows(screenId: string, fallbackRows: DataRow[], page = 1, rel
   return { rows, source, total, pageSize: PAGE_SIZE }
 }
 
+// 页面标注/反馈工具:浮层按钮 → 面板(自动带当前页 + 组件拾取器 + 分类 + 意见)→ 入库;
+// 管理员可在「汇总」页一键把某条反馈推成 GitHub Issue。
+const FEEDBACK_CATS: Array<{ key: string; label: string }> = [
+  { key: 'ui', label: '界面/视觉' }, { key: 'interaction', label: '交互' }, { key: 'data', label: '数据/字段' },
+  { key: 'copy', label: '文案' }, { key: 'flow', label: '流程' }, { key: 'perf', label: '性能' }, { key: 'other', label: '其他' },
+]
+const FB_STATUS_CN: Record<string, string> = { new: '待处理', pushed: '已推 GitHub', resolved: '已解决', dismissed: '已忽略' }
+
+function describeElement(el: Element): string {
+  const holder = el.closest('[data-testid]') as HTMLElement | null
+  const testid = holder?.dataset?.testid
+  const aria = el.getAttribute('aria-label')
+  const text = (el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 36)
+  const tag = el.tagName.toLowerCase()
+  if (testid) return `${text ? `「${text}」` : ''}[${testid}]`
+  if (aria) return `${aria} <${tag}>`
+  return `${text ? `「${text}」` : ''}<${tag}>`
+}
+
+function FeedbackWidget({ onToast }: { onToast: (t: Toast) => void }) {
+  const [open, setOpen] = useState(false)
+  const [tab, setTab] = useState<'submit' | 'review'>('submit')
+  const isAdmin = getRoles().some((r) => r === 'system_admin' || r === 'managing_partner')
+  const [component, setComponent] = useState('')
+  const [category, setCategory] = useState('ui')
+  const [message, setMessage] = useState('')
+  const [picking, setPicking] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const [items, setItems] = useState<Array<Record<string, unknown>>>([])
+  const [reloadKey, setReloadKey] = useState(0)
+
+  // 组件拾取:进入后 hover 高亮、点击捕获描述并退出;排除工具自身。
+  useEffect(() => {
+    if (!picking) return
+    let hovered: HTMLElement | null = null
+    const clear = () => { if (hovered) { hovered.style.outline = ''; hovered.style.outlineOffset = ''; hovered = null } }
+    const onMove = (e: MouseEvent) => {
+      const t = e.target as HTMLElement
+      if (!t || t.closest('.fb-widget')) return
+      if (hovered !== t) { clear(); hovered = t; t.style.outline = '2px solid #0f766e'; t.style.outlineOffset = '1px' }
+    }
+    const onClick = (e: MouseEvent) => {
+      const t = e.target as HTMLElement
+      if (t.closest('.fb-widget')) return
+      e.preventDefault(); e.stopPropagation()
+      setComponent(describeElement(t)); clear(); setPicking(false)
+    }
+    document.addEventListener('mousemove', onMove, true)
+    document.addEventListener('click', onClick, true)
+    document.body.style.cursor = 'crosshair'
+    return () => { clear(); document.removeEventListener('mousemove', onMove, true); document.removeEventListener('click', onClick, true); document.body.style.cursor = '' }
+  }, [picking])
+
+  useEffect(() => {
+    if (!open || tab !== 'review' || !isAdmin) return
+    apiGet<{ items: Array<Record<string, unknown>> }>('/api/feedback').then((r) => setItems(r.items ?? [])).catch(() => setItems([]))
+  }, [open, tab, isAdmin, reloadKey])
+
+  const submit = async () => {
+    if (!message.trim()) return
+    setBusy(true)
+    try {
+      const screen_id = location.hash.replace(/^#\//, '').split('?')[0] || 'unknown'
+      const screen_title = document.querySelector('[data-testid="screen-title"]')?.textContent?.trim() || screen_id
+      await apiPost('/api/feedback', { message: message.trim(), component_label: component || undefined, category, screen_id, screen_title, page_url: location.href.slice(0, 300) })
+      onToast({ title: '反馈已提交', detail: '已收集,开发会从「汇总」里整理并同步 GitHub。谢谢!' })
+      setMessage(''); setComponent('')
+    } catch (error) {
+      onToast({ title: '提交失败', detail: error instanceof Error ? error.message : 'API 调用失败' })
+    } finally { setBusy(false) }
+  }
+
+  const pushGithub = async (id: number) => {
+    try {
+      const r = await apiPost<{ github_issue_url?: string }>(`/api/feedback/${id}/push-github`, {})
+      onToast({ title: '已推送到 GitHub', detail: r.github_issue_url || '已创建 Issue' })
+      setReloadKey((k) => k + 1)
+    } catch (error) {
+      onToast({ title: '推送失败', detail: error instanceof Error ? error.message.replace(/^\{"detail":"?|"?\}$/g, '') : 'API 调用失败' })
+    }
+  }
+  const setStatus = async (id: number, status: string) => {
+    try { await apiPatch(`/api/feedback/${id}`, { status }); setReloadKey((k) => k + 1) } catch { /* ignore */ }
+  }
+
+  return (
+    <div className="fb-widget">
+      {!open && (
+        <button type="button" className="fb-fab" data-testid="feedback-fab" onClick={() => setOpen(true)} title="反馈 / 标注此页面">
+          <MessageSquare size={18} /> 反馈
+        </button>
+      )}
+      {open && (
+        <div className="fb-panel" data-testid="feedback-panel">
+          <div className="fb-head">
+            <strong>页面反馈 / 标注</strong>
+            <button type="button" className="icon-button" onClick={() => { setOpen(false); setPicking(false) }} aria-label="关闭"><X size={16} /></button>
+          </div>
+          {isAdmin && (
+            <div className="subtab-bar">
+              <button type="button" className={classNames('subtab', tab === 'submit' && 'is-active')} onClick={() => setTab('submit')}>提交反馈</button>
+              <button type="button" className={classNames('subtab', tab === 'review' && 'is-active')} onClick={() => setTab('review')}>汇总 / 推 GitHub</button>
+            </div>
+          )}
+          {tab === 'submit' ? (
+            <div className="fb-form">
+              <p className="muted-note">当前页:{document.querySelector('[data-testid="screen-title"]')?.textContent?.trim() || location.hash}</p>
+              <label className="fb-field">
+                <span>组件(可选,点「选择」在页面上直接圈)</span>
+                <div className="fb-pick-row">
+                  <input value={component} onChange={(e) => setComponent(e.target.value)} placeholder="如:估值表 / 保存按钮" data-testid="feedback-component" />
+                  <button type="button" className={classNames('secondary-button', picking && 'is-picking')} onClick={() => setPicking((v) => !v)} data-testid="feedback-pick">
+                    <Crosshair size={14} /> {picking ? '点击页面元素…' : '选择'}
+                  </button>
+                </div>
+              </label>
+              <label className="fb-field">
+                <span>类别</span>
+                <select value={category} onChange={(e) => setCategory(e.target.value)} data-testid="feedback-category">
+                  {FEEDBACK_CATS.map((c) => <option key={c.key} value={c.key}>{c.label}</option>)}
+                </select>
+              </label>
+              <label className="fb-field">
+                <span>修改意见</span>
+                <textarea value={message} onChange={(e) => setMessage(e.target.value)} rows={4} placeholder="描述这个页面/组件哪里需要调整…" data-testid="feedback-message" />
+              </label>
+              <button type="button" className="primary-button full-width" disabled={busy || !message.trim()} onClick={submit} data-testid="feedback-submit">
+                <Send size={15} /> {busy ? '提交中…' : '提交反馈'}
+              </button>
+            </div>
+          ) : (
+            <div className="fb-review" data-testid="feedback-review">
+              {items.length === 0 ? <p className="muted-note">暂无反馈</p> : items.map((f) => (
+                <div className="fb-item" key={String(f.id)}>
+                  <div className="fb-item-head">
+                    <span className="fb-cat">{FEEDBACK_CATS.find((c) => c.key === f.category)?.label ?? String(f.category)}</span>
+                    <span className={classNames('fb-status', `is-${f.status}`)}>{FB_STATUS_CN[String(f.status)] ?? String(f.status)}</span>
+                  </div>
+                  <p className="fb-msg">{String(f.message)}</p>
+                  <div className="fb-meta">{String(f.screen_title ?? '')} · {f.component_label ? String(f.component_label) : '未指定组件'} · {String(f.author ?? '')}</div>
+                  <div className="fb-actions">
+                    {f.github_issue_url ? (
+                      <a className="link-button" href={String(f.github_issue_url)} target="_blank" rel="noreferrer">查看 Issue #{String(f.github_issue_number)}</a>
+                    ) : (
+                      <button type="button" className="link-button" onClick={() => pushGithub(Number(f.id))} data-testid={`fb-push-${f.id}`}>推到 GitHub</button>
+                    )}
+                    {f.status !== 'resolved' && <button type="button" className="link-button" onClick={() => setStatus(Number(f.id), 'resolved')}>标记已解决</button>}
+                    {f.status !== 'dismissed' && <button type="button" className="link-button danger" onClick={() => setStatus(Number(f.id), 'dismissed')}>忽略</button>}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
 function App() {
   const [route, setRoute] = useState(readRoute)
   const [authed, setAuthed] = useState(() => sessionStorage.getItem('capitalos-session') === 'active')
@@ -622,6 +783,8 @@ function App() {
           <PageRenderer screen={current} canWrite={canWrite} onToast={showToast} />
         </main>
       </div>
+
+      <FeedbackWidget onToast={showToast} />
 
       {toast && (
         <div className="toast" role="status">

@@ -1992,3 +1992,47 @@ tbody tr:hover {
 /* 顶部 section 导航条:比普通 panel 更紧凑,9 个 tab 可横向滚动 */
 .section-tabbar { padding: 4px 10px; }
 .section-tabbar .subtab-bar { margin-bottom: 0; border-bottom: none; }
+
+/* ── 页面反馈 / 标注工具 ── */
+.fb-widget { position: fixed; right: 20px; bottom: 20px; z-index: 60; }
+.fb-fab {
+  display: inline-flex; align-items: center; gap: 7px;
+  border: none; cursor: pointer;
+  background: #0f766e; color: #fff;
+  padding: 10px 16px; border-radius: 999px;
+  font-size: 13px; font-weight: 700;
+  box-shadow: 0 6px 20px rgba(15, 118, 110, 0.35);
+}
+.fb-fab:hover { background: #0d655e; }
+.fb-panel {
+  width: 360px; max-width: calc(100vw - 32px);
+  max-height: calc(100vh - 40px); overflow: auto;
+  background: var(--surface, #fff); border: 1px solid var(--line);
+  border-radius: 12px; box-shadow: 0 12px 40px rgba(0,0,0,0.18);
+  padding: 14px;
+}
+.fb-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+.fb-head strong { color: var(--ink); font-size: 15px; }
+.fb-form { display: flex; flex-direction: column; gap: 12px; }
+.fb-field { display: flex; flex-direction: column; gap: 5px; font-size: 12.5px; color: var(--muted); }
+.fb-field input, .fb-field select, .fb-field textarea {
+  width: 100%; font: inherit; padding: 8px 10px;
+  border: 1px solid var(--line); border-radius: 8px; color: var(--ink); background: #fff;
+}
+.fb-field textarea { resize: vertical; }
+.fb-pick-row { display: flex; gap: 8px; }
+.fb-pick-row input { flex: 1; }
+.fb-pick-row .secondary-button { flex: 0 0 auto; padding: 8px 10px; }
+.fb-pick-row .is-picking { background: #ccfbf1; color: #0f766e; border-color: #0f766e; }
+
+.fb-review { display: flex; flex-direction: column; gap: 10px; }
+.fb-item { border: 1px solid var(--line); border-radius: 9px; padding: 10px 12px; background: #f8fafc; }
+.fb-item-head { display: flex; align-items: center; gap: 8px; margin-bottom: 5px; }
+.fb-cat { font-size: 11px; font-weight: 700; color: var(--accent); }
+.fb-status { font-size: 11px; padding: 1px 7px; border-radius: 999px; background: #e2e8f0; color: #475569; }
+.fb-status.is-pushed { background: #dbeafe; color: #1e40af; }
+.fb-status.is-resolved { background: #dcfce7; color: #166534; }
+.fb-status.is-dismissed { background: #f1f5f9; color: #94a3b8; }
+.fb-msg { color: var(--ink); font-size: 13px; line-height: 1.5; margin: 0 0 6px; white-space: pre-wrap; }
+.fb-meta { color: var(--muted); font-size: 11.5px; margin-bottom: 6px; }
+.fb-actions { display: flex; flex-wrap: wrap; gap: 12px; }

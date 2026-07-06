@@ -5,9 +5,10 @@ import io
 import os
 import re
 import threading
+import urllib.request
 import uuid
 from datetime import datetime, timedelta
-from json import dumps
+from json import dumps, loads
 from typing import Any
 
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
@@ -195,6 +196,19 @@ class AiAnalyzePayload(BaseModel):
 
 class ExtractClausesPayload(BaseModel):
     text: str = Field(min_length=1)
+
+
+class CreateFeedbackPayload(BaseModel):
+    message: str = Field(min_length=1, max_length=4000)
+    screen_id: str | None = Field(default=None, max_length=80)
+    screen_title: str | None = Field(default=None, max_length=160)
+    page_url: str | None = Field(default=None, max_length=300)
+    component_label: str | None = Field(default=None, max_length=300)
+    category: str = Field(default="other", max_length=40)
+
+
+class FeedbackStatusPayload(BaseModel):
+    status: str  # new | pushed | resolved | dismissed
 
 
 class AiJobPayload(BaseModel):
@@ -1467,6 +1481,170 @@ def fund_schedule(fund_id: int, user: AuthedUser = Depends(current_user)) -> dic
     finally:
         connection.close()
     return {"count": len(rows), "items": rows}
+
+
+_FEEDBACK_CATEGORY_LABEL = {
+    "ui": "界面/视觉", "interaction": "交互", "data": "数据/字段", "copy": "文案",
+    "flow": "流程", "perf": "性能", "other": "其他",
+}
+
+
+def _github_token() -> str | None:
+    """取 GitHub token:优先 env GITHUB_TOKEN,回落到 ~/.git-credentials(不记录内容)。"""
+    tok = os.getenv("GITHUB_TOKEN")
+    if tok:
+        return tok.strip()
+    cred = os.path.expanduser("~/.git-credentials")
+    if os.path.exists(cred):
+        with open(cred, encoding="utf-8") as fh:
+            for line in fh:
+                m = re.search(r"://[^:]+:([^@]+)@github\.com", line)
+                if m:
+                    return m.group(1)
+    return None
+
+
+def _create_github_issue(title: str, body: str) -> tuple[int, str]:
+    tok = _github_token()
+    if not tok:
+        raise HTTPException(status_code=503, detail="未配置 GitHub token(env GITHUB_TOKEN 或 ~/.git-credentials)")
+    repo = os.getenv("GITHUB_REPO", "zippo1908/InvestPlatform")
+    data = dumps({"title": title[:250], "body": body, "labels": ["user-feedback"]}).encode("utf-8")
+    req = urllib.request.Request(
+        f"https://api.github.com/repos/{repo}/issues",
+        data=data,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {tok}",
+            "Accept": "application/vnd.github+json",
+            "Content-Type": "application/json",
+            "User-Agent": "CapitalOS-Feedback",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            obj = loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:  # type: ignore[attr-defined]
+        detail = exc.read().decode("utf-8", "ignore")[:200] if hasattr(exc, "read") else str(exc)
+        raise HTTPException(status_code=502, detail=f"GitHub 建 issue 失败({exc.code}):{detail}") from exc
+    return int(obj["number"]), str(obj["html_url"])
+
+
+@app.post("/api/feedback")
+def create_feedback(payload: CreateFeedbackPayload, user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
+    """任意登录用户在页面提交一条标注/修改意见。"""
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """INSERT INTO cap_feedback_annotations
+                   (screen_id, screen_title, page_url, component_label, category, message, author_user_id, tenant_id)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
+                (payload.screen_id, payload.screen_title, payload.page_url, payload.component_label,
+                 payload.category if payload.category in _FEEDBACK_CATEGORY_LABEL else "other",
+                 payload.message, user.user_id, tid),
+            )
+            fid = int(cursor.lastrowid)
+        connection.commit()
+    finally:
+        connection.close()
+    return {"ok": True, "feedback_id": fid}
+
+
+@app.get("/api/feedback")
+def list_feedback(user: AuthedUser = Depends(require_roles("system_admin", "managing_partner")), status: str | None = None) -> dict[str, Any]:
+    """汇总所有标注(管理员/开发账号审阅)。可选按 status 过滤。"""
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            if status:
+                cursor.execute(
+                    """SELECT f.feedback_id AS id, f.screen_id, f.screen_title, f.page_url, f.component_label,
+                              f.category, f.message, f.status, f.github_issue_number, f.github_issue_url, f.created_at,
+                              u.display_name AS author
+                       FROM cap_feedback_annotations f LEFT JOIN cap_users u ON u.user_id=f.author_user_id
+                       WHERE f.tenant_id=%s AND f.status=%s ORDER BY f.feedback_id DESC LIMIT 500""",
+                    (tid, status),
+                )
+            else:
+                cursor.execute(
+                    """SELECT f.feedback_id AS id, f.screen_id, f.screen_title, f.page_url, f.component_label,
+                              f.category, f.message, f.status, f.github_issue_number, f.github_issue_url, f.created_at,
+                              u.display_name AS author
+                       FROM cap_feedback_annotations f LEFT JOIN cap_users u ON u.user_id=f.author_user_id
+                       WHERE f.tenant_id=%s ORDER BY f.feedback_id DESC LIMIT 500""",
+                    (tid,),
+                )
+            rows = cursor.fetchall()
+    finally:
+        connection.close()
+    return {"count": len(rows), "items": rows}
+
+
+@app.post("/api/feedback/{feedback_id}/push-github")
+def push_feedback_github(feedback_id: int, user: AuthedUser = Depends(require_roles("system_admin", "managing_partner"))) -> dict[str, Any]:
+    """把一条标注推成 GitHub Issue,回写 issue 号/链接并置为 pushed。"""
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """SELECT f.feedback_id, f.screen_id, f.screen_title, f.page_url, f.component_label, f.category,
+                          f.message, f.status, f.github_issue_url, u.display_name AS author
+                   FROM cap_feedback_annotations f LEFT JOIN cap_users u ON u.user_id=f.author_user_id
+                   WHERE f.feedback_id=%s AND f.tenant_id=%s""",
+                (feedback_id, tid),
+            )
+            fb = cursor.fetchone()
+            if fb is None:
+                raise HTTPException(status_code=404, detail="Feedback not found")
+            if fb["status"] == "pushed" and fb["github_issue_url"]:
+                return {"ok": True, "already": True, "github_issue_url": fb["github_issue_url"]}
+
+            cat = _FEEDBACK_CATEGORY_LABEL.get(fb["category"], fb["category"])
+            title = f"[用户反馈] {fb['screen_title'] or fb['screen_id'] or '页面'} · {cat}"
+            body = (
+                f"**页面**:{fb['screen_title'] or ''}(`{fb['screen_id'] or ''}`)\n"
+                f"**组件**:{fb['component_label'] or '(未指定)'}\n"
+                f"**类别**:{cat}\n"
+                f"**提交人**:{fb['author'] or '匿名'}\n"
+                f"**页面地址**:{fb['page_url'] or ''}\n\n"
+                f"**意见**:\n{fb['message']}\n\n"
+                f"---\n_由 CapitalOS 页面标注工具自动同步(feedback #{feedback_id})_"
+            )
+            number, url = _create_github_issue(title, body)
+            cursor.execute(
+                "UPDATE cap_feedback_annotations SET status='pushed', github_issue_number=%s, github_issue_url=%s WHERE feedback_id=%s AND tenant_id=%s",
+                (number, url, feedback_id, tid),
+            )
+            write_audit(cursor, user.user_id, "feedback.push_github", "feedback", feedback_id, title, after={"issue": number})
+        connection.commit()
+    finally:
+        connection.close()
+    return {"ok": True, "github_issue_number": number, "github_issue_url": url}
+
+
+@app.patch("/api/feedback/{feedback_id}")
+def update_feedback_status(feedback_id: int, payload: FeedbackStatusPayload, user: AuthedUser = Depends(require_roles("system_admin", "managing_partner"))) -> dict[str, Any]:
+    """管理员更新标注状态(resolved / dismissed 等)。"""
+    if payload.status not in {"new", "pushed", "resolved", "dismissed"}:
+        raise HTTPException(status_code=400, detail="Invalid status")
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "UPDATE cap_feedback_annotations SET status=%s WHERE feedback_id=%s AND tenant_id=%s",
+                (payload.status, feedback_id, tid),
+            )
+            if cursor.rowcount == 0:
+                raise HTTPException(status_code=404, detail="Feedback not found")
+        connection.commit()
+    finally:
+        connection.close()
+    return {"ok": True, "status": payload.status}
 
 
 @app.get("/api/projects/{project_id}/funds-investment")
