@@ -29,6 +29,9 @@ docker exec -i investplatform-mysql mysql --default-character-set=utf8mb4 \
 # 4c) 项目卡片补全:评论/财务/委派/决策四表 + demo 种子(务必带 utf8mb4)
 docker exec -i investplatform-mysql mysql --default-character-set=utf8mb4 \
   -uroot -p"$PASS" capitalos < db/patch_project_card.sql
+# 4d) 服务端 AI 解析任务表(cap_ai_jobs):关掉浏览器/换设备也能恢复解析
+docker exec -i investplatform-mysql mysql --default-character-set=utf8mb4 \
+  -uroot -p"$PASS" capitalos < db/patch_ai_jobs.sql
 
 # 5) 账户与演示数据(bcrypt 口令 + demo.user;可选第二租户)
 cd backend && . .venv/bin/activate && pip install -r requirements.txt
@@ -45,6 +48,7 @@ cd ../db && python setup_accounts.py --with-tenant2
 | 4 | `patch_auth.sql` | managing_partner 补 `project.edit`/`risk.manage`/`fund.export` | ✅ INSERT IGNORE |
 | 4b | `patch_workflow_steps.sql` | 3 个流程模板的有序步骤(项目:立项→尽调→投决→归档 等),支撑审批自动流转 | ✅ 按 family 清后重插 |
 | 4c | `patch_project_card.sql` | 项目卡片四表(评论/财务/委派/决策)+ 项目3 demo 种子 | ✅ IF NOT EXISTS + 按 project_id 重插 |
+| 4d | `patch_ai_jobs.sql` | 服务端 AI 解析任务表 `cap_ai_jobs`(后端跑到底落库,前端轮询/换设备恢复) | ✅ IF NOT EXISTS |
 | 5 | `setup_accounts.py` | 所有用户设 bcrypt 口令(默认 `demo-login`);建 `demo.user`(管理合伙人);`--with-tenant2` 种入 Meridian 第二租户(独立公司树,演示隔离) | ✅ 存在性判断 |
 
 ## 租户模型(隔离怎么生效)

@@ -67,7 +67,7 @@ import {
 import type { DataRow, Project, Screen } from './data'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
-import { API_BASE, apiDelete, apiDownload, apiGet, apiPatch, apiPost, auditDetail, getPerms, getRoles, getToken, setPerms, setRoles, streamPost, setToken } from './api'
+import { API_BASE, apiDelete, apiDownload, apiGet, apiPatch, apiPost, auditDetail, getPerms, getRoles, getToken, setPerms, setRoles, setToken } from './api'
 
 marked.setOptions({ breaks: true, gfm: true })
 
@@ -1041,49 +1041,9 @@ function AiConfigPanel({ onToast }: { onToast: (toast: Toast) => void }) {
   )
 }
 
-// ── 模块级 AI 解析管理:让流式解析脱离组件生命周期,切页签也在后台继续跑 ──
-// 组件卸载不再中断解析:run 状态存在这个 Map 里,onDelta 累加到这里并每帧持久化到
-// localStorage;组件重挂时订阅同一个 run,能看到「仍在生成」或已完成的完整结果。
-type AiRunState = { busy: boolean; answer: string; error: string | null }
-type AiRun = AiRunState & { subs: Set<(s: AiRunState) => void> }
-const aiRuns = new Map<string, AiRun>()
-function ensureAiRun(key: string): AiRun {
-  let r = aiRuns.get(key)
-  if (!r) { r = { busy: false, answer: '', error: null, subs: new Set() }; aiRuns.set(key, r) }
-  return r
-}
-function getAiRun(key: string): AiRunState | null {
-  const r = aiRuns.get(key)
-  return r ? { busy: r.busy, answer: r.answer, error: r.error } : null
-}
-function subscribeAiRun(key: string, cb: (s: AiRunState) => void): () => void {
-  const r = ensureAiRun(key)
-  r.subs.add(cb)
-  return () => { r.subs.delete(cb) }
-}
-function clearAiRun(key: string): void { aiRuns.delete(key) }
-function emitAiRun(r: AiRun): void {
-  const s: AiRunState = { busy: r.busy, answer: r.answer, error: r.error }
-  r.subs.forEach((cb) => cb(s))
-}
-async function startAiRun(key: string, body: unknown, onProgress: (answer: string, done: boolean) => void): Promise<void> {
-  const r = ensureAiRun(key)
-  if (r.busy) return // 已有在途解析,忽略重复触发
-  r.busy = true; r.answer = ''; r.error = null; emitAiRun(r)
-  try {
-    await streamPost('/api/ai/analyze/stream', body, (delta) => {
-      r.answer += delta
-      onProgress(r.answer, false) // 每帧持久化(即使组件已卸载也能存)
-      emitAiRun(r)
-    })
-  } catch (error) {
-    r.error = error instanceof Error ? error.message : 'AI 调用失败'
-  } finally {
-    r.busy = false
-    emitAiRun(r)
-    onProgress(r.answer, true)
-  }
-}
+// AI 解析改为「服务端异步任务」:POST 建 job → 后端线程跑到底并落库 → 前端轮询取回。
+// 关掉浏览器/换设备回来都能通过 job_id / latest 恢复(不再依赖前端进程存活)。
+type AiJob = { job_id: number; status: 'running' | 'done' | 'error'; result_text: string | null; error_text: string | null; model: string | null }
 
 function AiPage({
   screen,
@@ -1107,20 +1067,23 @@ function AiPage({
   const [aiError, setAiError] = useState<string | null>(null)
   const [editing, setEditing] = useState(false)
   const [savedAt, setSavedAt] = useState<string | null>(null)
+  const jobIdRef = useRef<number | null>(null)   // 当前解析任务 id(服务端)
+  const pollRef = useRef<number | null>(null)     // 轮询定时器
 
-  // 自动草稿:解析耗时长,切页签会丢结果 → 把「材料 + 指令 + 结果」按屏本地留存,
-  // 回到本屏自动恢复;结果可切换为可编辑草稿;清空交给显式按钮,不在自动逻辑里误删。
+  // 自动草稿:把「材料 + 指令 + 结果 + 任务id」按屏本地留存,回本屏自动恢复;
+  // 结果可切换为可编辑草稿;清空交给显式按钮,不在自动逻辑里误删。
   const draftKey = `capitalos-ai-draft-${screen.id}`
   const restoredRef = useRef(false)
   useEffect(() => {
     try {
       const raw = localStorage.getItem(draftKey)
       if (raw) {
-        const d = JSON.parse(raw) as { text?: string; instruction?: string; answer?: string | null; savedAt?: string }
+        const d = JSON.parse(raw) as { text?: string; instruction?: string; answer?: string | null; savedAt?: string; jobId?: number }
         if (d.text) setText(d.text)
         if (d.instruction) setInstruction(d.instruction)
         if (d.answer) setAnswer(d.answer)
         if (d.savedAt) setSavedAt(d.savedAt)
+        if (d.jobId) jobIdRef.current = d.jobId
       }
     } catch { /* 坏草稿忽略 */ }
     restoredRef.current = true
@@ -1130,7 +1093,12 @@ function AiPage({
     if (!restoredRef.current) return
     if (!text && !instruction && !answer) return // 全空不主动写/删,清空由按钮负责
     const ts = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
-    try { localStorage.setItem(draftKey, JSON.stringify({ text, instruction, answer, savedAt: ts })) } catch { /* 配额满忽略 */ }
+    try {
+      const raw = localStorage.getItem(draftKey)
+      const prev = raw ? JSON.parse(raw) : {}
+      // 合并保留 jobId,避免正文/结果变化时把任务 id 冲掉(否则重挂无法按 id 恢复)。
+      localStorage.setItem(draftKey, JSON.stringify({ ...prev, text, instruction, answer, savedAt: ts }))
+    } catch { /* 配额满忽略 */ }
     setSavedAt(ts)
   }, [text, instruction, answer, draftKey])
   // 每帧把结果并入 localStorage 草稿(合并保留 text/instruction),组件卸载后仍会执行。
@@ -1143,32 +1111,72 @@ function AiPage({
     } catch { /* 配额满忽略 */ }
   }
 
-  // 订阅本屏在途/已完成的解析:重挂时若后台仍在生成,直接接管进度(不再「挂掉」)。
+  // 把任务 id 并入草稿,便于关掉浏览器/重挂后恢复。
+  const persistJobId = (id: number | null) => {
+    try {
+      const raw = localStorage.getItem(draftKey)
+      const d = raw ? JSON.parse(raw) : {}
+      localStorage.setItem(draftKey, JSON.stringify({ ...d, jobId: id }))
+    } catch { /* 忽略 */ }
+  }
+
+  // 轮询任务:每 ~1s 拉一次,更新结果;running 继续轮询,done/error 收尾。
+  const pollJob = (id: number) => {
+    if (pollRef.current) { window.clearTimeout(pollRef.current); pollRef.current = null }
+    apiGet<AiJob>(`/api/ai/jobs/${id}`)
+      .then((job) => {
+        if (jobIdRef.current !== id) return // 已被清空/换任务,丢弃过期结果
+        const ans = job.result_text ?? ''
+        setAnswer(ans)
+        if (ans) persistAnswer(ans)
+        if (job.status === 'running') {
+          setAiBusy(true)
+          pollRef.current = window.setTimeout(() => pollJob(id), 1000)
+        } else {
+          setAiBusy(false)
+          if (job.status === 'error') setAiError(job.error_text || 'AI 任务失败')
+          else onToast({ title: 'AI 解析完成', detail: `模型 ${job.model ?? ''} 已返回`, action: 'ai.analyze', entity: 'cap_ai_jobs' })
+        }
+      })
+      .catch(() => setAiBusy(false))
+  }
+
+  // 挂载时恢复在途/最近任务:优先本地草稿里的 jobId;没有则查本屏 latest(换设备)。
   useEffect(() => {
-    const cur = getAiRun(screen.id)
-    if (cur && (cur.busy || cur.answer)) { setAnswer(cur.answer); setAiBusy(cur.busy); setAiError(cur.error) }
-    const unsub = subscribeAiRun(screen.id, (s) => {
-      setAnswer(s.answer); setAiBusy(s.busy); setAiError(s.error)
-    })
-    return unsub
+    let ignore = false
+    const resume = (id: number) => { jobIdRef.current = id; setAiBusy(true); pollJob(id) }
+    if (jobIdRef.current) {
+      resume(jobIdRef.current)
+    } else {
+      apiGet<{ job: AiJob | null }>(`/api/ai/jobs/latest?screen_id=${encodeURIComponent(screen.id)}`)
+        .then((r) => { if (!ignore && r.job && r.job.status === 'running') { persistJobId(r.job.job_id); resume(r.job.job_id) } })
+        .catch(() => undefined)
+    }
+    return () => { ignore = true; if (pollRef.current) { window.clearTimeout(pollRef.current); pollRef.current = null } }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [screen.id])
 
   const clearDraft = () => {
+    if (pollRef.current) { window.clearTimeout(pollRef.current); pollRef.current = null }
+    jobIdRef.current = null
     setText(''); setInstruction(''); setAnswer(null); setEditing(false); setSavedAt(null); setAiError(null)
-    clearAiRun(screen.id) // 同时清掉后台 run,避免下次重挂又被恢复
     localStorage.removeItem(draftKey)
   }
 
-  const run = () => {
+  const run = async () => {
     if (!text.trim()) return
-    setConfirmed(false)
-    // 纪要用固定结构化指令;工作台用自定义指令。交给模块级 run —— 切页签也不中断。
-    const instr = workspace ? instruction : MEETING_INSTRUCTION
-    void startAiRun(screen.id, { text, instruction: instr }, (ans, done) => {
-      persistAnswer(ans)
-      if (done && !getAiRun(screen.id)?.error) onToast({ title: 'AI 解析完成', detail: '流式生成结束', action: 'ai.analyze', entity: 'ai_parse_job' })
-    })
+    setConfirmed(false); setAiError(null); setAnswer(''); setAiBusy(true)
+    try {
+      // 纪要用固定结构化指令;工作台用自定义指令。发起服务端任务,后端跑到底,前端轮询。
+      const instr = workspace ? instruction : MEETING_INSTRUCTION
+      const r = await apiPost<{ job_id: number }>('/api/ai/jobs', { screen_id: screen.id, text, instruction: instr, job_kind: workspace ? 'analyze' : 'meeting' })
+      jobIdRef.current = r.job_id
+      persistJobId(r.job_id)
+      pollJob(r.job_id)
+    } catch (error) {
+      setAiBusy(false)
+      setAiError(error instanceof Error ? error.message.replace(/^\{"detail":"?|"?\}$/g, '') : 'AI 调用失败')
+    }
   }
 
   return (

@@ -4,6 +4,7 @@ import csv
 import io
 import os
 import re
+import threading
 import uuid
 from datetime import datetime, timedelta
 from json import dumps
@@ -190,6 +191,13 @@ class AiSummarizePayload(BaseModel):
 class AiAnalyzePayload(BaseModel):
     text: str
     instruction: str | None = None
+
+
+class AiJobPayload(BaseModel):
+    screen_id: str = Field(min_length=1, max_length=64)
+    text: str = Field(min_length=1)
+    instruction: str | None = None
+    job_kind: str = Field(default="analyze", max_length=32)
 
 
 class AiConfigPayload(BaseModel):
@@ -498,6 +506,10 @@ async def rate_limit(request: Request, call_next):
     if request.method != "OPTIONS":
         for prefix, window, limit in _RATE_RULES:
             if path.startswith(prefix):
+                # AI 限流只针对会真正调用大模型的写请求(POST);GET(状态/任务轮询)不计,
+                # 否则前端每秒轮询任务会被自己的限流打成 429。
+                if prefix == "/api/ai/" and request.method == "GET":
+                    break
                 if not _rate_allow(f"{prefix}|{_client_ip(request)}", window, limit):
                     origin = request.headers.get("origin", "*")
                     return JSONResponse(
@@ -2891,6 +2903,113 @@ def ai_analyze(payload: AiAnalyzePayload, user: AuthedUser = Depends(current_use
 
 
 @app.post("/api/ai/analyze/stream")
+def _run_ai_job(job_id: int, tid: int, messages: list[dict[str, str]]) -> None:
+    """后台线程:把解析跑到底并周期性把累计结果写库。前端断开也不影响。"""
+    acc = ""
+    last_write = 0
+    conn = connect_db()
+    try:
+        try:
+            model = llm.status().get("model")
+            with conn.cursor() as cur:
+                cur.execute("UPDATE cap_ai_jobs SET model=%s WHERE ai_job_id=%s AND tenant_id=%s", (model, job_id, tid))
+            conn.commit()
+            for delta in llm.chat_stream(messages):
+                acc += delta
+                # 节流落库:每累积 ~60 字符写一次,兼顾前端轮询可见增长与 DB 压力。
+                if len(acc) - last_write >= 60:
+                    with conn.cursor() as cur:
+                        cur.execute("UPDATE cap_ai_jobs SET result_text=%s WHERE ai_job_id=%s AND tenant_id=%s", (acc, job_id, tid))
+                    conn.commit()
+                    last_write = len(acc)
+            with conn.cursor() as cur:
+                cur.execute("UPDATE cap_ai_jobs SET result_text=%s, status='done' WHERE ai_job_id=%s AND tenant_id=%s", (acc, job_id, tid))
+            conn.commit()
+        except (llm.LLMError, llm.LLMNotConfigured) as exc:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE cap_ai_jobs SET result_text=%s, status='error', error_text=%s WHERE ai_job_id=%s AND tenant_id=%s", (acc, str(exc)[:480], job_id, tid))
+            conn.commit()
+        except Exception as exc:  # noqa: BLE001 后台线程兜底,别让异常静默丢任务
+            with conn.cursor() as cur:
+                cur.execute("UPDATE cap_ai_jobs SET status='error', error_text=%s WHERE ai_job_id=%s AND tenant_id=%s", (str(exc)[:480], job_id, tid))
+            conn.commit()
+    finally:
+        conn.close()
+
+
+def _build_ai_messages(instruction: str | None, text: str) -> list[dict[str, str]]:
+    instr = (instruction or "").strip() or "请对以下材料做投资视角的要点分析与风险提示。"
+    return [
+        {"role": "system", "content": "你是 PE/VC 投资平台的分析助手。用中文、结构化、可直接用于投资决策地回答;可用 Markdown 小标题与要点,避免空话。"},
+        {"role": "user", "content": f"{instr}\n\n材料:\n{text[:20000]}"},
+    ]
+
+
+@app.post("/api/ai/jobs")
+def create_ai_job(payload: AiJobPayload, user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
+    """发起服务端解析任务:立刻返回 job_id,后台线程把解析跑到底并落库(前端可关闭)。"""
+    if not llm.is_configured():
+        raise HTTPException(status_code=503, detail="AI 未配置:请在 deploy/.env 配置 LLM_*")
+    text = payload.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text required")
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """INSERT INTO cap_ai_jobs (screen_id, job_kind, instruction, input_preview, status, owner_user_id, tenant_id)
+                   VALUES (%s, %s, %s, %s, 'running', %s, %s)""",
+                (payload.screen_id, payload.job_kind, (payload.instruction or "")[:2000], text[:480], user.user_id, tid),
+            )
+            job_id = int(cursor.lastrowid)
+        connection.commit()
+    finally:
+        connection.close()
+    messages = _build_ai_messages(payload.instruction, text)
+    threading.Thread(target=_run_ai_job, args=(job_id, tid, messages), daemon=True).start()
+    return {"ok": True, "job_id": job_id, "status": "running"}
+
+
+@app.get("/api/ai/jobs/latest")
+def latest_ai_job(screen_id: str, user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
+    """本人在该屏最近一次解析任务(用于关闭浏览器/换设备后恢复)。"""
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """SELECT ai_job_id AS job_id, status, result_text, error_text, model, updated_at
+                   FROM cap_ai_jobs WHERE owner_user_id=%s AND screen_id=%s AND tenant_id=%s
+                   ORDER BY ai_job_id DESC LIMIT 1""",
+                (user.user_id, screen_id, tid),
+            )
+            row = cursor.fetchone()
+    finally:
+        connection.close()
+    return {"job": row}
+
+
+@app.get("/api/ai/jobs/{job_id}")
+def get_ai_job(job_id: int, user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
+    """轮询任务状态 + 已累计结果(本人 + 租户内)。"""
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """SELECT ai_job_id AS job_id, status, result_text, error_text, model, updated_at
+                   FROM cap_ai_jobs WHERE ai_job_id=%s AND owner_user_id=%s AND tenant_id=%s""",
+                (job_id, user.user_id, tid),
+            )
+            row = cursor.fetchone()
+    finally:
+        connection.close()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return row
+
+
 def ai_analyze_stream(payload: AiAnalyzePayload, user: AuthedUser = Depends(current_user)) -> StreamingResponse:
     """SSE 流式分析:边生成边下发 token,前端可低延迟增量渲染。"""
     text = payload.text.strip()
