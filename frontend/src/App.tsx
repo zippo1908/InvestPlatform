@@ -1844,7 +1844,6 @@ const PROJECT_SUBTABS = ['基本情况', '投资汇总', '财务数据', '委派
 type ProjectSubtab = (typeof PROJECT_SUBTABS)[number]
 // 顶部 section 导航(对照反馈截图那一行)。概况=卡片主视图;其余为各专题 section。
 const PROJECT_SECTIONS = ['概况', '日程', '基金投资情况', '权益变动', '三会', '现金流', '估值', '投后数据', '协议条款(AI)'] as const
-type ProjectSection = (typeof PROJECT_SECTIONS)[number]
 const _n = (v: unknown): number | null => (v == null || v === '' ? null : Number(v))
 const CF_KIND_CN: Record<string, string> = { project_return: '项目回款', capital_call: '出资', investment: '投资打款', management_fee: '管理费', distribution: '分配', expense: '费用' }
 const CF_DIR_CN: Record<string, string> = { inflow: '流入', outflow: '流出' }
@@ -1888,6 +1887,36 @@ const SECTION_DATA: Record<string, { path: string; map: (r: Record<string, unkno
     path: 'schedule',
     map: (r) => ({ 事项: String(r.event_title ?? '—'), 类型: EVENT_KIND_CN[String(r.event_kind)] ?? String(r.event_kind ?? '—'), 开始: dtmin(r.starts_at), 结束: dtmin(r.ends_at), 地点: String(r.location_text ?? '—') }),
   },
+}
+
+// ── 基金详情:阶段/section/基本情况 与项目同构 ──
+const FUND_STAGES = ['筹备', '募集', '投资', '收获', '延长', '清算']
+const FUND_STAGE_INDEX: Record<string, number> = { planning: 0, raising: 1, investing: 2, harvesting: 3, extended: 4, closed: 5 }
+const FUND_STATUS_CN: Record<string, string> = { planning: '筹备', raising: '募集', investing: '投资', harvesting: '收获', extended: '延长', closed: '清算' }
+const FUND_SECTIONS = ['概况', '组合项目', 'LP出资', '现金流', '财报', '日程'] as const
+const FUND_BASIC_GROUPS: Array<[string, string[]]> = [
+  ['基础信息', ['fund_name', 'legal_name', 'fund_status']],
+  ['规模期限', ['target_size', 'committed_size', 'paid_in_size', 'net_asset_value']],
+]
+const COMMIT_STATUS_CN: Record<string, string> = { active: '在册', exited: '已退出', defaulted: '违约', transferred: '已转让' }
+const DISCLOSURE_CN: Record<string, string> = { confirmed: '已确认', sent: '已发送', pending: '待披露', none: '未披露' }
+const REPORT_KIND_CN: Record<string, string> = { quarterly: '季报', annual: '年报', monthly: '月报', interim: '中期', semiannual: '半年报' }
+const REPORT_STATUS_CN: Record<string, string> = { approved: '已审批', draft: '草稿', submitted: '已提交', published: '已发布' }
+const FUND_SECTION_DATA: Record<string, { path: string; map: (r: Record<string, unknown>) => DataRow }> = {
+  组合项目: {
+    path: 'portfolio',
+    map: (r) => ({ 项目: String(r.short_name ?? '—'), 轮次: String(r.round_label ?? '—'), 认购金额: wan(_n(r.agreement_amount)), 已打款: wan(_n(r.cumulative_paid_amount)), 持股比例: pct(_n(r.current_ownership_ratio)), 最新估值: wan(_n(r.latest_valuation)), 状态: INV_STATUS_CN[String(r.investment_status)] ?? String(r.investment_status ?? '—') }),
+  },
+  LP出资: {
+    path: 'commitments',
+    map: (r) => ({ LP: String(r.investor_name ?? '—'), 认缴: wan(_n(r.committed_amount)), 实缴: wan(_n(r.paid_in_amount)), 入伙日期: r.admission_date ? String(r.admission_date) : '—', 状态: COMMIT_STATUS_CN[String(r.status)] ?? String(r.status ?? '—'), 披露: DISCLOSURE_CN[String(r.disclosure_status)] ?? String(r.disclosure_status ?? '—') }),
+  },
+  现金流: SECTION_DATA.现金流,
+  财报: {
+    path: 'reports',
+    map: (r) => ({ 期间: String(r.period_code ?? '—'), 类型: REPORT_KIND_CN[String(r.report_kind)] ?? String(r.report_kind ?? '—'), 总资产: wan(_n(r.total_assets)), 总负债: wan(_n(r.total_liabilities)), 净资产: wan(_n(r.net_assets)), 实缴资本: wan(_n(r.paid_in_capital)), 已分配: wan(_n(r.distributed_amount)), 状态: REPORT_STATUS_CN[String(r.report_status)] ?? String(r.report_status ?? '—') }),
+  },
+  日程: { path: 'schedule', map: SECTION_DATA.日程.map },
 }
 const SEAT_CN: Record<string, string> = { director: '董事', observer: '观察员', other: '其他' }
 const REP_STATUS_CN: Record<string, string> = { active: '在任', resigned: '已卸任' }
@@ -2071,17 +2100,18 @@ function DetailPage({
   const [loadedAt, setLoadedAt] = useState<string | null>(null) // 乐观锁:加载时的 updated_at
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
-  const [section, setSection] = useState<ProjectSection>('概况') // 顶部 section 导航
+  const [section, setSection] = useState<string>('概况') // 顶部 section 导航(项目/基金通用)
   const [sectionRows, setSectionRows] = useState<DataRow[]>([])
   const [sectionLoading, setSectionLoading] = useState(false)
   const [subtab, setSubtab] = useState<ProjectSubtab>('基本情况') // 项目卡片二级 tab
   const [summary, setSummary] = useState<InvestSummary | null>(null)
   const [summaryLoading, setSummaryLoading] = useState(false)
+  const sectionMap = kind === 'fund' ? FUND_SECTION_DATA : SECTION_DATA
 
-  // 顶部各专题 section(基金投资/权益变动/现金流/估值/投后数据)按需拉取。
+  // 顶部各专题 section 按需拉取(项目/基金各自的 SECTION_DATA)。
   useEffect(() => {
-    if (kind !== 'project' || selectedId == null) return
-    const spec = SECTION_DATA[section]
+    if (kind == null || selectedId == null) return
+    const spec = sectionMap[section]
     if (!spec) { setSectionRows([]); return }
     let ignore = false
     setSectionLoading(true); setSectionRows([])
@@ -2090,6 +2120,7 @@ function DetailPage({
       .catch(() => { if (!ignore) setSectionRows([]) })
       .finally(() => { if (!ignore) setSectionLoading(false) })
     return () => { ignore = true }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [kind, section, selectedId, listPath])
 
   const [tabRows, setTabRows] = useState<DataRow[]>([])
@@ -2133,10 +2164,11 @@ function DetailPage({
     return () => { ignore = true }
   }, [kind, showHistory, selectedId, listPath])
 
-  // 路由带 ?id= 时预选该实体(从列表行「打开」进来)。
+  // 路由带 ?id= 时预选该实体(从列表行「打开」进来);换屏回到概况 section。
   useEffect(() => {
     const urlId = readRouteId()
     if (urlId != null) setSelectedId(urlId)
+    setSection('概况')
   }, [screen.id])
 
   // 载入实体列表(供选择)。
@@ -2241,6 +2273,8 @@ function DetailPage({
   const entityName = form[nameKey] || (loading ? '加载中…' : '（无数据）')
   const fieldByKey = Object.fromEntries(fields.map((f) => [f.key, f])) as Record<string, DetailField>
   const curStage = stageIndexOf({ stage_label: String(detail.stage_label ?? ''), opportunity_status: String(detail.opportunity_status ?? '') })
+  const fundStatus = String(form.fund_status ?? detail.fund_status ?? '')
+  const fundStage = FUND_STAGE_INDEX[fundStatus] ?? 0
 
   return (
     <div className="page-grid">
@@ -2481,36 +2515,96 @@ function DetailPage({
         </>
       ) : (
         <>
-          <section className="panel motion-item">
-            <PanelTitle icon={Clock} title="关键时间线" />
-            <Timeline />
-          </section>
-          <section className="panel full-span motion-item">
-            <div className="tab-summary">
-              <strong>主档编辑</strong>
-              <span>{canWrite ? '修改字段后点「保存主档」写入后端并记审计。' : '当前角色只读,字段不可编辑。'}</span>
-            </div>
-            <div className="form-grid detail-edit-grid">
-              {fields.map((f) => (
-                <label key={f.key}>
-                  <span>{f.label}</span>
-                  <input
-                    type={f.kind === 'number' ? 'number' : 'text'}
-                    value={form[f.key] ?? ''}
-                    readOnly={!canWrite}
-                    data-field={f.key}
-                    onChange={(event) => setForm((prev) => ({ ...prev, [f.key]: event.target.value }))}
-                  />
-                </label>
+          {/* 基金顶部 section 导航(与项目同构) */}
+          <section className="panel full-span motion-item section-tabbar">
+            <div className="subtab-bar" data-testid="fund-sections">
+              {FUND_SECTIONS.map((s) => (
+                <button key={s} type="button" className={classNames('subtab', section === s && 'is-active')} onClick={() => setSection(s)}>{s}</button>
               ))}
             </div>
-            <div className="button-row" style={{ marginTop: 14 }}>
-              <button type="button" className="primary-button" disabled={!canWrite || saving || selectedId == null} data-testid="detail-save" onClick={save}>
-                <CheckCircle size={16} />
-                {saving ? '保存中…' : '保存主档'}
-              </button>
-            </div>
           </section>
+
+          {section === '概况' ? (
+            <>
+              {/* 基金生命周期流向条 */}
+              <section className="panel full-span motion-item">
+                <PanelTitle icon={GitBranch} title="基金所处阶段" />
+                <div className="stage-flow" data-testid="fund-stage-bar">
+                  {FUND_STAGES.flatMap((s, i) => {
+                    const node = (
+                      <div key={`fn-${i}`} className={classNames('stage-node', i < fundStage && 'is-done', i === fundStage && 'is-current')}>
+                        <span className="stage-node-dot">{i < fundStage ? '✓' : i + 1}</span>
+                        <span className="stage-node-name">{s}</span>
+                      </div>
+                    )
+                    return i === 0 ? [node] : [
+                      <span key={`fa-${i}`} className={classNames('stage-arrow', i <= fundStage && 'is-filled')} aria-hidden="true" />,
+                      node,
+                    ]
+                  })}
+                </div>
+              </section>
+
+              {/* 基金卡片头部 */}
+              <section className="panel full-span motion-item">
+                <PanelTitle icon={FileText} title="基金卡片" />
+                <div className="project-card-grid" data-testid="fund-card">
+                  <div><span>基金简称</span><strong>{form.fund_name || '—'}</strong></div>
+                  <div><span>基金全称</span><strong>{form.legal_name || '—'}</strong></div>
+                  <div><span>状态</span><strong><StatusBadge value={FUND_STATUS_CN[fundStatus] ?? fundStatus ?? '—'} /></strong></div>
+                  <div><span>目标规模</span><strong>{wan(_n(form.target_size))}</strong></div>
+                  <div><span>认缴规模</span><strong>{wan(_n(form.committed_size))}</strong></div>
+                  <div><span>实缴总额</span><strong>{wan(_n(form.paid_in_size))}</strong></div>
+                  <div><span>净资产</span><strong>{wan(_n(form.net_asset_value))}</strong></div>
+                </div>
+              </section>
+
+              {/* 基本情况(可编辑) */}
+              <section className="panel full-span motion-item">
+                <div data-testid="fund-basic">
+                  {FUND_BASIC_GROUPS.map(([group, keys]) => (
+                    <fieldset className="form-section" key={group}>
+                      <legend>{group}</legend>
+                      <div className="form-grid detail-edit-grid">
+                        {keys.map((k) => {
+                          const f = fieldByKey[k]
+                          if (!f) return null
+                          return (
+                            <label key={k}>
+                              <span>{f.label}</span>
+                              <input type={f.kind === 'number' ? 'number' : 'text'} value={form[k] ?? ''} readOnly={!canWrite} data-field={k}
+                                onChange={(e) => setForm((prev) => ({ ...prev, [k]: e.target.value }))} />
+                            </label>
+                          )
+                        })}
+                      </div>
+                    </fieldset>
+                  ))}
+                  <div className="button-row" style={{ marginTop: 14 }}>
+                    <button type="button" className="primary-button" disabled={!canWrite || saving || selectedId == null} data-testid="detail-save" onClick={save}>
+                      <CheckCircle size={16} /> {saving ? '保存中…' : '修改'}
+                    </button>
+                  </div>
+                </div>
+              </section>
+            </>
+          ) : sectionMap[section] ? (
+            <section className="panel full-span motion-item" data-testid="section-data">
+              <PanelTitle icon={FileText} title={section} />
+              {sectionLoading ? (
+                <p className="muted-note">加载中…</p>
+              ) : sectionRows.length === 0 ? (
+                <p className="muted-note">该基金暂无{section}记录。</p>
+              ) : (
+                <DataTable rows={sectionRows} compact />
+              )}
+            </section>
+          ) : (
+            <section className="panel full-span motion-item" data-testid="section-placeholder">
+              <PanelTitle icon={FileText} title={section} />
+              <p className="muted-note">「{section}」结构已就位。</p>
+            </section>
+          )}
         </>
       )}
     </div>

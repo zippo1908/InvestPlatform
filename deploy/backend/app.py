@@ -1356,6 +1356,119 @@ def project_decisions(project_id: int, user: AuthedUser = Depends(current_user))
     return {"count": len(rows), "items": rows}
 
 
+def _assert_fund(cursor: Any, fund_id: int, tid: int) -> dict[str, Any]:
+    cursor.execute(
+        "SELECT fund_id, fund_name FROM cap_funds WHERE fund_id=%s AND tenant_id=%s AND deleted_at IS NULL",
+        (fund_id, tid),
+    )
+    row = cursor.fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Fund not found")
+    return row
+
+
+@app.get("/api/funds/{fund_id}/portfolio")
+def fund_portfolio(fund_id: int, user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
+    """组合项目 section:该基金投了哪些项目(cap_investment_positions join 项目)。"""
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            _assert_fund(cursor, fund_id, tid)
+            cursor.execute(
+                """SELECT pr.short_name, p.round_label, p.agreement_amount, p.cumulative_paid_amount,
+                          p.current_ownership_ratio, p.latest_valuation, p.investment_status
+                   FROM cap_investment_positions p LEFT JOIN cap_projects pr ON pr.project_id=p.project_id
+                   WHERE p.fund_id=%s AND p.tenant_id=%s AND p.deleted_at IS NULL ORDER BY p.first_payment_on""",
+                (fund_id, tid),
+            )
+            rows = cursor.fetchall()
+    finally:
+        connection.close()
+    return {"count": len(rows), "items": rows}
+
+
+@app.get("/api/funds/{fund_id}/commitments")
+def fund_commitments(fund_id: int, user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
+    """LP 出资 section:各 LP 认缴/实缴(cap_fund_commitments join 投资人)。"""
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            _assert_fund(cursor, fund_id, tid)
+            cursor.execute(
+                """SELECT i.investor_name, c.committed_amount, c.paid_in_amount, c.ownership_units,
+                          c.admission_date, c.status, c.disclosure_status
+                   FROM cap_fund_commitments c LEFT JOIN cap_investors i ON i.investor_id=c.investor_id
+                   WHERE c.fund_id=%s AND c.deleted_at IS NULL ORDER BY c.committed_amount DESC""",
+                (fund_id,),
+            )
+            rows = cursor.fetchall()
+    finally:
+        connection.close()
+    return {"count": len(rows), "items": rows}
+
+
+@app.get("/api/funds/{fund_id}/cashflows")
+def fund_cashflows(fund_id: int, user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
+    """现金流 section:基金层面出资/回款流水(cap_cashflows by fund)。"""
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            _assert_fund(cursor, fund_id, tid)
+            cursor.execute(
+                """SELECT cashflow_kind, direction, amount, currency, occurred_on, settlement_status, description
+                   FROM cap_cashflows WHERE fund_id=%s AND deleted_at IS NULL ORDER BY occurred_on DESC""",
+                (fund_id,),
+            )
+            rows = cursor.fetchall()
+    finally:
+        connection.close()
+    return {"count": len(rows), "items": rows}
+
+
+@app.get("/api/funds/{fund_id}/reports")
+def fund_reports(fund_id: int, user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
+    """财报 section:基金定期财报(cap_fund_financial_reports)。"""
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            _assert_fund(cursor, fund_id, tid)
+            cursor.execute(
+                """SELECT period_code, report_kind, total_assets, total_liabilities, net_assets,
+                          paid_in_capital, distributed_amount, report_status
+                   FROM cap_fund_financial_reports WHERE fund_id=%s ORDER BY period_code DESC""",
+                (fund_id,),
+            )
+            rows = cursor.fetchall()
+    finally:
+        connection.close()
+    return {"count": len(rows), "items": rows}
+
+
+@app.get("/api/funds/{fund_id}/schedule")
+def fund_schedule(fund_id: int, user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
+    """日程 section:与本基金关联的日历事件(cap_calendar_events)。"""
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            _assert_fund(cursor, fund_id, tid)
+            cursor.execute(
+                """SELECT event_title, event_kind, starts_at, ends_at, location_text
+                   FROM cap_calendar_events
+                   WHERE linked_entity_type='fund' AND linked_entity_id=%s AND tenant_id=%s AND deleted_at IS NULL
+                   ORDER BY starts_at""",
+                (fund_id, tid),
+            )
+            rows = cursor.fetchall()
+    finally:
+        connection.close()
+    return {"count": len(rows), "items": rows}
+
+
 @app.get("/api/projects/{project_id}/funds-investment")
 def project_funds_investment(project_id: int, user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
     """基金投资情况 section:哪些基金、以什么轮次/金额/持股投了本项目。"""
