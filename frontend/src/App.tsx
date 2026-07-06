@@ -69,6 +69,7 @@ import {
 import type { DataRow, Project, Screen } from './data'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
+import html2canvas from 'html2canvas'
 import { API_BASE, apiDelete, apiDownload, apiGet, apiPatch, apiPost, auditDetail, getPerms, getRoles, getToken, setPerms, setRoles, streamPost, setToken } from './api'
 
 marked.setOptions({ breaks: true, gfm: true })
@@ -363,8 +364,10 @@ function FeedbackWidget({ onToast }: { onToast: (t: Toast) => void }) {
   const [message, setMessage] = useState('')
   const [picking, setPicking] = useState(false)
   const [busy, setBusy] = useState(false)
+  const [withShot, setWithShot] = useState(true) // 一键截图(默认开)
   const [items, setItems] = useState<Array<Record<string, unknown>>>([])
   const [reloadKey, setReloadKey] = useState(0)
+  const [shotView, setShotView] = useState<Record<number, string>>({}) // 已加载的截图 objectURL
 
   // 组件拾取:进入后 hover 高亮、点击捕获描述并退出;排除工具自身。
   useEffect(() => {
@@ -393,18 +396,51 @@ function FeedbackWidget({ onToast }: { onToast: (t: Toast) => void }) {
     apiGet<{ items: Array<Record<string, unknown>> }>('/api/feedback').then((r) => setItems(r.items ?? [])).catch(() => setItems([]))
   }, [open, tab, isAdmin, reloadKey])
 
+  // 一键截图:抓当前视口(忽略反馈工具自身),压到 jpeg。失败不阻断提交。
+  const captureShot = async (): Promise<string | undefined> => {
+    try {
+      const canvas = await html2canvas(document.body, {
+        ignoreElements: (el) => (el as HTMLElement).classList?.contains('fb-widget'),
+        x: window.scrollX, y: window.scrollY, width: window.innerWidth, height: window.innerHeight,
+        scale: 0.7, backgroundColor: '#f8fafc', logging: false, useCORS: true,
+      })
+      return canvas.toDataURL('image/jpeg', 0.7)
+    } catch (e) { console.warn('[feedback] 截图失败:', e); return undefined }
+  }
+
   const submit = async () => {
     if (!message.trim()) return
     setBusy(true)
     try {
       const screen_id = location.hash.replace(/^#\//, '').split('?')[0] || 'unknown'
       const screen_title = document.querySelector('[data-testid="screen-title"]')?.textContent?.trim() || screen_id
-      await apiPost('/api/feedback', { message: message.trim(), component_label: component || undefined, category, screen_id, screen_title, page_url: location.href.slice(0, 300) })
-      onToast({ title: '反馈已提交', detail: '已收集,开发会从「汇总」里整理并同步 GitHub。谢谢!' })
+      const screenshot = withShot ? await captureShot() : undefined
+      await apiPost('/api/feedback', { message: message.trim(), component_label: component || undefined, category, screen_id, screen_title, page_url: location.href.slice(0, 300), screenshot })
+      onToast({ title: '反馈已提交', detail: screenshot ? '已收集(含截图),开发会从「汇总」整理并同步 GitHub' : '已收集,开发会从「汇总」整理并同步 GitHub' })
       setMessage(''); setComponent('')
     } catch (error) {
       onToast({ title: '提交失败', detail: error instanceof Error ? error.message : 'API 调用失败' })
     } finally { setBusy(false) }
+  }
+
+  const pushAll = async () => {
+    try {
+      const r = await apiPost<{ pushed: number; failed: number }>('/api/feedback/push-github-batch', {})
+      onToast({ title: `已批量推送 ${r.pushed} 条`, detail: r.failed ? `${r.failed} 条失败` : '全部已建 GitHub Issue' })
+      setReloadKey((k) => k + 1)
+    } catch (error) {
+      onToast({ title: '批量推送失败', detail: error instanceof Error ? error.message.replace(/^\{"detail":"?|"?\}$/g, '') : 'API 调用失败' })
+    }
+  }
+  const loadShot = async (id: number) => {
+    if (shotView[id]) { setShotView((m) => { const n = { ...m }; delete n[id]; return n }); return } // 再点收起
+    try {
+      const token = getToken()
+      const res = await fetch(`${API_BASE}/api/feedback/${id}/screenshot`, { headers: token ? { Authorization: `Bearer ${token}` } : {} })
+      if (!res.ok) throw new Error()
+      const url = URL.createObjectURL(await res.blob())
+      setShotView((m) => ({ ...m, [id]: url }))
+    } catch { onToast({ title: '截图加载失败', detail: '可能未附带截图' }) }
   }
 
   const pushGithub = async (id: number) => {
@@ -461,12 +497,21 @@ function FeedbackWidget({ onToast }: { onToast: (t: Toast) => void }) {
                 <span>修改意见</span>
                 <textarea value={message} onChange={(e) => setMessage(e.target.value)} rows={4} placeholder="描述这个页面/组件哪里需要调整…" data-testid="feedback-message" />
               </label>
+              <label className="fb-check">
+                <input type="checkbox" checked={withShot} onChange={(e) => setWithShot(e.target.checked)} data-testid="feedback-withshot" />
+                <span>附带当前页面截图</span>
+              </label>
               <button type="button" className="primary-button full-width" disabled={busy || !message.trim()} onClick={submit} data-testid="feedback-submit">
-                <Send size={15} /> {busy ? '提交中…' : '提交反馈'}
+                <Send size={15} /> {busy ? (withShot ? '截图并提交…' : '提交中…') : '提交反馈'}
               </button>
             </div>
           ) : (
             <div className="fb-review" data-testid="feedback-review">
+              {items.some((f) => f.status === 'new') && (
+                <button type="button" className="secondary-button full-width" onClick={pushAll} data-testid="feedback-pushall">
+                  <Send size={14} /> 批量推送待处理({items.filter((f) => f.status === 'new').length})
+                </button>
+              )}
               {items.length === 0 ? <p className="muted-note">暂无反馈</p> : items.map((f) => (
                 <div className="fb-item" key={String(f.id)}>
                   <div className="fb-item-head">
@@ -475,7 +520,13 @@ function FeedbackWidget({ onToast }: { onToast: (t: Toast) => void }) {
                   </div>
                   <p className="fb-msg">{String(f.message)}</p>
                   <div className="fb-meta">{String(f.screen_title ?? '')} · {f.component_label ? String(f.component_label) : '未指定组件'} · {String(f.author ?? '')}</div>
+                  {shotView[Number(f.id)] && <img className="fb-shot" src={shotView[Number(f.id)]} alt="反馈截图" />}
                   <div className="fb-actions">
+                    {f.screenshot_path ? (
+                      <button type="button" className="link-button" onClick={() => loadShot(Number(f.id))} data-testid={`fb-shot-${f.id}`}>
+                        {shotView[Number(f.id)] ? '收起截图' : '看截图'}
+                      </button>
+                    ) : null}
                     {f.github_issue_url ? (
                       <a className="link-button" href={String(f.github_issue_url)} target="_blank" rel="noreferrer">查看 Issue #{String(f.github_issue_number)}</a>
                     ) : (

@@ -8,6 +8,7 @@ CREATE TABLE IF NOT EXISTS cap_feedback_annotations (
   screen_title VARCHAR(160),
   page_url VARCHAR(300),
   component_label VARCHAR(300),                 -- 拾取到的组件描述(data-testid / 文案 / 标签)
+  screenshot_path VARCHAR(300),                 -- 一键截图文件相对路径(存 deploy/backend/feedback_shots/)
   category VARCHAR(40) NOT NULL DEFAULT 'other', -- ui/interaction/data/copy/flow/perf/other
   message TEXT NOT NULL,
   status ENUM('new','pushed','resolved','dismissed') NOT NULL DEFAULT 'new',

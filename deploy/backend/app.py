@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import csv
 import io
 import os
@@ -205,6 +206,7 @@ class CreateFeedbackPayload(BaseModel):
     page_url: str | None = Field(default=None, max_length=300)
     component_label: str | None = Field(default=None, max_length=300)
     category: str = Field(default="other", max_length=40)
+    screenshot: str | None = None  # data:image/jpeg;base64,... 一键截图(可选)
 
 
 class FeedbackStatusPayload(BaseModel):
@@ -1530,9 +1532,29 @@ def _create_github_issue(title: str, body: str) -> tuple[int, str]:
     return int(obj["number"]), str(obj["html_url"])
 
 
+_FEEDBACK_SHOTS_DIR = os.path.join(os.path.dirname(__file__), "feedback_shots")
+
+
+def _save_feedback_screenshot(fid: int, data_url: str) -> str | None:
+    """把 data:image/...;base64,... 存成文件,返回相对路径(存不了返回 None)。"""
+    try:
+        if "," in data_url:
+            data_url = data_url.split(",", 1)[1]
+        raw = base64.b64decode(data_url)
+        if len(raw) > 8 * 1024 * 1024:  # 截图上限 8MB
+            return None
+        os.makedirs(_FEEDBACK_SHOTS_DIR, exist_ok=True)
+        name = f"fb-{fid}.jpg"
+        with open(os.path.join(_FEEDBACK_SHOTS_DIR, name), "wb") as fh:
+            fh.write(raw)
+        return name
+    except Exception:  # noqa: BLE001 截图失败不该拖累反馈本身
+        return None
+
+
 @app.post("/api/feedback")
 def create_feedback(payload: CreateFeedbackPayload, user: AuthedUser = Depends(require_permission("feedback.annotate"))) -> dict[str, Any]:
-    """提交一条标注/修改意见。门槛:需 feedback.annotate 能力位(开发者账号)。"""
+    """提交一条标注/修改意见。门槛:需 feedback.annotate 能力位(开发者账号)。可带一键截图。"""
     tid = tenant_of(user)
     connection = connect_db()
     try:
@@ -1546,10 +1568,33 @@ def create_feedback(payload: CreateFeedbackPayload, user: AuthedUser = Depends(r
                  payload.message, user.user_id, tid),
             )
             fid = int(cursor.lastrowid)
+            if payload.screenshot:
+                shot = _save_feedback_screenshot(fid, payload.screenshot)
+                if shot:
+                    cursor.execute("UPDATE cap_feedback_annotations SET screenshot_path=%s WHERE feedback_id=%s", (shot, fid))
         connection.commit()
     finally:
         connection.close()
     return {"ok": True, "feedback_id": fid}
+
+
+@app.get("/api/feedback/{feedback_id}/screenshot")
+def feedback_screenshot(feedback_id: int, user: AuthedUser = Depends(require_roles("system_admin", "managing_partner"))) -> FileResponse:
+    """取某条反馈的截图(管理员汇总页查看)。"""
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT screenshot_path FROM cap_feedback_annotations WHERE feedback_id=%s AND tenant_id=%s", (feedback_id, tid))
+            row = cursor.fetchone()
+    finally:
+        connection.close()
+    if row is None or not row["screenshot_path"]:
+        raise HTTPException(status_code=404, detail="No screenshot")
+    path = os.path.join(_FEEDBACK_SHOTS_DIR, os.path.basename(str(row["screenshot_path"])))
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Screenshot file missing")
+    return FileResponse(path, media_type="image/jpeg")
 
 
 @app.get("/api/feedback")
@@ -1562,8 +1607,8 @@ def list_feedback(user: AuthedUser = Depends(require_roles("system_admin", "mana
             if status:
                 cursor.execute(
                     """SELECT f.feedback_id AS id, f.screen_id, f.screen_title, f.page_url, f.component_label,
-                              f.category, f.message, f.status, f.github_issue_number, f.github_issue_url, f.created_at,
-                              u.display_name AS author
+                              f.screenshot_path, f.category, f.message, f.status, f.github_issue_number, f.github_issue_url,
+                              f.created_at, u.display_name AS author
                        FROM cap_feedback_annotations f LEFT JOIN cap_users u ON u.user_id=f.author_user_id
                        WHERE f.tenant_id=%s AND f.status=%s ORDER BY f.feedback_id DESC LIMIT 500""",
                     (tid, status),
@@ -1571,8 +1616,8 @@ def list_feedback(user: AuthedUser = Depends(require_roles("system_admin", "mana
             else:
                 cursor.execute(
                     """SELECT f.feedback_id AS id, f.screen_id, f.screen_title, f.page_url, f.component_label,
-                              f.category, f.message, f.status, f.github_issue_number, f.github_issue_url, f.created_at,
-                              u.display_name AS author
+                              f.screenshot_path, f.category, f.message, f.status, f.github_issue_number, f.github_issue_url,
+                              f.created_at, u.display_name AS author
                        FROM cap_feedback_annotations f LEFT JOIN cap_users u ON u.user_id=f.author_user_id
                        WHERE f.tenant_id=%s ORDER BY f.feedback_id DESC LIMIT 500""",
                     (tid,),
@@ -1581,6 +1626,61 @@ def list_feedback(user: AuthedUser = Depends(require_roles("system_admin", "mana
     finally:
         connection.close()
     return {"count": len(rows), "items": rows}
+
+
+def _feedback_issue_text(fb: dict[str, Any], fid: int) -> tuple[str, str]:
+    cat = _FEEDBACK_CATEGORY_LABEL.get(fb["category"], fb["category"])
+    title = f"[用户反馈] {fb.get('screen_title') or fb.get('screen_id') or '页面'} · {cat}"
+    shot_note = "\n**截图**:已随反馈附带,见 CapitalOS 汇总页。" if fb.get("screenshot_path") else ""
+    body = (
+        f"**页面**:{fb.get('screen_title') or ''}(`{fb.get('screen_id') or ''}`)\n"
+        f"**组件**:{fb.get('component_label') or '(未指定)'}\n"
+        f"**类别**:{cat}\n"
+        f"**提交人**:{fb.get('author') or '匿名'}\n"
+        f"**页面地址**:{fb.get('page_url') or ''}{shot_note}\n\n"
+        f"**意见**:\n{fb['message']}\n\n"
+        f"---\n_由 CapitalOS 页面标注工具自动同步(feedback #{fid})_"
+    )
+    return title, body
+
+
+@app.post("/api/feedback/push-github-batch")
+def push_feedback_github_batch(user: AuthedUser = Depends(require_roles("system_admin", "managing_partner"))) -> dict[str, Any]:
+    """把所有「待处理(new)」反馈一次性推成 GitHub Issue,返回逐条结果。"""
+    tid = tenant_of(user)
+    connection = connect_db()
+    pushed, failed, results = 0, 0, []
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """SELECT f.feedback_id, f.screen_id, f.screen_title, f.page_url, f.component_label, f.screenshot_path,
+                          f.category, f.message, u.display_name AS author
+                   FROM cap_feedback_annotations f LEFT JOIN cap_users u ON u.user_id=f.author_user_id
+                   WHERE f.tenant_id=%s AND f.status='new' ORDER BY f.feedback_id""",
+                (tid,),
+            )
+            rows = cursor.fetchall()
+            for fb in rows:
+                fid = int(fb["feedback_id"])
+                try:
+                    title, body = _feedback_issue_text(fb, fid)
+                    number, url = _create_github_issue(title, body)
+                    cursor.execute(
+                        "UPDATE cap_feedback_annotations SET status='pushed', github_issue_number=%s, github_issue_url=%s WHERE feedback_id=%s AND tenant_id=%s",
+                        (number, url, fid, tid),
+                    )
+                    connection.commit()
+                    pushed += 1
+                    results.append({"feedback_id": fid, "issue": number, "url": url})
+                except HTTPException as exc:
+                    failed += 1
+                    results.append({"feedback_id": fid, "error": str(exc.detail)})
+            if pushed:
+                write_audit(cursor, user.user_id, "feedback.push_github_batch", "feedback", 0, f"批量推送 {pushed} 条", after={"pushed": pushed, "failed": failed})
+                connection.commit()
+    finally:
+        connection.close()
+    return {"ok": True, "pushed": pushed, "failed": failed, "results": results}
 
 
 @app.post("/api/feedback/{feedback_id}/push-github")
@@ -1603,17 +1703,7 @@ def push_feedback_github(feedback_id: int, user: AuthedUser = Depends(require_ro
             if fb["status"] == "pushed" and fb["github_issue_url"]:
                 return {"ok": True, "already": True, "github_issue_url": fb["github_issue_url"]}
 
-            cat = _FEEDBACK_CATEGORY_LABEL.get(fb["category"], fb["category"])
-            title = f"[用户反馈] {fb['screen_title'] or fb['screen_id'] or '页面'} · {cat}"
-            body = (
-                f"**页面**:{fb['screen_title'] or ''}(`{fb['screen_id'] or ''}`)\n"
-                f"**组件**:{fb['component_label'] or '(未指定)'}\n"
-                f"**类别**:{cat}\n"
-                f"**提交人**:{fb['author'] or '匿名'}\n"
-                f"**页面地址**:{fb['page_url'] or ''}\n\n"
-                f"**意见**:\n{fb['message']}\n\n"
-                f"---\n_由 CapitalOS 页面标注工具自动同步(feedback #{feedback_id})_"
-            )
+            title, body = _feedback_issue_text(fb, feedback_id)
             number, url = _create_github_issue(title, body)
             cursor.execute(
                 "UPDATE cap_feedback_annotations SET status='pushed', github_issue_number=%s, github_issue_url=%s WHERE feedback_id=%s AND tenant_id=%s",

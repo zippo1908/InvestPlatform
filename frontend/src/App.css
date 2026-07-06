@@ -1857,7 +1857,7 @@ tbody tr:hover {
 .stage-node.is-current .stage-node-dot {
   border-color: var(--accent);
   color: var(--accent);
-  box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 18%, #fff);
+  box-shadow: 0 0 0 4px rgba(15, 118, 110, 0.18);
 }
 .stage-node-name { margin-top: 6px; font-size: 12px; color: var(--muted); white-space: nowrap; }
 .stage-node.is-done .stage-node-name { color: var(--ink); }
@@ -2036,3 +2036,9 @@ tbody tr:hover {
 .fb-msg { color: var(--ink); font-size: 13px; line-height: 1.5; margin: 0 0 6px; white-space: pre-wrap; }
 .fb-meta { color: var(--muted); font-size: 11.5px; margin-bottom: 6px; }
 .fb-actions { display: flex; flex-wrap: wrap; gap: 12px; }
+
+/* 反馈:截图开关 + 汇总里的截图预览 */
+.fb-check { display: flex; align-items: center; gap: 7px; font-size: 12.5px; color: var(--muted); cursor: pointer; }
+.fb-check input { width: 14px; height: 14px; }
+.fb-shot { width: 100%; border: 1px solid var(--line); border-radius: 8px; margin: 6px 0; display: block; }
+.fb-review .full-width { margin-bottom: 10px; }

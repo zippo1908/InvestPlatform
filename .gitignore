@@ -28,3 +28,4 @@ deploy/backend/backend.log
 deploy/frontend/frontend.log
 deploy/healthcheck.log
 deploy/uploads/
+deploy/backend/feedback_shots/
