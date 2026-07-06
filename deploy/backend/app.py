@@ -1372,6 +1372,116 @@ def project_decisions(project_id: int, user: AuthedUser = Depends(current_user))
     return {"count": len(rows), "items": rows}
 
 
+def _assert_investor(cursor: Any, investor_id: int, tid: int) -> dict[str, Any]:
+    cursor.execute(
+        "SELECT investor_id, investor_name FROM cap_investors WHERE investor_id=%s AND tenant_id=%s AND deleted_at IS NULL",
+        (investor_id, tid),
+    )
+    row = cursor.fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Investor not found")
+    return row
+
+
+@app.get("/api/investors")
+def list_investors(user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
+    """投资人列表(详情屏选择器 + 台账)。"""
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """SELECT investor_id AS id, investor_name AS name, investor_kind, qualification_status,
+                          risk_rating, city, disclosure_status
+                   FROM cap_investors WHERE tenant_id=%s AND deleted_at IS NULL ORDER BY investor_id""",
+                (tid,),
+            )
+            rows = cursor.fetchall()
+    finally:
+        connection.close()
+    return {"count": len(rows), "items": rows}
+
+
+@app.get("/api/investors/{investor_id}")
+def get_investor(investor_id: int, user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """SELECT i.investor_id AS id, i.investor_name, i.investor_code, i.investor_kind,
+                          i.qualification_status, i.risk_rating, i.city, i.country_code, i.disclosure_status,
+                          i.notes, u.display_name AS owner, i.updated_at
+                   FROM cap_investors i LEFT JOIN cap_users u ON u.user_id=i.owner_user_id
+                   WHERE i.investor_id=%s AND i.tenant_id=%s AND i.deleted_at IS NULL""",
+                (investor_id, tid),
+            )
+            row = cursor.fetchone()
+    finally:
+        connection.close()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Investor not found")
+    return row
+
+
+@app.get("/api/investors/{investor_id}/commitments")
+def investor_commitments(investor_id: int, user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
+    """出资承诺 section:该投资人对各基金的认缴/实缴(cap_fund_commitments join 基金)。"""
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            _assert_investor(cursor, investor_id, tid)
+            cursor.execute(
+                """SELECT f.fund_name, c.committed_amount, c.paid_in_amount, c.admission_date, c.status, c.disclosure_status
+                   FROM cap_fund_commitments c LEFT JOIN cap_funds f ON f.fund_id=c.fund_id
+                   WHERE c.investor_id=%s AND c.deleted_at IS NULL ORDER BY c.committed_amount DESC""",
+                (investor_id,),
+            )
+            rows = cursor.fetchall()
+    finally:
+        connection.close()
+    return {"count": len(rows), "items": rows}
+
+
+@app.get("/api/investors/{investor_id}/contacts")
+def investor_contacts(investor_id: int, user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
+    """联系人 section(cap_investor_contacts)。"""
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            _assert_investor(cursor, investor_id, tid)
+            cursor.execute(
+                """SELECT contact_name, title, email, mobile_mask, is_primary
+                   FROM cap_investor_contacts WHERE investor_id=%s ORDER BY is_primary DESC, contact_id""",
+                (investor_id,),
+            )
+            rows = cursor.fetchall()
+    finally:
+        connection.close()
+    return {"count": len(rows), "items": rows}
+
+
+@app.get("/api/investors/{investor_id}/touchpoints")
+def investor_touchpoints(investor_id: int, user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
+    """触点记录 section(cap_investor_touchpoints)。"""
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            _assert_investor(cursor, investor_id, tid)
+            cursor.execute(
+                """SELECT touchpoint_kind, occurred_at, subject, summary, next_step
+                   FROM cap_investor_touchpoints WHERE investor_id=%s ORDER BY occurred_at DESC""",
+                (investor_id,),
+            )
+            rows = cursor.fetchall()
+    finally:
+        connection.close()
+    return {"count": len(rows), "items": rows}
+
+
 def _assert_fund(cursor: Any, fund_id: int, tid: int) -> dict[str, Any]:
     cursor.execute(
         "SELECT fund_id, fund_name FROM cap_funds WHERE fund_id=%s AND tenant_id=%s AND deleted_at IS NULL",

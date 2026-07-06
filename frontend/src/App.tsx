@@ -2137,6 +2137,27 @@ const FUND_SECTION_DATA: Record<string, { path: string; map: (r: Record<string, 
   },
   日程: { path: 'schedule', map: SECTION_DATA.日程.map },
 }
+
+// ── 投资人详情:同构页 ──
+const INVESTOR_SECTIONS = ['概况', '出资承诺', '联系人', '触点记录'] as const
+const INVESTOR_KIND_CN: Record<string, string> = { government_guidance: '政府引导基金', corporate: '产业/企业', family_office: '家族办公室', financial: '金融机构', insurance: '保险资金', individual: '个人', other: '其他' }
+const QUAL_CN: Record<string, string> = { qualified: '合格投资者', pending: '待认定', rejected: '不合格', expired: '已过期' }
+const RISK_RATING_CN: Record<string, string> = { low: '低', medium: '中', high: '高', conservative: '保守', balanced: '平衡', aggressive: '进取', professional: '专业投资者', retail: '普通投资者', qualified: '合格' }
+const TOUCHPOINT_CN: Record<string, string> = { meeting: '会议', call: '电话', email: '邮件', roadshow: '路演', site_visit: '实地走访', other: '其他' }
+const INVESTOR_SECTION_DATA: Record<string, { path: string; map: (r: Record<string, unknown>) => DataRow }> = {
+  出资承诺: {
+    path: 'commitments',
+    map: (r) => ({ 基金: String(r.fund_name ?? '—'), 认缴: wan(_n(r.committed_amount)), 实缴: wan(_n(r.paid_in_amount)), 入伙日期: r.admission_date ? String(r.admission_date) : '—', 状态: COMMIT_STATUS_CN[String(r.status)] ?? String(r.status ?? '—'), 披露: DISCLOSURE_CN[String(r.disclosure_status)] ?? String(r.disclosure_status ?? '—') }),
+  },
+  联系人: {
+    path: 'contacts',
+    map: (r) => ({ 姓名: String(r.contact_name ?? '—'), 职务: String(r.title ?? '—'), 邮箱: String(r.email ?? '—'), 手机: String(r.mobile_mask ?? '—'), 主要联系人: r.is_primary ? '是' : '否' }),
+  },
+  触点记录: {
+    path: 'touchpoints',
+    map: (r) => ({ 类型: TOUCHPOINT_CN[String(r.touchpoint_kind)] ?? String(r.touchpoint_kind ?? '—'), 时间: dtmin(r.occurred_at), 主题: String(r.subject ?? '—'), 摘要: String(r.summary ?? '—'), 下一步: String(r.next_step ?? '—') }),
+  },
+}
 const SEAT_CN: Record<string, string> = { director: '董事', observer: '观察员', other: '其他' }
 const REP_STATUS_CN: Record<string, string> = { active: '在任', resigned: '已卸任' }
 const DECISION_TYPE_CN: Record<string, string> = { ic: '投委会', pre_ic: '立项', follow_on: '追加', exit: '退出', other: '其他' }
@@ -2305,7 +2326,8 @@ function DetailPage({
       ? 'fund'
       : null
 
-  // 非 project/fund 的 detail(如投资人)暂沿用静态上下文面板。
+  // 投资人 detail 走真数据同构页;其它非 project/fund detail 仍用静态面板。
+  if (screen.id.startsWith('investor-detail')) return <InvestorDetailPage canWrite={canWrite} onToast={onToast} />
   if (kind === null) return <StaticDetailPage screen={screen} canWrite={canWrite} onToast={onToast} />
 
   const listPath = kind === 'project' ? '/api/projects' : '/api/funds'
@@ -2830,7 +2852,93 @@ function DetailPage({
   )
 }
 
-// 非 project/fund 的 detail 屏(投资人等)保留原静态上下文面板。
+// 投资人详情:同构页(选择器 + 卡片 + section:出资承诺/联系人/触点记录,全真数据)。
+function InvestorDetailPage({ canWrite, onToast }: { canWrite: boolean; onToast: (t: Toast) => void }) {
+  void canWrite; void onToast
+  const [entities, setEntities] = useState<Array<Record<string, unknown>>>([])
+  const [selectedId, setSelectedId] = useState<number | null>(() => readRouteId())
+  const [detail, setDetail] = useState<Record<string, unknown>>({})
+  const [section, setSection] = useState<string>('概况')
+  const [rows, setRows] = useState<DataRow[]>([])
+  const [loading, setLoading] = useState(false)
+
+  useEffect(() => {
+    apiGet<{ items: Array<Record<string, unknown>> }>('/api/investors')
+      .then((r) => { setEntities(r.items ?? []); setSelectedId((prev) => prev ?? (r.items?.[0]?.id as number | undefined) ?? null) })
+      .catch(() => setEntities([]))
+  }, [])
+  useEffect(() => {
+    if (selectedId == null) return
+    let ignore = false
+    apiGet<Record<string, unknown>>(`/api/investors/${selectedId}`).then((d) => { if (!ignore) setDetail(d) }).catch(() => undefined)
+    return () => { ignore = true }
+  }, [selectedId])
+  useEffect(() => {
+    if (selectedId == null) return
+    const spec = INVESTOR_SECTION_DATA[section]
+    if (!spec) { setRows([]); return }
+    let ignore = false
+    setLoading(true); setRows([])
+    apiGet<{ items: Array<Record<string, unknown>> }>(`/api/investors/${selectedId}/${spec.path}`)
+      .then((r) => { if (!ignore) setRows((r.items ?? []).map(spec.map)) })
+      .catch(() => { if (!ignore) setRows([]) })
+      .finally(() => { if (!ignore) setLoading(false) })
+    return () => { ignore = true }
+  }, [section, selectedId])
+
+  const name = String(detail.investor_name ?? (entities.find((e) => e.id === selectedId)?.name) ?? '—')
+  return (
+    <div className="page-grid">
+      <section className="panel detail-hero full-span motion-item">
+        <div>
+          <span className="page-kicker">投资人</span>
+          <h2>{name}</h2>
+          <p>真实主档:选择投资人后加载出资承诺、联系人、触点记录(租户内)。</p>
+        </div>
+        <div className="detail-actions">
+          <label className="detail-picker">
+            <span>选择投资人</span>
+            <select value={selectedId ?? ''} onChange={(e) => setSelectedId(Number(e.target.value))} data-testid="investor-picker">
+              {entities.map((e) => <option key={String(e.id)} value={String(e.id)}>{String(e.name)}</option>)}
+            </select>
+          </label>
+        </div>
+      </section>
+
+      <section className="panel full-span motion-item section-tabbar">
+        <div className="subtab-bar" data-testid="investor-sections">
+          {INVESTOR_SECTIONS.map((s) => (
+            <button key={s} type="button" className={classNames('subtab', section === s && 'is-active')} onClick={() => setSection(s)}>{s}</button>
+          ))}
+        </div>
+      </section>
+
+      {section === '概况' ? (
+        <section className="panel full-span motion-item">
+          <PanelTitle icon={User} title="投资人卡片" />
+          <div className="project-card-grid" data-testid="investor-card">
+            <div><span>名称</span><strong>{name}</strong></div>
+            <div><span>类型</span><strong>{INVESTOR_KIND_CN[String(detail.investor_kind)] ?? String(detail.investor_kind ?? '—')}</strong></div>
+            <div><span>合格状态</span><strong><StatusBadge value={QUAL_CN[String(detail.qualification_status)] ?? String(detail.qualification_status ?? '—')} /></strong></div>
+            <div><span>风险等级</span><strong>{RISK_RATING_CN[String(detail.risk_rating)] ?? String(detail.risk_rating ?? '—')}</strong></div>
+            <div><span>城市</span><strong>{String(detail.city ?? '—')}</strong></div>
+            <div><span>披露状态</span><strong>{DISCLOSURE_CN[String(detail.disclosure_status)] ?? String(detail.disclosure_status ?? '—')}</strong></div>
+            <div><span>负责人</span><strong>{String(detail.owner ?? '—')}</strong></div>
+            <div><span>编号</span><strong>{String(detail.investor_code ?? '—')}</strong></div>
+          </div>
+          {detail.notes ? <p className="muted-note" style={{ marginTop: 12 }}>备注:{String(detail.notes)}</p> : null}
+        </section>
+      ) : (
+        <section className="panel full-span motion-item" data-testid="investor-section-data">
+          <PanelTitle icon={FileText} title={section} />
+          {loading ? <p className="muted-note">加载中…</p> : rows.length === 0 ? <p className="muted-note">该投资人暂无{section}记录。</p> : <DataTable rows={rows} compact />}
+        </section>
+      )}
+    </div>
+  )
+}
+
+// 非 project/fund 的 detail 屏(其它静态上下文,如管理机构)保留原面板。
 function StaticDetailPage({
   screen,
   canWrite,
