@@ -173,6 +173,14 @@ class AiAnalyzePayload(BaseModel):
     instruction: str | None = None
 
 
+class AiConfigPayload(BaseModel):
+    enabled: bool | None = None
+    base_url: str | None = None
+    api_key: str | None = None  # 空/缺省 = 保留原 key 不变
+    model: str | None = None
+    timeout: int | None = None
+
+
 SCREENS: list[dict[str, str]] = [
     {"id": "login", "title": "Login", "group": "Entry"},
     {"id": "workbench", "title": "Executive Workbench", "group": "Workspace"},
@@ -2340,6 +2348,96 @@ def ai_analyze_stream(payload: AiAnalyzePayload, user: AuthedUser = Depends(curr
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
     )
+
+
+# ── AI 配置(DB 覆盖 .env,管理端 UI 可改)──────────────────────────────────
+_AI_SETTING_TO_ENV = {
+    "llm_enabled": "LLM_ENABLED",
+    "llm_base_url": "LLM_BASE_URL",
+    "llm_api_key": "LLM_API_KEY",
+    "llm_model": "LLM_MODEL",
+    "llm_timeout": "LLM_TIMEOUT",
+}
+
+
+def _load_ai_settings_into_env() -> None:
+    """把 DB 里的 LLM 配置写入 os.environ(覆盖 .env),供 llm.py 读取。启动 + 每次更新调用。"""
+    if pymysql is None:
+        return
+    try:
+        connection = connect_db()
+    except Exception:  # noqa: BLE001 —— 启动时 DB 不可用不应崩
+        return
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT setting_key, setting_value FROM cap_app_settings WHERE setting_key LIKE 'llm_%%'")
+            for row in cursor.fetchall():
+                env = _AI_SETTING_TO_ENV.get(row["setting_key"])
+                if env and row["setting_value"] is not None:
+                    os.environ[env] = str(row["setting_value"])
+    except Exception:  # noqa: BLE001 —— 表不存在等,忽略,退回 .env
+        pass
+    finally:
+        connection.close()
+
+
+@app.on_event("startup")
+def _startup_load_ai_settings() -> None:
+    _load_ai_settings_into_env()
+
+
+@app.get("/api/ai/config")
+def get_ai_config(user: AuthedUser = Depends(require_roles("system_admin", "managing_partner"))) -> dict[str, Any]:
+    """管理端查看当前 AI 配置(绝不回显 key,只给 has_api_key)。"""
+    return llm.status()
+
+
+@app.post("/api/ai/config")
+def set_ai_config(payload: AiConfigPayload, user: AuthedUser = Depends(require_roles("system_admin", "managing_partner"))) -> dict[str, Any]:
+    """管理端更新 AI 配置 → 存 DB + 立即生效。api_key 留空表示不改。"""
+    updates: dict[str, str] = {}
+    if payload.enabled is not None:
+        updates["llm_enabled"] = "true" if payload.enabled else "false"
+    if payload.base_url is not None:
+        updates["llm_base_url"] = payload.base_url.strip()
+    if payload.api_key:
+        updates["llm_api_key"] = payload.api_key.strip()
+    if payload.model is not None:
+        updates["llm_model"] = payload.model.strip()
+    if payload.timeout is not None:
+        updates["llm_timeout"] = str(payload.timeout)
+    if not updates:
+        raise HTTPException(status_code=400, detail="没有要更新的字段")
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            for key, val in updates.items():
+                cursor.execute(
+                    """
+                    INSERT INTO cap_app_settings (setting_key, setting_value, updated_by)
+                    VALUES (%s, %s, %s)
+                    ON DUPLICATE KEY UPDATE setting_value=VALUES(setting_value), updated_by=VALUES(updated_by)
+                    """,
+                    (key, val, user.user_id),
+                )
+            write_audit(cursor, user.user_id, "ai.config.update", "app_setting", None, "LLM config", after={"keys": list(updates)})
+        connection.commit()
+    finally:
+        connection.close()
+    _load_ai_settings_into_env()  # 立即生效
+    return {"ok": True, "config": llm.status()}
+
+
+@app.post("/api/ai/config/test")
+def test_ai_config(user: AuthedUser = Depends(require_roles("system_admin", "managing_partner"))) -> dict[str, Any]:
+    """连通性测试:发一条极短提示,验证 base_url/model/key 是否可用。"""
+    if not llm.is_configured():
+        raise HTTPException(status_code=503, detail="AI 未启用或未配置")
+    try:
+        reply = llm.chat([{"role": "user", "content": "只回复两个字:正常"}], max_tokens=16)
+    except llm.LLMError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    return {"ok": True, "model": llm.status()["model"], "reply": reply.strip()[:100]}
 
 
 # ── 真文件上传 / 下载 ──────────────────────────────────────────────────────

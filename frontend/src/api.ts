@@ -40,6 +40,19 @@ export function getPerms(): string[] {
   }
 }
 
+const ROLES_KEY = 'capitalos-roles'
+export function setRoles(roles: string[] | null): void {
+  if (roles) localStorage.setItem(ROLES_KEY, JSON.stringify(roles))
+  else localStorage.removeItem(ROLES_KEY)
+}
+export function getRoles(): string[] {
+  try {
+    return JSON.parse(localStorage.getItem(ROLES_KEY) || '[]')
+  } catch {
+    return []
+  }
+}
+
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const token = getToken()
   const response = await fetch(`${API_BASE}${path}`, {

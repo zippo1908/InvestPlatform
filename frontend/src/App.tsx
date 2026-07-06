@@ -67,7 +67,7 @@ import {
 import type { DataRow, Project, Screen } from './data'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
-import { API_BASE, apiDelete, apiDownload, apiGet, apiPatch, apiPost, auditDetail, getPerms, getToken, setPerms, streamPost, setToken } from './api'
+import { API_BASE, apiDelete, apiDownload, apiGet, apiPatch, apiPost, auditDetail, getPerms, getRoles, getToken, setPerms, setRoles, streamPost, setToken } from './api'
 
 marked.setOptions({ breaks: true, gfm: true })
 
@@ -435,6 +435,8 @@ function App() {
           const loginPerms = ((result.user as { perms?: string[] } | undefined)?.perms) ?? []
           setPerms(loginPerms)
           setPermsState(loginPerms)
+          const loginRoles = ((result.user as { roles?: string[] } | undefined)?.roles) ?? []
+          setRoles(loginRoles)
           sessionStorage.setItem('capitalos-session', 'active')
           sessionStorage.setItem('capitalos-user-id', String((result.user as { id?: number } | undefined)?.id ?? 1))
           setAuthed(true)
@@ -599,6 +601,7 @@ function App() {
                 setToken(null)
                 setPerms(null)
                 setPermsState([])
+                setRoles(null)
                 setAuthed(false)
                 goTo('login')
               }}
@@ -979,6 +982,76 @@ function DashboardPage({ onToast }: { onToast: (toast: Toast) => void }) {
   )
 }
 
+// AI 接入配置面板(管理员):DB 覆盖 .env,保存即生效,密钥不回显。
+function AiConfigPanel({ onToast }: { onToast: (toast: Toast) => void }) {
+  type Cfg = { enabled?: boolean; base_url?: string; model?: string; has_api_key?: boolean; timeout?: number }
+  const [cfg, setCfg] = useState<Cfg | null>(null)
+  const [form, setForm] = useState({ enabled: false, base_url: '', model: '', api_key: '', timeout: 30 })
+  const [busy, setBusy] = useState(false)
+  const [testResult, setTestResult] = useState<string | null>(null)
+
+  const load = () =>
+    apiGet<Cfg>('/api/ai/config')
+      .then((c) => {
+        setCfg(c)
+        setForm((f) => ({ ...f, enabled: !!c.enabled, base_url: c.base_url || '', model: c.model || '', timeout: c.timeout || 30 }))
+      })
+      .catch(() => undefined)
+  useEffect(() => { void load() }, [])
+
+  const save = async () => {
+    setBusy(true)
+    try {
+      const body: Record<string, unknown> = { enabled: form.enabled, base_url: form.base_url, model: form.model, timeout: Number(form.timeout) }
+      if (form.api_key.trim()) body.api_key = form.api_key.trim()
+      await apiPost('/api/ai/config', body)
+      setForm((f) => ({ ...f, api_key: '' }))
+      onToast({ title: 'AI 配置已保存', detail: '已即时生效', action: 'ai.config.update', entity: 'app_setting' })
+      void load()
+    } catch (error) {
+      onToast({ title: '保存失败', detail: error instanceof Error ? error.message : 'API 调用失败' })
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const test = async () => {
+    setBusy(true); setTestResult(null)
+    try {
+      const r = await apiPost<{ model: string; reply: string }>('/api/ai/config/test')
+      setTestResult(`✅ ${r.model}:${r.reply}`)
+    } catch (error) {
+      setTestResult('❌ ' + (error instanceof Error ? error.message : '测试失败'))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <section className="panel full-span motion-item">
+      <PanelTitle icon={Settings} title="AI 接入配置(管理员)" />
+      <p className="muted-copy">配置大模型接入(OpenAI 兼容),保存即生效。密钥不回显、留空表示不修改。当前:{cfg?.has_api_key ? '已配置密钥 ✓' : '未配置密钥'}。</p>
+      <div className="form-grid detail-edit-grid">
+        <label><span>状态</span>
+          <select value={form.enabled ? '1' : '0'} onChange={(e) => setForm((f) => ({ ...f, enabled: e.target.value === '1' }))}>
+            <option value="1">启用</option>
+            <option value="0">停用</option>
+          </select>
+        </label>
+        <label><span>Base URL</span><input value={form.base_url} onChange={(e) => setForm((f) => ({ ...f, base_url: e.target.value }))} placeholder="https://api.siliconflow.cn/v1" /></label>
+        <label><span>模型</span><input value={form.model} onChange={(e) => setForm((f) => ({ ...f, model: e.target.value }))} placeholder="deepseek-ai/DeepSeek-V3" /></label>
+        <label><span>API Key(留空不改)</span><input type="password" value={form.api_key} onChange={(e) => setForm((f) => ({ ...f, api_key: e.target.value }))} placeholder={cfg?.has_api_key ? '••• 已设置' : '未设置'} /></label>
+        <label><span>超时(秒)</span><input type="number" value={form.timeout} onChange={(e) => setForm((f) => ({ ...f, timeout: Number(e.target.value) }))} /></label>
+      </div>
+      <div className="button-row" style={{ marginTop: 12, alignItems: 'center' }}>
+        <button className="primary-button" type="button" disabled={busy} onClick={save}>保存配置</button>
+        <button className="secondary-button" type="button" disabled={busy} onClick={test}>连通性测试</button>
+        {testResult && <span style={{ fontSize: 13 }}>{testResult}</span>}
+      </div>
+    </section>
+  )
+}
+
 function AiPage({
   screen,
   canWrite,
@@ -1111,6 +1184,8 @@ function AiPage({
           ]}
         />
       </section>
+
+      {workspace && getRoles().some((r) => r === 'system_admin' || r === 'managing_partner') && <AiConfigPanel onToast={onToast} />}
     </div>
   )
 }
