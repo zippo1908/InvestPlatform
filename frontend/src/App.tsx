@@ -2181,37 +2181,64 @@ function RiskPage({
     { 基金简称: '医疗专项', 项目名称: '矩阵医疗', 轮次: 'C 轮', 条款状态: '跟踪中', 特殊条款: '临床节点', 提醒日期: '2026-07-12', 责任人: '林蔚' },
     { 基金简称: '成长一期', 项目名称: '澜舟机器人', 轮次: 'A+ 轮', 条款状态: '已关闭', 特殊条款: '信息权', 提醒日期: '2026-06-30', 责任人: '沈思' },
   ]
-  const rows = screen.id === 'risk-clauses' ? clauseRows : risks
+  const isIncident = screen.id === 'burst-risk'
+  const [incidents, setIncidents] = useState<Array<Record<string, unknown>>>([])
+  const [reloadKey, setReloadKey] = useState(0)
+
+  useEffect(() => {
+    if (!isIncident) return
+    let active = true
+    apiGet<{ items: Array<Record<string, unknown>> }>('/api/risks').then((r) => { if (active) setIncidents(r.items ?? []) }).catch(() => undefined)
+    return () => { active = false }
+  }, [isIncident, reloadKey])
+
+  const addUpdate = async (id: number, title: string) => {
+    const text = window.prompt(`为「${title}」登记处置进展:`)
+    if (!text || !text.trim()) return
+    try {
+      const result = await apiPost(`/api/risks/${id}/updates`, { update_text: text.trim(), update_status: 'progress' })
+      onToast({ title: '进展已登记', detail: auditDetail(result), action: 'risk.update', entity: 'cap_risk_incidents', result })
+      setReloadKey((k) => k + 1)
+    } catch (error) {
+      onToast({ title: '登记失败', detail: error instanceof Error ? error.message : 'API 调用失败' })
+    }
+  }
 
   return (
     <div className="page-grid">
       <section className="panel full-span motion-item">
         <PanelTitle icon={AlertTriangle} title={screen.title} />
-        <div className="risk-summary">
-          {['高风险 2', '临期 4', '待补充 5', '已关闭 11'].map((item) => (
-            <span key={item}>{item}</span>
-          ))}
-        </div>
-        <DataTable rows={rows} />
-        <button
-          className="primary-button"
-          type="button"
-          disabled={!canWrite}
-          onClick={async () => {
-            try {
-              const result = await apiPost('/api/risks/1/updates', {
-                update_text: 'Frontend submitted mitigation progress.',
-                update_status: 'progress',
-              })
-              onToast({ title: '风险记录已更新', detail: auditDetail(result) })
-            } catch (error) {
-              onToast({ title: '风险更新失败', detail: error instanceof Error ? error.message : 'API 调用失败' })
-            }
-          }}
-        >
-          <Plus size={16} />
-          {screen.primaryAction}
-        </button>
+        {isIncident ? (
+          <div className="table-wrap" data-testid="risk-table">
+            <table>
+              <thead><tr><th>风险事项</th><th>严重度</th><th>状态</th><th>最新进展</th><th>关联项目</th><th>操作</th></tr></thead>
+              <tbody>
+                {incidents.map((r, i) => (
+                  <tr key={i}>
+                    <td>{String(r.title ?? '')}</td>
+                    <td><StatusBadge value={String(r.severity ?? '')} /></td>
+                    <td><StatusBadge value={String(r.status ?? '')} /></td>
+                    <td>{String(r.latest_progress ?? '—')}</td>
+                    <td>{String(r.project ?? '—')}</td>
+                    <td>
+                      <button className="link-button" type="button" disabled={!canWrite} onClick={() => addUpdate(Number(r.id), String(r.title ?? r.id))}>
+                        <Plus size={14} /> 登记进展
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+                {incidents.length === 0 && <tr><td colSpan={6} style={{ color: 'var(--muted)', padding: 16 }}>暂无风险事件</td></tr>}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <>
+            <div className="risk-summary">
+              {['待触发条款', '跟踪中', '已关闭'].map((item) => (<span key={item}>{item}</span>))}
+            </div>
+            <DataTable rows={clauseRows} />
+          </>
+        )}
       </section>
       <section className="panel two-thirds motion-item">
         <PanelTitle icon={Shield} title="处置方案与审计" />
