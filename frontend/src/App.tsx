@@ -1842,6 +1842,38 @@ const PROJECT_BASIC_GROUPS: Array<[string, string[]]> = [
 ]
 const PROJECT_SUBTABS = ['基本情况', '投资汇总', '财务数据', '委派代表', '投资决策'] as const
 type ProjectSubtab = (typeof PROJECT_SUBTABS)[number]
+// 顶部 section 导航(对照反馈截图那一行)。概况=卡片主视图;其余为各专题 section。
+const PROJECT_SECTIONS = ['概况', '日程', '基金投资情况', '权益变动', '三会', '现金流', '估值', '投后数据', '协议条款(AI)'] as const
+type ProjectSection = (typeof PROJECT_SECTIONS)[number]
+const _n = (v: unknown): number | null => (v == null || v === '' ? null : Number(v))
+const CF_KIND_CN: Record<string, string> = { project_return: '项目回款', capital_call: '出资', investment: '投资打款', management_fee: '管理费', distribution: '分配', expense: '费用' }
+const CF_DIR_CN: Record<string, string> = { inflow: '流入', outflow: '流出' }
+const SETTLE_CN: Record<string, string> = { settled: '已结算', pending: '待结算', failed: '失败' }
+const INV_STATUS_CN: Record<string, string> = { funded: '已出资', committed: '已认缴', exited: '已退出', writeoff: '已减记' }
+const VAL_METHOD_CN: Record<string, string> = { latest_round: '最新一轮', dcf: 'DCF', comparable: '可比公司', cost: '成本法', option: '期权定价' }
+// 各 section → 端点 + 行映射(转中文键给 DataTable)。仅列出接真数据的 section。
+const SECTION_DATA: Record<string, { path: string; map: (r: Record<string, unknown>) => DataRow }> = {
+  基金投资情况: {
+    path: 'funds-investment',
+    map: (r) => ({ 基金: String(r.fund_name ?? '—'), 轮次: String(r.round_label ?? '—'), 认购金额: wan(_n(r.agreement_amount)), 已打款: wan(_n(r.cumulative_paid_amount)), 持股比例: pct(_n(r.current_ownership_ratio)), 首次打款: r.first_payment_on ? String(r.first_payment_on) : '—', 状态: INV_STATUS_CN[String(r.investment_status)] ?? String(r.investment_status ?? '—') }),
+  },
+  权益变动: {
+    path: 'equity-changes',
+    map: (r) => ({ 事由: String(r.change_reason ?? '—'), 轮次: String(r.round_label ?? '—'), 是否领投: r.is_lead_investor ? '是' : '否', 投前持股: pct(_n(r.pre_money_ratio)), 投后持股: pct(_n(r.post_money_ratio)), 份额变动: _n(r.share_count_delta) == null ? '—' : Number(r.share_count_delta).toLocaleString('zh-CN', { maximumFractionDigits: 0 }), 协议日期: r.agreement_date ? String(r.agreement_date) : '—' }),
+  },
+  现金流: {
+    path: 'cashflows',
+    map: (r) => ({ 类型: CF_KIND_CN[String(r.cashflow_kind)] ?? String(r.cashflow_kind ?? '—'), 方向: CF_DIR_CN[String(r.direction)] ?? String(r.direction ?? '—'), 金额: wan(_n(r.amount)), 币种: String(r.currency ?? '—'), 日期: r.occurred_on ? String(r.occurred_on) : '—', 结算: SETTLE_CN[String(r.settlement_status)] ?? String(r.settlement_status ?? '—'), 说明: String(r.description ?? '—') }),
+  },
+  估值: {
+    path: 'valuations',
+    map: (r) => ({ 估值日期: r.valuation_date ? String(r.valuation_date) : '—', 方法: VAL_METHOD_CN[String(r.valuation_method)] ?? String(r.valuation_method ?? '—'), 投前估值: wan(_n(r.pre_money_value)), 投后估值: wan(_n(r.post_money_value)), 持有估值: wan(_n(r.holding_value)), 备注: String(r.notes ?? '—') }),
+  },
+  投后数据: {
+    path: 'financials',
+    map: (r) => ({ 期间: String(r.period_label ?? ''), 营业收入: wan(_n(r.revenue)), 毛利率: r.gross_margin == null ? '—' : `${(Number(r.gross_margin) * 100).toFixed(1)}%`, 净利润: wan(_n(r.net_profit)), 经营现金流: wan(_n(r.operating_cash_flow)), 员工数: r.headcount == null ? '—' : Number(r.headcount) }),
+  },
+}
 const SEAT_CN: Record<string, string> = { director: '董事', observer: '观察员', other: '其他' }
 const REP_STATUS_CN: Record<string, string> = { active: '在任', resigned: '已卸任' }
 const DECISION_TYPE_CN: Record<string, string> = { ic: '投委会', pre_ic: '立项', follow_on: '追加', exit: '退出', other: '其他' }
@@ -1972,9 +2004,26 @@ function DetailPage({
   const [loadedAt, setLoadedAt] = useState<string | null>(null) // 乐观锁:加载时的 updated_at
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
+  const [section, setSection] = useState<ProjectSection>('概况') // 顶部 section 导航
+  const [sectionRows, setSectionRows] = useState<DataRow[]>([])
+  const [sectionLoading, setSectionLoading] = useState(false)
   const [subtab, setSubtab] = useState<ProjectSubtab>('基本情况') // 项目卡片二级 tab
   const [summary, setSummary] = useState<InvestSummary | null>(null)
   const [summaryLoading, setSummaryLoading] = useState(false)
+
+  // 顶部各专题 section(基金投资/权益变动/现金流/估值/投后数据)按需拉取。
+  useEffect(() => {
+    if (kind !== 'project' || selectedId == null) return
+    const spec = SECTION_DATA[section]
+    if (!spec) { setSectionRows([]); return }
+    let ignore = false
+    setSectionLoading(true); setSectionRows([])
+    apiGet<{ items: Array<Record<string, unknown>> }>(`${listPath}/${selectedId}/${spec.path}`)
+      .then((r) => { if (!ignore) setSectionRows((r.items ?? []).map(spec.map)) })
+      .catch(() => { if (!ignore) setSectionRows([]) })
+      .finally(() => { if (!ignore) setSectionLoading(false) })
+    return () => { ignore = true }
+  }, [kind, section, selectedId, listPath])
 
   const [tabRows, setTabRows] = useState<DataRow[]>([])
   const [tabLoading, setTabLoading] = useState(false)
@@ -2176,6 +2225,17 @@ function DetailPage({
 
       {kind === 'project' ? (
         <>
+          {/* 顶部 section 导航(对照反馈:概况/日程/基金投资情况/…/协议条款AI) */}
+          <section className="panel full-span motion-item section-tabbar">
+            <div className="subtab-bar" data-testid="project-sections">
+              {PROJECT_SECTIONS.map((s) => (
+                <button key={s} type="button" className={classNames('subtab', section === s && 'is-active')} onClick={() => setSection(s)}>{s}</button>
+              ))}
+            </div>
+          </section>
+
+          {section === '概况' ? (
+          <>
           {/* 项目所处阶段进度条 */}
           <section className="panel full-span motion-item">
             <PanelTitle icon={GitBranch} title="项目所处阶段" />
@@ -2331,6 +2391,24 @@ function DetailPage({
           </section>
 
           <ProjectCommentPanel projectId={selectedId} canWrite={canWrite} onToast={onToast} />
+          </>
+          ) : SECTION_DATA[section] ? (
+            <section className="panel full-span motion-item" data-testid="section-data">
+              <PanelTitle icon={FileText} title={section} />
+              {sectionLoading ? (
+                <p className="muted-note">加载中…</p>
+              ) : sectionRows.length === 0 ? (
+                <p className="muted-note">该项目暂无{section}记录。</p>
+              ) : (
+                <DataTable rows={sectionRows} compact />
+              )}
+            </section>
+          ) : (
+            <section className="panel full-span motion-item" data-testid="section-placeholder">
+              <PanelTitle icon={FileText} title={section} />
+              <p className="muted-note">「{section}」结构已就位,数据接入在下一批(日程 / 三会 / 协议条款 AI)。</p>
+            </section>
+          )}
         </>
       ) : (
         <>

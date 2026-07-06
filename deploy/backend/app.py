@@ -1352,6 +1352,87 @@ def project_decisions(project_id: int, user: AuthedUser = Depends(current_user))
     return {"count": len(rows), "items": rows}
 
 
+@app.get("/api/projects/{project_id}/funds-investment")
+def project_funds_investment(project_id: int, user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
+    """基金投资情况 section:哪些基金、以什么轮次/金额/持股投了本项目。"""
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            _assert_project(cursor, project_id, tid)
+            cursor.execute(
+                """SELECT f.fund_name, p.round_label, p.agreement_amount, p.cumulative_paid_amount,
+                          p.current_ownership_ratio, p.first_payment_on, p.investment_status
+                   FROM cap_investment_positions p LEFT JOIN cap_funds f ON f.fund_id=p.fund_id
+                   WHERE p.project_id=%s AND p.tenant_id=%s AND p.deleted_at IS NULL
+                   ORDER BY p.first_payment_on""",
+                (project_id, tid),
+            )
+            rows = cursor.fetchall()
+    finally:
+        connection.close()
+    return {"count": len(rows), "items": rows}
+
+
+@app.get("/api/projects/{project_id}/equity-changes")
+def project_equity_changes(project_id: int, user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
+    """权益变动 section:各轮次持股/份额变化(cap_equity_changes)。"""
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            _assert_project(cursor, project_id, tid)
+            cursor.execute(
+                """SELECT change_reason, round_label, is_lead_investor, pre_money_ratio, post_money_ratio,
+                          share_count_delta, agreement_date, notes
+                   FROM cap_equity_changes WHERE project_id=%s AND tenant_id=%s AND deleted_at IS NULL
+                   ORDER BY agreement_date""",
+                (project_id, tid),
+            )
+            rows = cursor.fetchall()
+    finally:
+        connection.close()
+    return {"count": len(rows), "items": rows}
+
+
+@app.get("/api/projects/{project_id}/cashflows")
+def project_cashflows(project_id: int, user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
+    """现金流 section:本项目相关打款/回款流水(cap_cashflows,按 project 归属,项目已鉴权)。"""
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            _assert_project(cursor, project_id, tid)
+            cursor.execute(
+                """SELECT cashflow_kind, direction, amount, currency, occurred_on, settlement_status, description
+                   FROM cap_cashflows WHERE project_id=%s AND deleted_at IS NULL ORDER BY occurred_on DESC""",
+                (project_id,),
+            )
+            rows = cursor.fetchall()
+    finally:
+        connection.close()
+    return {"count": len(rows), "items": rows}
+
+
+@app.get("/api/projects/{project_id}/valuations")
+def project_valuations(project_id: int, user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
+    """估值 section:历次估值(cap_project_valuations)。"""
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            _assert_project(cursor, project_id, tid)
+            cursor.execute(
+                """SELECT valuation_date, valuation_method, pre_money_value, post_money_value, holding_value, notes
+                   FROM cap_project_valuations WHERE project_id=%s ORDER BY valuation_date DESC""",
+                (project_id,),
+            )
+            rows = cursor.fetchall()
+    finally:
+        connection.close()
+    return {"count": len(rows), "items": rows}
+
+
 @app.get("/api/projects/{project_id}/history")
 def project_history(project_id: int, user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
     """历史:该项目的审计变更记录(cap_audit_logs)。"""
