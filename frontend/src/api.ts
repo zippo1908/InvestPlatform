@@ -106,12 +106,14 @@ export async function streamPost(
   path: string,
   body: unknown,
   onDelta: (text: string) => void,
+  signal?: AbortSignal,
 ): Promise<void> {
   const token = getToken()
   const res = await fetch(`${API_BASE}${path}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
     body: JSON.stringify(body),
+    signal,
   })
   if (res.status === 401) {
     setToken(null)

@@ -506,9 +506,10 @@ async def rate_limit(request: Request, call_next):
     if request.method != "OPTIONS":
         for prefix, window, limit in _RATE_RULES:
             if path.startswith(prefix):
-                # AI 限流只针对会真正调用大模型的写请求(POST);GET(状态/任务轮询)不计,
-                # 否则前端每秒轮询任务会被自己的限流打成 429。
-                if prefix == "/api/ai/" and request.method == "GET":
+                # AI 限流只针对真正调模型的请求。豁免:所有 GET(状态/config)、以及
+                # /api/ai/jobs/* 子路径(状态/latest/tail-stream 都只读库不调模型)。
+                # 注意 POST /api/ai/jobs(建任务=触发模型)不在 jobs/ 子路径下,仍受限。
+                if prefix == "/api/ai/" and (request.method == "GET" or path.startswith("/api/ai/jobs/")):
                     break
                 if not _rate_allow(f"{prefix}|{_client_ip(request)}", window, limit):
                     origin = request.headers.get("origin", "*")
@@ -2906,7 +2907,7 @@ def ai_analyze(payload: AiAnalyzePayload, user: AuthedUser = Depends(current_use
 def _run_ai_job(job_id: int, tid: int, messages: list[dict[str, str]]) -> None:
     """后台线程:把解析跑到底并周期性把累计结果写库。前端断开也不影响。"""
     acc = ""
-    last_write = 0
+    last_ts = _time.monotonic()
     conn = connect_db()
     try:
         try:
@@ -2916,12 +2917,12 @@ def _run_ai_job(job_id: int, tid: int, messages: list[dict[str, str]]) -> None:
             conn.commit()
             for delta in llm.chat_stream(messages):
                 acc += delta
-                # 节流落库:每累积 ~60 字符写一次,兼顾前端轮询可见增长与 DB 压力。
-                if len(acc) - last_write >= 60:
+                # 时间节流落库(~200ms 一次):细到能让 SSE 尾随呈现近似逐字的流式,又不压垮 DB。
+                if _time.monotonic() - last_ts >= 0.2:
                     with conn.cursor() as cur:
                         cur.execute("UPDATE cap_ai_jobs SET result_text=%s WHERE ai_job_id=%s AND tenant_id=%s", (acc, job_id, tid))
                     conn.commit()
-                    last_write = len(acc)
+                    last_ts = _time.monotonic()
             with conn.cursor() as cur:
                 cur.execute("UPDATE cap_ai_jobs SET result_text=%s, status='done' WHERE ai_job_id=%s AND tenant_id=%s", (acc, job_id, tid))
             conn.commit()
@@ -3008,6 +3009,49 @@ def get_ai_job(job_id: int, user: AuthedUser = Depends(current_user)) -> dict[st
     if row is None:
         raise HTTPException(status_code=404, detail="Job not found")
     return row
+
+
+@app.post("/api/ai/jobs/{job_id}/stream")
+def stream_ai_job(job_id: int, user: AuthedUser = Depends(current_user)) -> StreamingResponse:
+    """SSE 尾随一个任务的结果:连上先补齐已生成部分,再低延迟增量下发到完成。
+    混合方案的「连着时低延迟」那一半 —— 任务本身在后台跑到底落库,这里只是 tail 数据库,
+    断开重连(切页签/刷新/换设备)都能从当前进度接着看。"""
+    tid = tenant_of(user)
+    uid = user.user_id
+
+    def event_stream():
+        sent = 0
+        conn = connect_db()
+        try:
+            conn.autocommit(True)  # 每次 SELECT 取最新已提交结果(否则快照读不到后台线程的更新)
+            while True:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT status, result_text, error_text FROM cap_ai_jobs WHERE ai_job_id=%s AND owner_user_id=%s AND tenant_id=%s",
+                        (job_id, uid, tid),
+                    )
+                    row = cur.fetchone()
+                if row is None:
+                    yield f"data: {dumps({'error': 'job not found'}, ensure_ascii=False)}\n\n"
+                    return
+                text = row["result_text"] or ""
+                if len(text) > sent:
+                    yield f"data: {dumps({'delta': text[sent:]}, ensure_ascii=False)}\n\n"
+                    sent = len(text)
+                if row["status"] != "running":
+                    if row["status"] == "error":
+                        yield f"data: {dumps({'error': row['error_text'] or 'AI 任务失败'}, ensure_ascii=False)}\n\n"
+                    yield f"data: {dumps({'done': True})}\n\n"
+                    return
+                _time.sleep(0.25)  # tail 间隔;配合后台 ~200ms 落库 ≈ 近实时
+        finally:
+            conn.close()
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 def ai_analyze_stream(payload: AiAnalyzePayload, user: AuthedUser = Depends(current_user)) -> StreamingResponse:
