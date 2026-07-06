@@ -1598,6 +1598,9 @@ tbody tr:hover {
     padding: 0 12px;
   }
 
+  /* 面包屑在窄屏与页面 h1 冗余且挤,隐藏(标题由 page-header 承担) */
+  .breadcrumbs { display: none; }
+
   .topbar-actions {
     gap: 6px;
   }

@@ -749,7 +749,7 @@ function App() {
                               className={classNames('nav-link', screen.id === current.id && 'is-active')}
                               title={screen.title}
                               aria-label={screen.title}
-                              onClick={() => goTo(screen.id)}
+                              onClick={() => { goTo(screen.id); if (window.innerWidth <= 860) setSidebarOpen(false) }}
                             >
                               <span className="nav-label">{screen.title}</span>
                               <span className="nav-short" aria-hidden="true">{navShortLabel(screen.title)}</span>
