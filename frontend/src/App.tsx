@@ -2206,8 +2206,16 @@ function DetailPage({
               </div>
             )}
 
-            {/* 底部操作:历史(下载 WORD/PDF 在下一批接入) */}
+            {/* 底部操作:下载 WORD/PDF / 历史 */}
             <div className="button-row card-footer">
+              <button type="button" className="secondary-button" data-testid="detail-export-docx" disabled={selectedId == null}
+                onClick={() => selectedId != null && apiDownload(`${listPath}/${selectedId}/export.docx`, `${entityName}-项目卡片.docx`).catch((e) => onToast({ title: '下载失败', detail: e instanceof Error ? e.message : 'API 调用失败' }))}>
+                <FileText size={16} /> 下载 WORD
+              </button>
+              <button type="button" className="secondary-button" data-testid="detail-export-pdf" disabled={selectedId == null}
+                onClick={() => selectedId != null && apiDownload(`${listPath}/${selectedId}/export.pdf`, `${entityName}-项目卡片.pdf`).catch((e) => onToast({ title: '下载失败', detail: e instanceof Error ? e.message : 'API 调用失败' }))}>
+                <FileText size={16} /> 下载 PDF
+              </button>
               <button type="button" className="secondary-button" data-testid="detail-history" onClick={() => setShowHistory((v) => !v)}>
                 <Clock size={16} /> {showHistory ? '收起历史' : '历史'}
               </button>

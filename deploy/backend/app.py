@@ -1406,6 +1406,211 @@ def add_project_comment(project_id: int, payload: CreateCommentPayload, user: Au
     return {"ok": True, "comment_id": comment_id, "audit_id": audit_id}
 
 
+_NOTO_TTC = "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc"
+
+
+def _gather_project_card(cursor: Any, project_id: int, tid: int) -> tuple:
+    """汇总项目卡片全部数据(供 WORD/PDF 导出)。"""
+    cursor.execute(
+        """SELECT p.short_name, p.legal_name, p.stage_label, p.industry_group, p.city,
+                  p.registered_location, p.registry_code_mask, p.summary, p.highlight_note,
+                  p.product_note, p.thesis, p.created_at, u.display_name AS owner
+           FROM cap_projects p LEFT JOIN cap_users u ON u.user_id=p.owner_user_id
+           WHERE p.project_id=%s AND p.tenant_id=%s AND p.deleted_at IS NULL""",
+        (project_id, tid),
+    )
+    proj = cursor.fetchone()
+    if proj is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    cursor.execute(
+        """SELECT SUM(agreement_amount) agreement_total, SUM(cumulative_paid_amount) paid_total,
+                  SUM(realized_return_amount) realized_total, MAX(latest_valuation) latest_valuation,
+                  MAX(current_ownership_ratio) ownership_ratio, MAX(round_label) round_label
+           FROM cap_investment_positions WHERE project_id=%s AND tenant_id=%s AND deleted_at IS NULL""",
+        (project_id, tid),
+    )
+    agg = cursor.fetchone() or {}
+    cursor.execute("SELECT period_label, revenue, gross_margin, net_profit, headcount FROM cap_project_financials WHERE project_id=%s AND tenant_id=%s ORDER BY period_label", (project_id, tid))
+    fins = cursor.fetchall()
+    cursor.execute("SELECT rep_name, seat_type, appointed_on, rep_status FROM cap_project_representatives WHERE project_id=%s AND tenant_id=%s", (project_id, tid))
+    reps = cursor.fetchall()
+    cursor.execute("SELECT decision_title, decision_type, decision_result, decided_on FROM cap_project_decisions WHERE project_id=%s AND tenant_id=%s ORDER BY decided_on DESC", (project_id, tid))
+    decs = cursor.fetchall()
+    return proj, agg, fins, reps, decs
+
+
+def _wan(v: Any) -> str:
+    return "—" if v is None else f"{float(v) / 1e4:,.1f} 万"
+
+
+def _seat_cn(v: str) -> str:
+    return {"director": "董事", "observer": "观察员", "other": "其他"}.get(v, v or "")
+
+
+def _dec_res_cn(v: str) -> str:
+    return {"approved": "通过", "rejected": "否决", "deferred": "暂缓"}.get(v, v or "")
+
+
+@app.get("/api/projects/{project_id}/export.docx")
+def export_project_docx(project_id: int, user: AuthedUser = Depends(current_user)) -> Response:
+    """导出项目卡片为 WORD(python-docx)。"""
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            proj, agg, fins, reps, decs = _gather_project_card(cursor, project_id, tid)
+    finally:
+        connection.close()
+
+    from docx import Document
+
+    doc = Document()
+    doc.add_heading(f"项目卡片 · {proj['short_name']}", level=0)
+    doc.add_heading("基本情况", level=1)
+    basic = [
+        ("企业简称", proj["short_name"]), ("企业全称", proj["legal_name"]), ("项目阶段", proj["stage_label"]),
+        ("行业方向", proj["industry_group"]), ("城市", proj["city"]), ("公司注册地", proj["registered_location"]),
+        ("统一信用代码", proj["registry_code_mask"]), ("项目负责人", proj["owner"]),
+        ("项目入库时间", str(proj["created_at"])[:10] if proj["created_at"] else ""),
+    ]
+    t = doc.add_table(rows=0, cols=2)
+    t.style = "Light Grid Accent 1"
+    for k, v in basic:
+        cells = t.add_row().cells
+        cells[0].text, cells[1].text = k, str(v or "—")
+    for label, val in [("项目简介", proj["summary"]), ("项目亮点", proj["highlight_note"]), ("主要产品", proj["product_note"]), ("投资逻辑", proj["thesis"])]:
+        if val:
+            doc.add_heading(label, level=2)
+            doc.add_paragraph(str(val))
+
+    paid = float(agg.get("paid_total") or 0)
+    val_ = float(agg.get("latest_valuation") or 0)
+    realized = float(agg.get("realized_total") or 0)
+    moic = f"{((val_ + realized) / paid):.2f}" if paid > 0 else "—"
+    doc.add_heading("投资汇总", level=1)
+    st = doc.add_table(rows=0, cols=2)
+    st.style = "Light Grid Accent 1"
+    for k, v in [
+        ("MOIC", moic), ("累计协议签署金额", _wan(agg.get("agreement_total"))), ("累计打款金额", _wan(agg.get("paid_total"))),
+        ("最新持股比例", "—" if agg.get("ownership_ratio") is None else f"{float(agg['ownership_ratio']) * 100:.2f}%"),
+        ("项目最新投后估值", _wan(agg.get("latest_valuation"))), ("投资轮次", agg.get("round_label") or "—"),
+        ("累计退出收益", _wan(agg.get("realized_total"))),
+    ]:
+        cells = st.add_row().cells
+        cells[0].text, cells[1].text = k, str(v)
+
+    if fins:
+        doc.add_heading("财务数据", level=1)
+        ft = doc.add_table(rows=1, cols=5); ft.style = "Light Grid Accent 1"
+        for i, h in enumerate(["期间", "营业收入", "毛利率", "净利润", "员工数"]):
+            ft.rows[0].cells[i].text = h
+        for f in fins:
+            c = ft.add_row().cells
+            c[0].text = str(f["period_label"]); c[1].text = _wan(f["revenue"])
+            c[2].text = "—" if f["gross_margin"] is None else f"{float(f['gross_margin']) * 100:.1f}%"
+            c[3].text = _wan(f["net_profit"]); c[4].text = str(f["headcount"] if f["headcount"] is not None else "—")
+    if reps:
+        doc.add_heading("委派代表", level=1)
+        rt = doc.add_table(rows=1, cols=3); rt.style = "Light Grid Accent 1"
+        for i, h in enumerate(["姓名", "席位", "委派日期"]):
+            rt.rows[0].cells[i].text = h
+        for r in reps:
+            c = rt.add_row().cells
+            c[0].text = str(r["rep_name"]); c[1].text = _seat_cn(r["seat_type"]); c[2].text = str(r["appointed_on"] or "—")
+    if decs:
+        doc.add_heading("投资决策", level=1)
+        for d in decs:
+            doc.add_paragraph(f"【{_dec_res_cn(d['decision_result'])}】{d['decision_title']}({str(d['decided_on'] or '')})", style="List Bullet")
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    return Response(
+        content=buf.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f'attachment; filename="project-{project_id}-card.docx"'},
+    )
+
+
+@app.get("/api/projects/{project_id}/export.pdf")
+def export_project_pdf(project_id: int, user: AuthedUser = Depends(current_user)) -> Response:
+    """导出项目卡片为 PDF(fpdf2 + Noto CJK 字体)。"""
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            proj, agg, fins, reps, decs = _gather_project_card(cursor, project_id, tid)
+    finally:
+        connection.close()
+
+    from fpdf import FPDF
+    from fpdf.enums import XPos, YPos
+
+    pdf = FPDF()
+    pdf.add_font("noto", "", _NOTO_TTC)
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+
+    # multi_cell 后必须把 x 归到左边距、y 到下一行,否则下一次 multi_cell 会从右边距起笔
+    # 触发 fpdf2「Not enough horizontal space」。
+    def h(text: str, size: int = 14) -> None:
+        pdf.set_font("noto", "", size)
+        pdf.set_x(pdf.l_margin)
+        pdf.multi_cell(0, 8, text, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.ln(1)
+
+    def kv(k: str, v: Any) -> None:
+        pdf.set_font("noto", "", 11)
+        pdf.set_x(pdf.l_margin)
+        pdf.multi_cell(0, 6, f"{k}:{'' if v in (None, '') else v}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+    h(f"项目卡片 · {proj['short_name']}", 18)
+    h("基本情况", 14)
+    for k, v in [("企业全称", proj["legal_name"]), ("项目阶段", proj["stage_label"]), ("行业方向", proj["industry_group"]),
+                 ("城市", proj["city"]), ("公司注册地", proj["registered_location"]), ("统一信用代码", proj["registry_code_mask"]),
+                 ("项目负责人", proj["owner"]), ("项目入库时间", str(proj["created_at"])[:10] if proj["created_at"] else "")]:
+        kv(k, v or "—")
+    for label, val in [("项目简介", proj["summary"]), ("项目亮点", proj["highlight_note"]), ("主要产品", proj["product_note"]), ("投资逻辑", proj["thesis"])]:
+        if val:
+            kv(label, str(val))
+    pdf.ln(2)
+
+    paid = float(agg.get("paid_total") or 0)
+    val_ = float(agg.get("latest_valuation") or 0)
+    realized = float(agg.get("realized_total") or 0)
+    moic = f"{((val_ + realized) / paid):.2f}" if paid > 0 else "—"
+    h("投资汇总", 14)
+    kv("MOIC", moic)
+    kv("累计协议签署金额", _wan(agg.get("agreement_total")))
+    kv("累计打款金额", _wan(agg.get("paid_total")))
+    kv("最新持股比例", "—" if agg.get("ownership_ratio") is None else f"{float(agg['ownership_ratio']) * 100:.2f}%")
+    kv("项目最新投后估值", _wan(agg.get("latest_valuation")))
+    kv("投资轮次", agg.get("round_label") or "—")
+    pdf.ln(2)
+
+    if fins:
+        h("财务数据", 14)
+        for f in fins:
+            gm = "—" if f["gross_margin"] is None else f"{float(f['gross_margin']) * 100:.1f}%"
+            kv(str(f["period_label"]), f"营收 {_wan(f['revenue'])} / 毛利 {gm} / 净利 {_wan(f['net_profit'])} / 员工 {f['headcount']}")
+        pdf.ln(2)
+    if reps:
+        h("委派代表", 14)
+        for r in reps:
+            kv(str(r["rep_name"]), f"{_seat_cn(r['seat_type'])} · {r['appointed_on'] or '—'}")
+        pdf.ln(2)
+    if decs:
+        h("投资决策", 14)
+        for d in decs:
+            kv(_dec_res_cn(d["decision_result"]), f"{d['decision_title']}({str(d['decided_on'] or '')})")
+
+    out = pdf.output()
+    return Response(
+        content=bytes(out),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="project-{project_id}-card.pdf"'},
+    )
+
+
 @app.patch("/api/projects/{project_id}")
 def update_project(
     project_id: int,
