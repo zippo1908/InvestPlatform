@@ -808,8 +808,8 @@ function PageHeader({
           <Columns size={16} />
           显示列
         </button>
-        {/* 文档屏的顶部通用主操作只会建占位记录,易与面板里真实「上传文件」混淆 → 隐藏。 */}
-        {current.kind !== 'documents' && (
+        {/* 文档/AI 屏的顶部通用主操作只会建占位记录,易与面板里真实入口混淆 → 隐藏。 */}
+        {current.kind !== 'documents' && current.kind !== 'ai' && (
           <button
             type="button"
             className="primary-button"
@@ -1069,6 +1069,7 @@ function AiPage({
   const workspace = screen.id === 'ai-workspace' // 通用工作台:自定义指令 + 自由文本分析
   // 纪要解析与工作台统一走 SSE 流式 Markdown:边吞吐边渲染,配处理中动效。
   const [text, setText] = useState('')
+  const matFileRef = useRef<HTMLInputElement>(null)
   const [instruction, setInstruction] = useState('')
   const [answer, setAnswer] = useState<string | null>(null)
   const [aiBusy, setAiBusy] = useState(false)
@@ -1114,16 +1115,36 @@ function AiPage({
           )}
           <textarea
             className="ai-bp-input"
-            placeholder={workspace ? '在此粘贴待分析材料…' : meeting ? '在此粘贴会议纪要正文…' : '在此粘贴材料正文…'}
+            placeholder={workspace ? '在此粘贴待分析材料,或上传 txt/md 文件…' : meeting ? '在此粘贴会议纪要,或上传 txt/md 文件…' : '在此粘贴材料正文…'}
             value={text}
             readOnly={!canWrite}
             onChange={(event) => setText(event.target.value)}
             rows={7}
           />
-          <button className="primary-button" type="button" disabled={!canWrite || aiBusy || !text.trim()} onClick={run}>
-            <Bot size={16} />
-            {aiBusy ? (workspace ? 'AI 分析中…' : 'AI 解析中…') : (workspace ? '运行分析' : 'AI 解析')}
-          </button>
+          <input
+            ref={matFileRef}
+            type="file"
+            accept=".txt,.md,.markdown,text/plain,text/markdown"
+            style={{ display: 'none' }}
+            onChange={async (event) => {
+              const f = event.target.files?.[0]
+              event.target.value = ''
+              if (!f) return
+              if (f.size > 2 * 1024 * 1024) { onToast({ title: '文件过大', detail: '材料文本上限 2MB' }); return }
+              const content = await f.text()
+              setText(content)
+              onToast({ title: '已载入材料', detail: `${f.name}(${content.length} 字),可直接分析` })
+            }}
+          />
+          <div className="button-row" style={{ marginTop: 10 }}>
+            <button className="primary-button" type="button" disabled={!canWrite || aiBusy || !text.trim()} onClick={run}>
+              <Bot size={16} />
+              {aiBusy ? (workspace ? 'AI 分析中…' : 'AI 解析中…') : (workspace ? '运行分析' : 'AI 解析')}
+            </button>
+            <button className="secondary-button" type="button" disabled={!canWrite || aiBusy} onClick={() => matFileRef.current?.click()} title="读取 txt/md 文本到材料框(PDF/Word 抽取待接入)">
+              <Upload size={16} /> 上传材料文件
+            </button>
+          </div>
           {aiError && (
             <div className="ai-hint is-error">
               <AlertTriangle size={14} />
