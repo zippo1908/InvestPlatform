@@ -3462,78 +3462,118 @@ function AdminPage({
     () => (screen.id === 'system-users' ? users : screen.id === 'roles-permissions' ? permissions : customFields),
     [screen.id],
   )
-  const { rows, source } = useBackendRows(screen.id, fallbackRows)
-  const orgs = ['总经理室', '投资一部', '医疗组', '基金运营', '风控法务', 'IR', '系统管理']
-  const [activeOrg, setActiveOrg] = useState(orgs[0])
+  const [reloadKey, setReloadKey] = useState(0)
+  const { rows, source } = useBackendRows(screen.id, fallbackRows, 1, reloadKey)
+  const [orgs, setOrgs] = useState<Array<{ id: number; name: string }>>([])
+  const [activeOrg, setActiveOrg] = useState<{ id: number; name: string } | null>(null)
+  const [roles, setRoles] = useState<Array<Record<string, unknown>>>([])
   const [audit, setAudit] = useState<Array<Record<string, unknown>>>([]) // 真实审计(cap_audit_logs)
-  useEffect(() => { apiGet<{ items: Array<Record<string, unknown>> }>('/api/audit/recent').then((r) => setAudit(r.items ?? [])).catch(() => setAudit([])) }, [])
+  const [creating, setCreating] = useState(false)
+  const [showPerms, setShowPerms] = useState(false)
+  const [uForm, setUForm] = useState({ login_name: '', display_name: '', email: '', org_id: 0, role_code: '' })
+  const [rForm, setRForm] = useState({ role_code: '', role_name: '', description: '' })
+
+  useEffect(() => { apiGet<{ items: Array<Record<string, unknown>> }>('/api/audit/recent').then((r) => setAudit(r.items ?? [])).catch(() => setAudit([])) }, [reloadKey])
+  useEffect(() => { apiGet<{ items: Array<{ id: number; name: string }> }>('/api/admin/orgs').then((r) => setOrgs(r.items ?? [])).catch(() => setOrgs([])) }, [])
+  useEffect(() => { apiGet<{ items: Array<Record<string, unknown>> }>('/api/admin/roles').then((r) => setRoles(r.items ?? [])).catch(() => setRoles([])) }, [reloadKey])
+
+  const isUsers = screen.id === 'system-users'
+  const isRoles = screen.id === 'roles-permissions'
+  const canCreate = isUsers || isRoles
+  // 组织树真过滤:选了具体部门 → 按台账「部门」列过滤(仅人员屏)。
+  const shownRows = isUsers && activeOrg ? rows.filter((r) => String(r.部门 ?? '') === activeOrg.name) : rows
+
+  const createUser = async () => {
+    if (!uForm.login_name.trim() || !uForm.display_name.trim() || !uForm.org_id || !uForm.role_code) { onToast({ title: '请填全', detail: '登录名/姓名/部门/角色必填' }); return }
+    try {
+      const r = await apiPost<{ default_password?: string }>('/api/admin/users', uForm)
+      onToast({ title: '用户已创建', detail: r.default_password ? `默认口令 ${r.default_password}(请提醒改)` : '已创建' })
+      setCreating(false); setUForm({ login_name: '', display_name: '', email: '', org_id: 0, role_code: '' }); setReloadKey((k) => k + 1)
+    } catch (e) { onToast({ title: '创建失败', detail: e instanceof Error ? e.message.replace(/^\{"detail":"?|"?\}$/g, '') : 'API 调用失败' }) }
+  }
+  const createRole = async () => {
+    if (!rForm.role_code.trim() || !rForm.role_name.trim()) { onToast({ title: '请填全', detail: '角色代码/名称必填' }); return }
+    try {
+      await apiPost('/api/admin/roles', rForm)
+      onToast({ title: '角色已创建', detail: '空权限,可再授权' })
+      setCreating(false); setRForm({ role_code: '', role_name: '', description: '' }); setReloadKey((k) => k + 1)
+    } catch (e) { onToast({ title: '创建失败', detail: e instanceof Error ? e.message.replace(/^\{"detail":"?|"?\}$/g, '') : 'API 调用失败' }) }
+  }
 
   return (
     <div className="page-grid">
       <section className="panel motion-item">
         <PanelTitle icon={Settings} title="组织与策略" />
-        <div className="org-tree">
-          {orgs.map((item) => (
-            <button
-              className={classNames(activeOrg === item && 'is-selected')}
-              key={item}
-              type="button"
-              onClick={() => {
-                setActiveOrg(item)
-                void runBackendAction(onToast, `${item}已选中`, {
-                  action: 'admin.org.select',
-                  entity_type: 'organization_unit',
-                  entity_label: item,
-                  after: { screen_id: screen.id, org: item },
-                })
-              }}
-            >
-              {item}
+        <div className="org-tree" data-testid="admin-org-tree">
+          <button className={classNames(activeOrg === null && 'is-selected')} type="button" onClick={() => setActiveOrg(null)}>全部</button>
+          {orgs.map((o) => (
+            <button className={classNames(activeOrg?.id === o.id && 'is-selected')} key={o.id} type="button" onClick={() => setActiveOrg(o)}>
+              {o.name}
             </button>
           ))}
         </div>
+        {isUsers && activeOrg && <p className="muted-note" style={{ marginTop: 8 }}>已按「{activeOrg.name}」过滤人员</p>}
       </section>
       <section className="panel two-thirds motion-item">
         <PanelTitle icon={Users} title={screen.title} />
         <DataSourceBadge source={source} />
-        <DataTable rows={rows} />
+        <DataTable rows={shownRows} />
+
+        {showPerms && (
+          <div className="perm-preview" data-testid="admin-perm-preview">
+            <strong>角色权限一览(真实)</strong>
+            {roles.map((r) => (
+              <div className="perm-role" key={String(r.role_code)}>
+                <span>{String(r.role_name)}<i>{String(r.role_code)}</i></span>
+                <span className="perm-codes">{(r.permissions as string[] | undefined)?.length ? (r.permissions as string[]).join(' · ') : '(无权限)'}</span>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {creating && isUsers && (
+          <div className="admin-create-form" data-testid="admin-create-user">
+            <div className="form-grid">
+              <label><span>登录名</span><input value={uForm.login_name} onChange={(e) => setUForm({ ...uForm, login_name: e.target.value })} data-testid="nu-login" /></label>
+              <label><span>姓名</span><input value={uForm.display_name} onChange={(e) => setUForm({ ...uForm, display_name: e.target.value })} data-testid="nu-name" /></label>
+              <label><span>邮箱(可选)</span><input value={uForm.email} onChange={(e) => setUForm({ ...uForm, email: e.target.value })} /></label>
+              <label><span>部门</span><select value={uForm.org_id} onChange={(e) => setUForm({ ...uForm, org_id: Number(e.target.value) })} data-testid="nu-org"><option value={0}>选择部门</option>{orgs.map((o) => <option key={o.id} value={o.id}>{o.name}</option>)}</select></label>
+              <label><span>角色</span><select value={uForm.role_code} onChange={(e) => setUForm({ ...uForm, role_code: e.target.value })} data-testid="nu-role"><option value="">选择角色</option>{roles.map((r) => <option key={String(r.role_code)} value={String(r.role_code)}>{String(r.role_name)}</option>)}</select></label>
+            </div>
+            <div className="button-row" style={{ marginTop: 10 }}>
+              <button className="primary-button" type="button" onClick={createUser} data-testid="nu-submit"><CheckCircle size={15} /> 创建用户</button>
+              <button className="secondary-button" type="button" onClick={() => setCreating(false)}>取消</button>
+            </div>
+            <p className="muted-note">默认口令 demo-login,创建后请提醒本人修改。</p>
+          </div>
+        )}
+        {creating && isRoles && (
+          <div className="admin-create-form" data-testid="admin-create-role">
+            <div className="form-grid">
+              <label><span>角色代码(英文)</span><input value={rForm.role_code} onChange={(e) => setRForm({ ...rForm, role_code: e.target.value })} placeholder="如 auditor_lite" data-testid="nr-code" /></label>
+              <label><span>角色名称</span><input value={rForm.role_name} onChange={(e) => setRForm({ ...rForm, role_name: e.target.value })} data-testid="nr-name" /></label>
+              <label className="span-2"><span>说明</span><input value={rForm.description} onChange={(e) => setRForm({ ...rForm, description: e.target.value })} /></label>
+            </div>
+            <div className="button-row" style={{ marginTop: 10 }}>
+              <button className="primary-button" type="button" onClick={createRole} data-testid="nr-submit"><CheckCircle size={15} /> 创建角色</button>
+              <button className="secondary-button" type="button" onClick={() => setCreating(false)}>取消</button>
+            </div>
+          </div>
+        )}
+
         <div className="button-row">
-          <button
-            className="secondary-button"
-            type="button"
-            onClick={async () => {
-              try {
-                const result = await apiPost('/api/actions', {
-                  action: 'permission.preview',
-                  entity_type: 'role',
-                  entity_label: screen.title,
-                  after: { role: 'readonly_auditor' },
-                })
-                onToast({ title: '权限预览', detail: auditDetail(result) })
-              } catch (error) {
-                onToast({ title: '权限预览失败', detail: error instanceof Error ? error.message : 'API 调用失败' })
-              }
-            }}
-          >
-            <Eye size={16} />
-            预览权限
+          <button className="secondary-button" type="button" onClick={() => setShowPerms((v) => !v)} data-testid="admin-preview-perms">
+            <Eye size={16} /> {showPerms ? '收起权限' : '预览权限'}
           </button>
-          <button
-            className="primary-button"
-            type="button"
-            disabled={!canWrite}
-            onClick={() =>
-              runBackendAction(onToast, screen.primaryAction, {
-                action: 'admin.primary_action',
-                entity_type: screen.id === 'system-users' ? 'user' : screen.id === 'roles-permissions' ? 'role' : 'custom_field',
-                entity_label: screen.title,
-                after: { screen_id: screen.id, org: activeOrg, action_label: screen.primaryAction },
-              })
-            }
-          >
-            <Plus size={16} />
-            {screen.primaryAction}
-          </button>
+          {canCreate ? (
+            <button className="primary-button" type="button" disabled={!canWrite} data-testid="admin-primary" onClick={() => setCreating((v) => !v)}>
+              <Plus size={16} /> {screen.primaryAction}
+            </button>
+          ) : (
+            <button className="secondary-button" type="button" disabled title="自定义字段管理规划中" onClick={() => onToast({ title: '规划中', detail: '自定义字段管理即将上线' })}>
+              <Plus size={16} /> {screen.primaryAction}
+            </button>
+          )}
         </div>
       </section>
       <section className="panel full-span motion-item">

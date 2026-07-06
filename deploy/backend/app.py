@@ -213,6 +213,21 @@ class FeedbackStatusPayload(BaseModel):
     status: str  # new | pushed | resolved | dismissed
 
 
+class CreateUserPayload(BaseModel):
+    login_name: str = Field(min_length=1, max_length=80)
+    display_name: str = Field(min_length=1, max_length=120)
+    email: str = Field(default="", max_length=160)
+    org_id: int
+    role_code: str = Field(min_length=1, max_length=80)
+    password: str | None = None  # 缺省 = demo-login
+
+
+class CreateRolePayload(BaseModel):
+    role_code: str = Field(min_length=1, max_length=80, pattern=r"^[a-z][a-z0-9_]*$")
+    role_name: str = Field(min_length=1, max_length=120)
+    description: str | None = Field(default=None, max_length=500)
+
+
 class AiJobPayload(BaseModel):
     screen_id: str = Field(min_length=1, max_length=64)
     text: str = Field(min_length=1)
@@ -1845,6 +1860,104 @@ def update_feedback_status(feedback_id: int, payload: FeedbackStatusPayload, use
     finally:
         connection.close()
     return {"ok": True, "status": payload.status}
+
+
+_ADMIN_ROLES = ("system_admin", "managing_partner")
+
+
+@app.get("/api/admin/orgs")
+def admin_orgs(user: AuthedUser = Depends(require_roles(*_ADMIN_ROLES))) -> dict[str, Any]:
+    """本租户组织(根公司 + 其部门),供人员管理组织树 / 新增用户选择。"""
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT org_id AS id, org_name AS name, org_type FROM cap_organizations WHERE (org_id=%s OR parent_org_id=%s) AND deleted_at IS NULL ORDER BY org_id",
+                (tid, tid),
+            )
+            rows = cursor.fetchall()
+    finally:
+        connection.close()
+    return {"count": len(rows), "items": rows}
+
+
+@app.get("/api/admin/roles")
+def admin_roles(user: AuthedUser = Depends(require_roles(*_ADMIN_ROLES))) -> dict[str, Any]:
+    """角色列表 + 各自权限码(供新增用户选择 + 权限预览)。"""
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT role_id, role_code, role_name FROM cap_roles WHERE is_active=1 ORDER BY role_id")
+            roles = cursor.fetchall()
+            cursor.execute(
+                """SELECT r.role_code, p.permission_code FROM cap_roles r
+                   JOIN cap_role_permissions rp ON rp.role_id=r.role_id AND rp.effect='allow'
+                   JOIN cap_permissions p ON p.permission_id=rp.permission_id"""
+            )
+            perm_rows = cursor.fetchall()
+    finally:
+        connection.close()
+    by_role: dict[str, list[str]] = {}
+    for pr in perm_rows:
+        by_role.setdefault(pr["role_code"], []).append(pr["permission_code"])
+    for r in roles:
+        r["permissions"] = sorted(by_role.get(r["role_code"], []))
+    return {"count": len(roles), "items": roles}
+
+
+@app.post("/api/admin/users")
+def admin_create_user(payload: CreateUserPayload, user: AuthedUser = Depends(require_roles(*_ADMIN_ROLES))) -> dict[str, Any]:
+    """新增用户:建 cap_users + 分派角色(口令默认 demo-login)。org 必须属本租户。"""
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            # 校验 org 属本租户
+            cursor.execute("SELECT org_id FROM cap_organizations WHERE org_id=%s AND (org_id=%s OR parent_org_id=%s) AND deleted_at IS NULL", (payload.org_id, tid, tid))
+            if cursor.fetchone() is None:
+                raise HTTPException(status_code=400, detail="org 不属于当前租户")
+            cursor.execute("SELECT role_id FROM cap_roles WHERE role_code=%s AND is_active=1", (payload.role_code,))
+            role = cursor.fetchone()
+            if role is None:
+                raise HTTPException(status_code=400, detail="角色不存在")
+            cursor.execute("SELECT user_id FROM cap_users WHERE login_name=%s", (payload.login_name,))
+            if cursor.fetchone() is not None:
+                raise HTTPException(status_code=409, detail="登录名已存在")
+            pw_hash = auth.hash_password(payload.password or "demo-login")
+            cursor.execute(
+                """INSERT INTO cap_users (org_id, employee_no, login_name, display_name, email, password_hash, account_status, timezone_name)
+                   VALUES (%s, %s, %s, %s, %s, %s, 'active', 'Asia/Shanghai')""",
+                (payload.org_id, f"U-{uuid.uuid4().hex[:8].upper()}", payload.login_name, payload.display_name, payload.email or f"{payload.login_name}@capitalos.local", pw_hash),
+            )
+            new_uid = int(cursor.lastrowid)
+            cursor.execute("INSERT INTO cap_user_roles (user_id, role_id) VALUES (%s, %s)", (new_uid, role["role_id"]))
+            audit_id = write_audit(cursor, user.user_id, "admin.user.create", "user", new_uid, payload.display_name, after={"login_name": payload.login_name, "role": payload.role_code})
+        connection.commit()
+    finally:
+        connection.close()
+    return {"ok": True, "user_id": new_uid, "audit_id": audit_id, "default_password": "demo-login" if not payload.password else None}
+
+
+@app.post("/api/admin/roles")
+def admin_create_role(payload: CreateRolePayload, user: AuthedUser = Depends(require_roles(*_ADMIN_ROLES))) -> dict[str, Any]:
+    """新增角色(空权限,建后可再授权)。"""
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT role_id FROM cap_roles WHERE role_code=%s", (payload.role_code,))
+            if cursor.fetchone() is not None:
+                raise HTTPException(status_code=409, detail="角色代码已存在")
+            cursor.execute(
+                "INSERT INTO cap_roles (role_code, role_name, description, data_scope, is_system_role, is_active) VALUES (%s, %s, %s, 'owned', 0, 1)",
+                (payload.role_code, payload.role_name, payload.description),
+            )
+            new_rid = int(cursor.lastrowid)
+            audit_id = write_audit(cursor, user.user_id, "admin.role.create", "role", new_rid, payload.role_name, after={"role_code": payload.role_code})
+        connection.commit()
+    finally:
+        connection.close()
+    return {"ok": True, "role_id": new_rid, "audit_id": audit_id}
 
 
 @app.get("/api/projects/{project_id}/funds-investment")
