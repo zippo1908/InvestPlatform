@@ -784,7 +784,8 @@ function App() {
         </main>
       </div>
 
-      <FeedbackWidget onToast={showToast} />
+      {/* 门槛:仅持 feedback.annotate 能力位的「开发者账号」可见反馈工具 */}
+      {getPerms().includes('feedback.annotate') && <FeedbackWidget onToast={showToast} />}
 
       {toast && (
         <div className="toast" role="status">

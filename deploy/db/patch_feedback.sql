@@ -19,3 +19,15 @@ CREATE TABLE IF NOT EXISTS cap_feedback_annotations (
   tenant_id BIGINT NOT NULL,
   INDEX idx_fb (tenant_id, status, feedback_id)
 );
+
+-- 门槛:新增 feedback.annotate 能力位,只授给「开发者账号」角色(system_admin / managing_partner)。
+-- 想要专门的开发者角色,可新建角色只授这一个 perm。幂等:NOT EXISTS 守卫。
+INSERT INTO cap_permissions (permission_code, permission_name, permission_kind, entity_type, action_code)
+SELECT 'feedback.annotate', '页面反馈标注', 'operation', 'feedback', 'annotate'
+WHERE NOT EXISTS (SELECT 1 FROM cap_permissions WHERE permission_code='feedback.annotate');
+
+INSERT INTO cap_role_permissions (role_id, permission_id, effect)
+SELECT r.role_id, p.permission_id, 'allow'
+FROM cap_roles r JOIN cap_permissions p ON p.permission_code='feedback.annotate'
+WHERE r.role_code IN ('system_admin', 'managing_partner')
+  AND NOT EXISTS (SELECT 1 FROM cap_role_permissions rp WHERE rp.role_id=r.role_id AND rp.permission_id=p.permission_id);

@@ -1531,8 +1531,8 @@ def _create_github_issue(title: str, body: str) -> tuple[int, str]:
 
 
 @app.post("/api/feedback")
-def create_feedback(payload: CreateFeedbackPayload, user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
-    """任意登录用户在页面提交一条标注/修改意见。"""
+def create_feedback(payload: CreateFeedbackPayload, user: AuthedUser = Depends(require_permission("feedback.annotate"))) -> dict[str, Any]:
+    """提交一条标注/修改意见。门槛:需 feedback.annotate 能力位(开发者账号)。"""
     tid = tenant_of(user)
     connection = connect_db()
     try:
