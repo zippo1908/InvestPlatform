@@ -2053,3 +2053,36 @@ tbody tr:hover {
 .admin-create-form { margin-top: 12px; border: 1px dashed var(--accent); border-radius: 8px; padding: 14px; background: #f0fdfa; }
 .admin-create-form .form-grid label.span-2 { grid-column: 1 / -1; }
 .admin-create-form input, .admin-create-form select { width: 100%; font: inherit; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; }
+
+/* ── 微交互打磨(冲 9 分)────────────────────────────── */
+/* 可交互卡片:悬浮轻抬 + 阴影加深(仅明确可点/信息卡,避免整页乱动) */
+.metric-card, .project-card, .flow-card, .risk-card, .fb-item, .comment-item {
+  transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease;
+  will-change: transform;
+}
+.metric-card:hover, .project-card:hover, .flow-card:hover, .risk-card:hover {
+  transform: translateY(-3px);
+  box-shadow: 0 10px 26px rgba(15, 23, 42, 0.10);
+}
+/* 按钮:统一过渡 + 按下回弹 */
+.primary-button, .secondary-button, .danger-button, .icon-button, .link-button, .subtab, .nav-link, .nav-domain-title {
+  transition: background 0.15s ease, color 0.15s ease, transform 0.12s ease, box-shadow 0.15s ease, border-color 0.15s ease;
+}
+.primary-button:hover, .secondary-button:hover, .danger-button:hover { transform: translateY(-1px); }
+.primary-button:active, .secondary-button:active, .danger-button:active, .icon-button:active { transform: scale(0.96); }
+/* 表格行悬浮高亮 */
+.table-wrap tbody tr { transition: background 0.12s ease; }
+.table-wrap tbody tr:hover { background: #f1f5f9; }
+/* 柱状图:配合 GSAP scaleY 从底部生长;height 变化也平滑 */
+.pipeline-bar i { transform-origin: bottom; transition: height 0.4s ease; }
+/* section/二级 tab 下划线滑动感 */
+.subtab { position: relative; }
+/* 骨架屏(加载态可用) */
+@keyframes fb-shimmer { 0% { background-position: -400px 0; } 100% { background-position: 400px 0; } }
+.skeleton { background: linear-gradient(90deg, #eef2f7 25%, #f8fafc 37%, #eef2f7 63%); background-size: 800px 100%; animation: fb-shimmer 1.3s infinite linear; border-radius: 6px; color: transparent !important; }
+/* 阶段流向条:入场时圆点轻微弹入(GSAP 补充见组件) */
+.stage-node-dot { transition: box-shadow 0.2s ease, background 0.2s ease, border-color 0.2s ease; }
+@media (prefers-reduced-motion: reduce) {
+  .metric-card, .project-card, .flow-card, .risk-card, .primary-button, .secondary-button, .danger-button { transition: none; }
+  .metric-card:hover, .project-card:hover, .flow-card:hover, .risk-card:hover { transform: none; }
+}

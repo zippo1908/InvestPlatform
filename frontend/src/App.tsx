@@ -117,6 +117,33 @@ function AiProcessing({ messages }: { messages: string[] }) {
   )
 }
 
+const prefersReducedMotion = () => typeof window !== 'undefined' && window.matchMedia('(prefers-reduced-motion: reduce)').matches
+
+// 数字滚动:把 "92.1 亿" / "128" / "+7.8%" 里的数值从 0 缓动到目标,保留前后缀。
+function CountUp({ value, className }: { value: string; className?: string }) {
+  const ref = useRef<HTMLElement>(null)
+  useEffect(() => {
+    const el = ref.current
+    if (!el) return
+    const m = value.match(/^([^\d-]*)(-?[\d,]+(?:\.\d+)?)(.*)$/)
+    if (!m || prefersReducedMotion()) { el.textContent = value; return }
+    const prefix = m[1]; const numStr = m[2]; const suffix = m[3]
+    const target = parseFloat(numStr.replace(/,/g, ''))
+    const decimals = numStr.includes('.') ? numStr.split('.')[1].length : 0
+    const useGroup = numStr.includes(',')
+    const obj = { v: 0 }
+    const tw = gsap.to(obj, {
+      v: target, duration: 1.1, ease: 'power2.out',
+      onUpdate: () => {
+        const shown = obj.v.toLocaleString('zh-CN', { minimumFractionDigits: decimals, maximumFractionDigits: decimals, useGrouping: useGroup })
+        el.textContent = `${prefix}${shown}${suffix}`
+      },
+    })
+    return () => { tw.kill() }
+  }, [value])
+  return <strong ref={ref} className={className}>{value}</strong>
+}
+
 const MEETING_MSGS = ['正在通读会议纪要…', '提取关键决策与结论…', '识别待办与负责人…', '整理风险提示…', '生成结构化摘要…']
 const WORKSPACE_MSGS = ['正在通读材料…', '套用投资分析框架…', '提炼要点与风险…', '组织结论与建议…']
 const BP_MSGS = ['正在读取 BP…', '识别企业与行业…', '提取融资与亮点…', '评估核心风险…', '生成回填建议…']
@@ -1053,6 +1080,15 @@ function DashboardPage({ onToast }: { onToast: (toast: Toast) => void }) {
     stage,
     count: projects.filter((project) => project.stage === stage).length,
   }))
+  // 柱状图入场:柱子从底部 scaleY 0→1 依次长出(GSAP)。
+  const chartRef = useRef<HTMLDivElement>(null)
+  useLayoutEffect(() => {
+    if (!chartRef.current || prefersReducedMotion()) return
+    const ctx = gsap.context(() => {
+      gsap.from('.pipeline-bar i', { scaleY: 0, transformOrigin: 'bottom', duration: 0.7, ease: 'power3.out', stagger: 0.06, delay: 0.15 })
+    }, chartRef)
+    return () => ctx.revert()
+  }, [])
 
   return (
     <div className="page-grid">
@@ -1060,7 +1096,7 @@ function DashboardPage({ onToast }: { onToast: (toast: Toast) => void }) {
         {dashboardMetrics.map((metric) => (
           <article className={classNames('metric-card', `tone-${metric.tone}`)} key={metric.label}>
             <span>{metric.label}</span>
-            <strong>{metric.value}</strong>
+            <CountUp value={metric.value} />
             <small>{metric.trend}</small>
           </article>
         ))}
@@ -1080,7 +1116,7 @@ function DashboardPage({ onToast }: { onToast: (toast: Toast) => void }) {
             })
           }
         />
-        <div className="pipeline-chart">
+        <div className="pipeline-chart" ref={chartRef}>
           {stageCounts.map((item, index) => (
             <div className="pipeline-bar" key={item.stage}>
               <span>{item.stage}</span>
@@ -2364,6 +2400,18 @@ function DetailPage({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [kind, section, selectedId, listPath])
 
+  // 阶段流向条入场:圆点弹入 + 箭头从左画出(GSAP)。
+  const stageRef = useRef<HTMLDivElement>(null)
+  useLayoutEffect(() => {
+    if (prefersReducedMotion() || !stageRef.current) return
+    const ctx = gsap.context(() => {
+      gsap.from('.stage-flow .stage-node', { autoAlpha: 0, y: 10, scale: 0.8, duration: 0.4, ease: 'back.out(1.7)', stagger: 0.045, delay: 0.12 })
+      gsap.from('.stage-flow .stage-arrow', { scaleX: 0, transformOrigin: 'left center', duration: 0.3, ease: 'power2.out', stagger: 0.045, delay: 0.18 })
+    }, stageRef)
+    return () => ctx.revert()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedId, section, kind])
+
   const [tabRows, setTabRows] = useState<DataRow[]>([])
   const [tabLoading, setTabLoading] = useState(false)
   const [history, setHistory] = useState<Array<Record<string, unknown>>>([])
@@ -2518,7 +2566,7 @@ function DetailPage({
   const fundStage = FUND_STAGE_INDEX[fundStatus] ?? 0
 
   return (
-    <div className="page-grid">
+    <div className="page-grid" ref={stageRef}>
       <section className="panel detail-hero full-span motion-item">
         <div>
           <span className="page-kicker">{screen.group}</span>
