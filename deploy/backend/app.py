@@ -133,6 +133,13 @@ class UpdateProjectPayload(BaseModel):
     city: str | None = Field(default=None, max_length=80)
     summary: str | None = Field(default=None, max_length=2000)
     stage_label: str | None = Field(default=None, max_length=80)
+    # 基本情况分组扩展字段(项目卡片二级 tab「基本情况」可编辑)
+    registered_location: str | None = Field(default=None, max_length=200)
+    registry_code_mask: str | None = Field(default=None, max_length=120)
+    source_channel: str | None = Field(default=None, max_length=120)
+    thesis: str | None = Field(default=None, max_length=2000)
+    product_note: str | None = Field(default=None, max_length=2000)
+    highlight_note: str | None = Field(default=None, max_length=2000)
     # 乐观锁:前端把加载时的 updated_at 回传;与库中不一致 → 409(有人先改了)。
     expected_updated_at: str | None = None
 
@@ -1180,7 +1187,9 @@ def get_project(project_id: int, user: AuthedUser = Depends(current_user)) -> di
                 """
                 SELECT p.project_id AS id, p.short_name, p.legal_name, p.opportunity_status,
                        p.stage_label, p.industry_group, p.city, p.registered_location,
-                       p.summary, p.thesis, p.product_note, u.display_name AS owner, p.updated_at
+                       p.registry_code_mask, p.source_channel, p.summary, p.thesis,
+                       p.product_note, p.highlight_note, p.created_at,
+                       u.display_name AS owner, p.updated_at
                 FROM cap_projects p
                 LEFT JOIN cap_users u ON u.user_id=p.owner_user_id
                 WHERE p.project_id=%s AND p.tenant_id=%s AND p.deleted_at IS NULL
@@ -1193,6 +1202,61 @@ def get_project(project_id: int, user: AuthedUser = Depends(current_user)) -> di
     if row is None:
         raise HTTPException(status_code=404, detail="Project not found")
     return row
+
+
+@app.get("/api/projects/{project_id}/summary")
+def project_investment_summary(project_id: int, user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
+    """投资汇总(项目卡片二级 tab):从 cap_investment_positions 聚合业绩/投资/回款指标。
+    MOIC/DPI 由真实金额算出;IRR 需现金流序列,暂不估(返回 None)。"""
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                  SUM(agreement_amount)        AS agreement_total,
+                  SUM(cumulative_paid_amount)  AS paid_total,
+                  SUM(realized_return_amount)  AS realized_total,
+                  MAX(latest_valuation)        AS latest_valuation,
+                  MAX(current_ownership_ratio) AS ownership_ratio,
+                  MIN(first_payment_on)        AS first_payment_on,
+                  COUNT(*)                     AS position_count,
+                  MAX(round_label)             AS round_label,
+                  MAX(investment_status)       AS investment_status,
+                  MAX(exit_status)             AS exit_status
+                FROM cap_investment_positions
+                WHERE project_id=%s AND tenant_id=%s AND deleted_at IS NULL
+                """,
+                (project_id, tid),
+            )
+            agg = cursor.fetchone() or {}
+    finally:
+        connection.close()
+
+    def fnum(v: Any) -> float | None:
+        return float(v) if v is not None else None
+
+    paid = fnum(agg.get("paid_total")) or 0.0
+    valuation = fnum(agg.get("latest_valuation"))
+    realized = fnum(agg.get("realized_total")) or 0.0
+    # MOIC=(当前持有估值+已实现回款)/已投入;DPI=已实现回款/已投入。paid=0 时不计算(避免除零)。
+    moic = round((((valuation or 0.0) + realized) / paid), 2) if paid > 0 else None
+    dpi = round((realized / paid), 2) if paid > 0 else None
+    return {
+        "has_position": (agg.get("position_count") or 0) > 0,
+        "performance": {"DPI": dpi, "MOIC": moic, "IRR": None},
+        "investment": {
+            "agreement_total": fnum(agg.get("agreement_total")),
+            "paid_total": fnum(agg.get("paid_total")),
+            "first_payment_on": agg.get("first_payment_on").isoformat() if agg.get("first_payment_on") else None,
+            "ownership_ratio": fnum(agg.get("ownership_ratio")),
+            "latest_valuation": valuation,
+            "round_label": agg.get("round_label"),
+            "investment_status": agg.get("investment_status"),
+        },
+        "realized": {"realized_total": realized or None, "exit_status": agg.get("exit_status")},
+    }
 
 
 @app.patch("/api/projects/{project_id}")

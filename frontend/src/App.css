@@ -1824,3 +1824,106 @@ tbody tr:hover {
 .ai-processing-dots i:nth-child(2) { animation-delay: 0.18s; }
 .ai-processing-dots i:nth-child(3) { animation-delay: 0.36s; }
 @keyframes dotpulse { 0%, 80%, 100% { opacity: 0.3; transform: scale(0.85); } 40% { opacity: 1; transform: scale(1); } }
+
+/* ── 项目卡片:阶段进度条 / 头部字段 / 二级 tab / 投资汇总指标 ── */
+.stage-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  overflow-x: auto;
+  padding: 4px 2px;
+}
+.stage-step {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 12px 6px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 12.5px;
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+.stage-step .stage-dot {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: var(--line);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+}
+.stage-step.is-done { color: var(--ink); border-color: color-mix(in srgb, var(--accent) 40%, var(--line)); }
+.stage-step.is-done .stage-dot { background: color-mix(in srgb, var(--accent) 25%, #fff); color: var(--accent); }
+.stage-step.is-current {
+  color: #fff;
+  background: var(--accent);
+  border-color: var(--accent);
+  font-weight: 700;
+}
+.stage-step.is-current .stage-dot { background: rgba(255,255,255,0.28); color: #fff; }
+
+.project-card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 12px 20px;
+}
+.project-card-grid > div { display: flex; flex-direction: column; gap: 4px; }
+.project-card-grid span { color: var(--muted); font-size: 12px; }
+.project-card-grid strong { color: var(--ink); font-size: 14px; }
+
+.subtab-bar {
+  display: flex;
+  gap: 4px;
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 14px;
+  overflow-x: auto;
+}
+.subtab {
+  border: none;
+  background: none;
+  padding: 9px 14px;
+  font-size: 13.5px;
+  color: var(--muted);
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  white-space: nowrap;
+}
+.subtab.is-active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+  font-weight: 700;
+}
+
+.metric-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px 20px;
+}
+.metric-grid > div {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #f8fafc;
+}
+.metric-grid span { color: var(--muted); font-size: 12px; }
+.metric-grid strong { color: var(--ink); font-size: 16px; }
+
+/* 长文本字段跨两列 */
+.detail-edit-grid label.span-2 { grid-column: 1 / -1; }
+.detail-edit-grid textarea {
+  width: 100%;
+  resize: vertical;
+  font: inherit;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}

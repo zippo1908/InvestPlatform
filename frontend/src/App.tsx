@@ -1701,15 +1701,21 @@ function FormPage({
   )
 }
 
-// detail 屏可编辑的主档字段(与后端 PATCH 白名单一致)。
-const DETAIL_FIELDS: Record<'project' | 'fund', { key: string; label: string; kind?: 'number' }[]> = {
+// detail 屏可编辑的主档字段(与后端 PATCH 白名单一致)。long=多行文本。
+type DetailField = { key: string; label: string; kind?: 'number'; long?: boolean }
+const DETAIL_FIELDS: Record<'project' | 'fund', DetailField[]> = {
   project: [
-    { key: 'short_name', label: '项目简称' },
+    { key: 'short_name', label: '企业简称' },
     { key: 'legal_name', label: '企业全称' },
     { key: 'industry_group', label: '行业方向' },
     { key: 'city', label: '城市' },
-    { key: 'stage_label', label: '阶段' },
-    { key: 'summary', label: '项目摘要' },
+    { key: 'registered_location', label: '公司注册地' },
+    { key: 'registry_code_mask', label: '统一信用代码' },
+    { key: 'source_channel', label: '来源渠道' },
+    { key: 'summary', label: '项目简介', long: true },
+    { key: 'highlight_note', label: '项目亮点', long: true },
+    { key: 'product_note', label: '主要产品', long: true },
+    { key: 'thesis', label: '投资逻辑', long: true },
   ],
   fund: [
     { key: 'fund_name', label: '基金简称' },
@@ -1721,6 +1727,41 @@ const DETAIL_FIELDS: Record<'project' | 'fund', { key: string; label: string; ki
     { key: 'net_asset_value', label: '净资产', kind: 'number' },
   ],
 }
+
+// 项目所处阶段(顶部进度条):入库 → … → 完全退出。
+const STAGE_STEPS = ['入库', 'NDA', 'TS', '立项', '投决', '领投', '投后', '部分退出', '完全退出']
+// 后端 stage_label / opportunity_status → 阶段条下标(尽量匹配,匹配不到落到「入库」)。
+const STAGE_INDEX: Record<string, number> = {
+  sourced: 0, 入库: 0, screening: 1, nda: 1, ts: 2, term_sheet: 2,
+  diligence: 3, 立项: 3, approved: 4, ic: 4, 投决: 4, invested: 5, 领投: 5, lead: 5,
+  portfolio: 6, 投后: 6, post_investment: 6, partial_exit: 7, 部分退出: 7,
+  exited: 8, 完全退出: 8, full_exit: 8,
+}
+function stageIndexOf(project: Record<string, string>): number {
+  const raw = (project.stage_label || project.opportunity_status || '').trim().toLowerCase()
+  if (raw in STAGE_INDEX) return STAGE_INDEX[raw]
+  // 中文直配
+  const cn = (project.stage_label || '').trim()
+  const i = STAGE_STEPS.indexOf(cn)
+  return i >= 0 ? i : 0
+}
+// 项目「基本情况」tab 的分组。
+const PROJECT_BASIC_GROUPS: Array<[string, string[]]> = [
+  ['基础信息', ['short_name', 'legal_name', 'industry_group', 'city', 'registered_location', 'registry_code_mask', 'source_channel']],
+  ['项目描述', ['summary', 'highlight_note', 'product_note', 'thesis']],
+]
+const PROJECT_SUBTABS = ['基本情况', '投资汇总', '财务数据', '委派代表', '投资决策'] as const
+type ProjectSubtab = (typeof PROJECT_SUBTABS)[number]
+type InvestSummary = {
+  has_position: boolean
+  performance: { DPI: number | null; MOIC: number | null; IRR: number | null }
+  investment: { agreement_total: number | null; paid_total: number | null; first_payment_on: string | null; ownership_ratio: number | null; latest_valuation: number | null; round_label: string | null; investment_status: string | null }
+  realized: { realized_total: number | null; exit_status: string | null }
+}
+// 金额(元)→ 万,保留 1 位;空显示 —。
+const wan = (v: number | null | undefined): string => (v == null ? '—' : `${(v / 1e4).toLocaleString('zh-CN', { maximumFractionDigits: 1 })} 万`)
+const pct = (v: number | null | undefined): string => (v == null ? '—' : `${(v * 100).toFixed(2)}%`)
+const num = (v: number | null | undefined): string => (v == null ? '—' : String(v))
 
 function DetailPage({
   screen,
@@ -1747,9 +1788,25 @@ function DetailPage({
   const [entities, setEntities] = useState<Array<Record<string, unknown>>>([])
   const [selectedId, setSelectedId] = useState<number | null>(() => readRouteId()) // 支持从列表行 ?id= 预选
   const [form, setForm] = useState<Record<string, string>>({})
+  const [detail, setDetail] = useState<Record<string, unknown>>({}) // 原始详情(阶段/入库时间/负责人等非编辑字段)
   const [loadedAt, setLoadedAt] = useState<string | null>(null) // 乐观锁:加载时的 updated_at
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
+  const [subtab, setSubtab] = useState<ProjectSubtab>('基本情况') // 项目卡片二级 tab
+  const [summary, setSummary] = useState<InvestSummary | null>(null)
+  const [summaryLoading, setSummaryLoading] = useState(false)
+
+  // 投资汇总:切到该 tab 时按需拉取聚合(cap_investment_positions)。
+  useEffect(() => {
+    if (kind !== 'project' || subtab !== '投资汇总' || selectedId == null) return
+    let ignore = false
+    setSummaryLoading(true); setSummary(null)
+    apiGet<InvestSummary>(`${listPath}/${selectedId}/summary`)
+      .then((s) => { if (!ignore) setSummary(s) })
+      .catch(() => { if (!ignore) setSummary(null) })
+      .finally(() => { if (!ignore) setSummaryLoading(false) })
+    return () => { ignore = true }
+  }, [kind, subtab, selectedId, listPath])
 
   // 路由带 ?id= 时预选该实体(从列表行「打开」进来)。
   useEffect(() => {
@@ -1782,6 +1839,7 @@ function DetailPage({
         const next: Record<string, string> = {}
         for (const f of fields) next[f.key] = detail[f.key] == null ? '' : String(detail[f.key])
         setForm(next)
+        setDetail(detail)
         setLoadedAt(detail.updated_at ? String(detail.updated_at) : null)
       })
       .catch(() => undefined)
@@ -1824,9 +1882,9 @@ function DetailPage({
     try {
       const result = await apiPost<{ stage?: string }>(`${listPath}/${selectedId}/advance`)
       onToast({ title: `阶段已推进${result.stage ? ' → ' + result.stage : ''}`, detail: auditDetail(result), action: 'project.advance', entity: 'cap_projects', result })
-      // 重取详情反映新阶段
+      // 重取详情反映新阶段(阶段进度条 + 项目卡片头部据此刷新)
       const d = await apiGet<Record<string, unknown>>(`${listPath}/${selectedId}`)
-      setForm((prev) => ({ ...prev, stage_label: d.stage_label ? String(d.stage_label) : prev.stage_label }))
+      setDetail(d)
       setLoadedAt(d.updated_at ? String(d.updated_at) : null)
     } catch (error) {
       onToast({ title: '推进失败', detail: error instanceof Error ? error.message : 'API 调用失败' })
@@ -1856,10 +1914,12 @@ function DetailPage({
   }
 
   const entityName = form[nameKey] || (loading ? '加载中…' : '（无数据）')
+  const fieldByKey = Object.fromEntries(fields.map((f) => [f.key, f])) as Record<string, DetailField>
+  const curStage = stageIndexOf({ stage_label: String(detail.stage_label ?? ''), opportunity_status: String(detail.opportunity_status ?? '') })
 
   return (
     <div className="page-grid">
-      <section className="panel detail-hero two-thirds motion-item">
+      <section className="panel detail-hero full-span motion-item">
         <div>
           <span className="page-kicker">{screen.group}</span>
           <h2>{entityName}</h2>
@@ -1905,43 +1965,155 @@ function DetailPage({
         </div>
       </section>
 
-      <section className="panel motion-item">
-        <PanelTitle icon={Clock} title="关键时间线" />
-        <Timeline />
-      </section>
+      {kind === 'project' ? (
+        <>
+          {/* 项目所处阶段进度条 */}
+          <section className="panel full-span motion-item">
+            <PanelTitle icon={GitBranch} title="项目所处阶段" />
+            <div className="stage-bar" data-testid="stage-bar">
+              {STAGE_STEPS.map((s, i) => (
+                <div key={s} className={classNames('stage-step', i < curStage && 'is-done', i === curStage && 'is-current')}>
+                  <span className="stage-dot">{i < curStage ? '✓' : i + 1}</span>
+                  <span className="stage-name">{s}</span>
+                </div>
+              ))}
+            </div>
+          </section>
 
-      <section className="panel full-span motion-item">
-        <div className="tab-summary">
-          <strong>主档编辑</strong>
-          <span>{canWrite ? '修改字段后点「保存主档」写入后端并记审计。' : '当前角色只读,字段不可编辑。'}</span>
-        </div>
-        <div className="form-grid detail-edit-grid">
-          {fields.map((f) => (
-            <label key={f.key}>
-              <span>{f.label}</span>
-              <input
-                type={f.kind === 'number' ? 'number' : 'text'}
-                value={form[f.key] ?? ''}
-                readOnly={!canWrite}
-                data-field={f.key}
-                onChange={(event) => setForm((prev) => ({ ...prev, [f.key]: event.target.value }))}
-              />
-            </label>
-          ))}
-        </div>
-        <div className="button-row" style={{ marginTop: 14 }}>
-          <button
-            type="button"
-            className="primary-button"
-            disabled={!canWrite || saving || selectedId == null}
-            data-testid="detail-save"
-            onClick={save}
-          >
-            <CheckCircle size={16} />
-            {saving ? '保存中…' : '保存主档'}
-          </button>
-        </div>
-      </section>
+          {/* 项目卡片头部字段 */}
+          <section className="panel full-span motion-item">
+            <PanelTitle icon={FileText} title="项目卡片" />
+            <div className="project-card-grid" data-testid="project-card">
+              <div><span>企业简称</span><strong>{form.short_name || '—'}</strong></div>
+              <div><span>企业全称</span><strong>{form.legal_name || '—'}</strong></div>
+              <div><span>项目进度</span><strong><StatusBadge value={String(detail.stage_label ?? '—')} /></strong></div>
+              <div><span>项目入库时间</span><strong>{detail.created_at ? String(detail.created_at).slice(0, 10) : '—'}</strong></div>
+              <div><span>统一信用代码</span><strong>{form.registry_code_mask || '—'}</strong></div>
+              <div><span>项目负责人</span><strong>{String(detail.owner ?? '—')}</strong></div>
+              <div><span>行业方向</span><strong>{form.industry_group || '—'}</strong></div>
+              <div><span>项目所在城市</span><strong>{form.city || '—'}</strong></div>
+            </div>
+          </section>
+
+          {/* 二级 tabs */}
+          <section className="panel full-span motion-item">
+            <div className="subtab-bar" data-testid="project-subtabs">
+              {PROJECT_SUBTABS.map((t) => (
+                <button key={t} type="button" className={classNames('subtab', subtab === t && 'is-active')} onClick={() => setSubtab(t)}>{t}</button>
+              ))}
+            </div>
+
+            {subtab === '基本情况' && (
+              <div data-testid="subtab-basic">
+                {PROJECT_BASIC_GROUPS.map(([group, keys]) => (
+                  <fieldset className="form-section" key={group}>
+                    <legend>{group}</legend>
+                    <div className="form-grid detail-edit-grid">
+                      {keys.map((k) => {
+                        const f = fieldByKey[k]
+                        if (!f) return null
+                        return (
+                          <label key={k} className={f.long ? 'span-2' : undefined}>
+                            <span>{f.label}</span>
+                            {f.long ? (
+                              <textarea value={form[k] ?? ''} readOnly={!canWrite} data-field={k} rows={3}
+                                onChange={(e) => setForm((prev) => ({ ...prev, [k]: e.target.value }))} />
+                            ) : (
+                              <input type="text" value={form[k] ?? ''} readOnly={!canWrite} data-field={k}
+                                onChange={(e) => setForm((prev) => ({ ...prev, [k]: e.target.value }))} />
+                            )}
+                          </label>
+                        )
+                      })}
+                    </div>
+                  </fieldset>
+                ))}
+                <div className="button-row" style={{ marginTop: 14 }}>
+                  <button type="button" className="primary-button" disabled={!canWrite || saving || selectedId == null} data-testid="detail-save" onClick={save}>
+                    <CheckCircle size={16} /> {saving ? '保存中…' : '修改'}
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {subtab === '投资汇总' && (
+              <div data-testid="subtab-summary">
+                {summaryLoading ? (
+                  <p className="muted-note">投资汇总加载中…</p>
+                ) : !summary ? (
+                  <p className="muted-note">投资汇总加载失败</p>
+                ) : !summary.has_position ? (
+                  <p className="muted-note">该项目暂无投资持仓记录(cap_investment_positions),投资汇总为空。</p>
+                ) : (
+                  <>
+                    <fieldset className="form-section"><legend>业绩指标</legend>
+                      <div className="metric-grid">
+                        <div><span>DPI</span><strong>{num(summary.performance.DPI)}</strong></div>
+                        <div><span>MOIC</span><strong>{num(summary.performance.MOIC)}</strong></div>
+                        <div><span>IRR</span><strong>{summary.performance.IRR == null ? '—' : pct(summary.performance.IRR)}</strong></div>
+                      </div>
+                    </fieldset>
+                    <fieldset className="form-section"><legend>投资信息</legend>
+                      <div className="metric-grid">
+                        <div><span>累计协议签署金额</span><strong>{wan(summary.investment.agreement_total)}</strong></div>
+                        <div><span>累计打款金额</span><strong>{wan(summary.investment.paid_total)}</strong></div>
+                        <div><span>首次打款时间</span><strong>{summary.investment.first_payment_on ?? '—'}</strong></div>
+                        <div><span>最新持股比例</span><strong>{pct(summary.investment.ownership_ratio)}</strong></div>
+                        <div><span>项目最新投后估值</span><strong>{wan(summary.investment.latest_valuation)}</strong></div>
+                        <div><span>投资轮次</span><strong>{summary.investment.round_label ?? '—'}</strong></div>
+                        <div><span>投资状态</span><strong>{summary.investment.investment_status ?? '—'}</strong></div>
+                      </div>
+                    </fieldset>
+                    <fieldset className="form-section"><legend>回款信息</legend>
+                      <div className="metric-grid">
+                        <div><span>累计退出收益</span><strong>{wan(summary.realized.realized_total)}</strong></div>
+                        <div><span>退出状态</span><strong>{summary.realized.exit_status ?? '—'}</strong></div>
+                      </div>
+                    </fieldset>
+                  </>
+                )}
+              </div>
+            )}
+
+            {subtab !== '基本情况' && subtab !== '投资汇总' && (
+              <p className="muted-note" data-testid="subtab-placeholder">「{subtab}」结构已就位,数据接入在下一阶段。</p>
+            )}
+          </section>
+        </>
+      ) : (
+        <>
+          <section className="panel motion-item">
+            <PanelTitle icon={Clock} title="关键时间线" />
+            <Timeline />
+          </section>
+          <section className="panel full-span motion-item">
+            <div className="tab-summary">
+              <strong>主档编辑</strong>
+              <span>{canWrite ? '修改字段后点「保存主档」写入后端并记审计。' : '当前角色只读,字段不可编辑。'}</span>
+            </div>
+            <div className="form-grid detail-edit-grid">
+              {fields.map((f) => (
+                <label key={f.key}>
+                  <span>{f.label}</span>
+                  <input
+                    type={f.kind === 'number' ? 'number' : 'text'}
+                    value={form[f.key] ?? ''}
+                    readOnly={!canWrite}
+                    data-field={f.key}
+                    onChange={(event) => setForm((prev) => ({ ...prev, [f.key]: event.target.value }))}
+                  />
+                </label>
+              ))}
+            </div>
+            <div className="button-row" style={{ marginTop: 14 }}>
+              <button type="button" className="primary-button" disabled={!canWrite || saving || selectedId == null} data-testid="detail-save" onClick={save}>
+                <CheckCircle size={16} />
+                {saving ? '保存中…' : '保存主档'}
+              </button>
+            </div>
+          </section>
+        </>
+      )}
     </div>
   )
 }
