@@ -2305,6 +2305,19 @@ function ListPage({
   const { rows, source, total, pageSize } = useBackendRows(screen.id, fallbackRows, page, reloadKey)
   const totalPages = total != null ? Math.max(1, Math.ceil(total / pageSize)) : null
 
+  // 支持批量删除的列表(有软删除端点的实体)
+  const DELETE_BASE: Record<string, string> = { 'project-list': '/api/projects', 'fund-list': '/api/funds' }
+  const deleteBase = canWrite ? DELETE_BASE[screen.id] : undefined
+  const batchDelete = async (ids: number[]) => {
+    if (!deleteBase || ids.length === 0) return
+    if (!window.confirm(`确认删除选中的 ${ids.length} 条?可在「回收站」恢复。`)) return
+    const results = await Promise.allSettled(ids.map((id) => apiDelete(`${deleteBase}/${id}`)))
+    const ok = results.filter((r) => r.status === 'fulfilled').length
+    const fail = results.length - ok
+    onToast({ title: `批量删除:成功 ${ok}${fail ? `,失败 ${fail}` : ''}`, detail: '已移入回收站', action: 'batch.delete', entity: deleteBase })
+    setReloadKey((k) => k + 1)
+  }
+
   return (
     <div className="page-grid">
       <section className="panel full-span motion-item">
@@ -2314,6 +2327,7 @@ function ListPage({
         <DataTable
           rows={rows}
           onRowOpen={LIST_DETAIL_TARGET[screen.id] ? (id) => goToEntity(LIST_DETAIL_TARGET[screen.id], id) : undefined}
+          onBatchDelete={deleteBase ? batchDelete : undefined}
         />
         {totalPages != null && (
           <div className="pager" data-testid="pager">
@@ -2461,13 +2475,15 @@ function ListControls({
   )
 }
 
-function DataTable({ rows, compact = false, onRowOpen }: { rows: DataRow[]; compact?: boolean; onRowOpen?: (id: number) => void }) {
+function DataTable({ rows, compact = false, onRowOpen, onBatchDelete }: { rows: DataRow[]; compact?: boolean; onRowOpen?: (id: number) => void; onBatchDelete?: (ids: number[]) => void }) {
   const [query, setQuery] = useState('')
   const [selected, setSelected] = useState<Set<number>>(new Set())
   const columns = Object.keys(rows[0] ?? {}).filter((c) => !c.startsWith('__')) // __ 前缀为隐藏元数据(如 __id)
   const filtered = rows.filter((row) => Object.values(row).join(' ').toLowerCase().includes(query.toLowerCase()))
   const allSelected = filtered.length > 0 && filtered.every((_, index) => selected.has(index))
   const canOpen = !!onRowOpen && rows.some((r) => r['__id'] != null && r['__id'] !== '')
+  const canBatch = !!onBatchDelete && rows.some((r) => r['__id'] != null && r['__id'] !== '')
+  const selectedIds = [...selected].map((i) => filtered[i]?.['__id']).filter((v) => v != null && v !== '').map(Number)
 
   return (
     <div className={classNames('table-wrap', compact && 'is-compact')} data-testid="records-table">
@@ -2484,6 +2500,18 @@ function DataTable({ rows, compact = false, onRowOpen }: { rows: DataRow[]; comp
             />
           </label>
           <span>{selected.size} 条已选</span>
+          {canBatch && selectedIds.length > 0 && (
+            <button
+              type="button"
+              className="danger-button"
+              onClick={() => {
+                onBatchDelete?.(selectedIds)
+                setSelected(new Set())
+              }}
+            >
+              <Trash size={14} /> 批量删除 ({selectedIds.length})
+            </button>
+          )}
         </div>
       )}
       <table>

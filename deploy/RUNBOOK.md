@@ -35,6 +35,15 @@ journalctl --user -u investplatform-backend -n 100   # 日志(也写 backend/bac
 - 前端改动:`cd frontend && npm run build && rm -rf ../deploy/frontend/dist && cp -r dist
   ../deploy/frontend/dist`(http.server 直读目录,**无需重启前端**)
 
+## ⚠️ 部署同步纪律(防 FTP/覆盖事故)
+> 曾发生:FTP 传错位置,用本地旧版覆盖了服务器 `deploy/`,丢失未提交的后端代码。
+- **服务器是权威源**。首选:直接在服务器改 → `git commit` → `git push`(凭据已存,静默推送)。
+- **必须用 FTP 时**:先在本地 `git pull` 把远端最新拉下来,再上传;否则旧版会覆盖服务器新代码。
+- **提交前务必核对暂存清单**:`git diff --cached --name-only` 要包含**所有**改动文件,
+  尤其 `deploy/backend/app.py`——别只提交前端(曾漏提交后端,一次覆盖就丢了)。
+- Windows FTP 客户端会把文件转成 CRLF 换行 → git 全标 "modified"。修复:
+  `git checkout HEAD -- <未改过的文件>` 还原为 LF;或 `git add --renormalize .`。
+
 ## 备份 / 恢复
 - 自动:cron 每日 03:00(北京)`tools/backup.sh` → `deploy/backups/capitalos-*.sql.gz`,留 7 天
 - 手动备份:`deploy/tools/backup.sh`
