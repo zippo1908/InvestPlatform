@@ -1379,6 +1379,27 @@ function FormPage({
   const [aiFields, setAiFields] = useState<Record<string, unknown> | null>(null)
   const [aiBusy, setAiBusy] = useState(false)
   const [aiError, setAiError] = useState<string | null>(null)
+  const [extracting, setExtracting] = useState(false)
+  const bpFileRef = useRef<HTMLInputElement>(null)
+
+  const uploadBpFile = async (f: File) => {
+    if (f.size > 20 * 1024 * 1024) { onToast({ title: '文件过大', detail: '上限 20MB' }); return }
+    setExtracting(true); setAiError(null)
+    try {
+      const fd = new FormData()
+      fd.append('file', f)
+      const token = getToken()
+      const res = await fetch(`${API_BASE}/api/ai/extract-text`, { method: 'POST', headers: token ? { Authorization: `Bearer ${token}` } : {}, body: fd })
+      if (!res.ok) throw new Error((await res.text()) || `HTTP ${res.status}`)
+      const out = await res.json() as { text: string; chars: number; file_name: string }
+      setBpText(out.text)
+      onToast({ title: '已解析 BP 文件', detail: `${out.file_name}(${out.chars} 字),点「AI 解析」抽字段` })
+    } catch (error) {
+      setAiError((error instanceof Error ? error.message : '解析失败').replace(/^\{"detail":"?|"?\}$/g, ''))
+    } finally {
+      setExtracting(false)
+    }
+  }
 
   const runAiParse = async () => {
     if (!bpText.trim()) return
@@ -1511,10 +1532,21 @@ function FormPage({
           <p>基金主档暂无 AI 抽取;项目「新增项目」支持粘贴 BP 文本由大模型抽取字段。</p>
         ) : (
           <>
-            <p>粘贴 BP / 项目介绍文本,由后端配置的大模型抽取结构化字段,一键回填左侧表单。</p>
+            <p>上传或粘贴 BP / 项目介绍,由后端配置的大模型抽取结构化字段,一键回填左侧表单。</p>
+            <input
+              ref={bpFileRef}
+              type="file"
+              accept=".txt,.md,.markdown,.pdf,.docx"
+              style={{ display: 'none' }}
+              onChange={(event) => { const f = event.target.files?.[0]; event.target.value = ''; if (f) void uploadBpFile(f) }}
+            />
+            <button className="secondary-button full-width" type="button" disabled={!canWrite || aiBusy || extracting} onClick={() => bpFileRef.current?.click()} title="支持 txt/md/PDF/Word(.docx)">
+              <Upload size={15} />
+              {extracting ? '解析文件中…' : '上传 BP 文件'}
+            </button>
             <textarea
               className="ai-bp-input"
-              placeholder="在此粘贴商业计划书或项目介绍…"
+              placeholder="上传 BP 文件后自动填入,或在此粘贴商业计划书 / 项目介绍…"
               value={bpText}
               readOnly={!canWrite}
               onChange={(event) => setBpText(event.target.value)}
