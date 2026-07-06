@@ -1697,6 +1697,7 @@ def screen_ledger(
     user: AuthedUser = Depends(current_user),
     page: int = 1,
     page_size: int = 20,
+    q: str = "",
 ) -> dict[str, Any]:
     query = LEDGER_QUERIES.get(screen_id)
     if query is None:
@@ -1706,18 +1707,28 @@ def screen_ledger(
     page_size = min(200, max(1, page_size))  # 上限 200,防一次拉爆
     offset = (page - 1) * page_size
     tenant_params: tuple[Any, ...] = (tenant_of(user),) if screen_id in LEDGER_TENANT_SCOPED else ()
-
-    # 总数:去掉 ORDER BY 的子查询计数(用于分页总页数)。
-    base_no_order = query.split("ORDER BY")[0]
-    count_sql = f"SELECT COUNT(*) AS n FROM ({base_no_order}) AS _c"
+    keyword = q.strip().lower()
 
     connection = connect_db()
     try:
         with connection.cursor() as cursor:
-            cursor.execute(count_sql, tenant_params)
-            total = int(cursor.fetchone()["n"])
-            cursor.execute(f"{query}\n            LIMIT %s OFFSET %s", (*tenant_params, page_size, offset))
-            rows = cursor.fetchall()
+            if keyword:
+                # 高级筛选:服务端跨全部数据(非仅当前页)按关键词过滤。取上限 5000 行,
+                # 在服务端逐值匹配(隐藏 __ 列不参与),再分页。
+                cursor.execute(f"{query}\n            LIMIT 5000", tenant_params)
+                all_rows = cursor.fetchall()
+                matched = [
+                    r for r in all_rows
+                    if any(keyword in str(v).lower() for k, v in r.items() if not str(k).startswith("__") and v is not None)
+                ]
+                total = len(matched)
+                rows = matched[offset:offset + page_size]
+            else:
+                base_no_order = query.split("ORDER BY")[0]
+                cursor.execute(f"SELECT COUNT(*) AS n FROM ({base_no_order}) AS _c", tenant_params)
+                total = int(cursor.fetchone()["n"])
+                cursor.execute(f"{query}\n            LIMIT %s OFFSET %s", (*tenant_params, page_size, offset))
+                rows = cursor.fetchall()
     finally:
         connection.close()
     return {

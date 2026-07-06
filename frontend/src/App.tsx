@@ -301,7 +301,7 @@ function mapBackendStage(stage: string) {
 
 const PAGE_SIZE = 20
 
-function useBackendRows(screenId: string, fallbackRows: DataRow[], page = 1, reloadKey = 0) {
+function useBackendRows(screenId: string, fallbackRows: DataRow[], page = 1, reloadKey = 0, q = '') {
   const [rows, setRows] = useState<DataRow[]>(fallbackRows)
   const [source, setSource] = useState<'loading' | 'mysql' | 'mock'>('loading')
   const [total, setTotal] = useState<number | null>(null)
@@ -311,7 +311,7 @@ function useBackendRows(screenId: string, fallbackRows: DataRow[], page = 1, rel
     setRows(fallbackRows)
     setSource('loading')
 
-    apiGet<LedgerResponse & { total?: number }>(`/api/ledger/${screenId}?page=${page}&page_size=${PAGE_SIZE}`)
+    apiGet<LedgerResponse & { total?: number }>(`/api/ledger/${screenId}?page=${page}&page_size=${PAGE_SIZE}${q ? `&q=${encodeURIComponent(q)}` : ''}`)
       .then((result) => {
         if (!active) return
         setRows(normalizeRows(result.items))
@@ -328,7 +328,7 @@ function useBackendRows(screenId: string, fallbackRows: DataRow[], page = 1, rel
     return () => {
       active = false
     }
-  }, [screenId, fallbackRows, page, reloadKey])
+  }, [screenId, fallbackRows, page, reloadKey, q])
 
   return { rows, source, total, pageSize: PAGE_SIZE }
 }
@@ -2393,8 +2393,9 @@ function ListPage({
   const fallbackRows = useMemo(() => listRows(screen.id), [screen.id])
   const [page, setPage] = useState(1)
   const [reloadKey, setReloadKey] = useState(0)
-  useEffect(() => { setPage(1) }, [screen.id]) // 换屏回到第一页
-  const { rows, source, total, pageSize } = useBackendRows(screen.id, fallbackRows, page, reloadKey)
+  const [q, setQ] = useState('')
+  useEffect(() => { setPage(1); setQ('') }, [screen.id]) // 换屏回到第一页 + 清搜索
+  const { rows, source, total, pageSize } = useBackendRows(screen.id, fallbackRows, page, reloadKey, q)
   const totalPages = total != null ? Math.max(1, Math.ceil(total / pageSize)) : null
 
   // 支持批量删除的列表(有软删除端点的实体)
@@ -2415,7 +2416,7 @@ function ListPage({
       <section className="panel full-span motion-item">
         <PanelTitle icon={ListIcon(screen.id)} title={`${screen.title}台账`} />
         <DataSourceBadge source={source} />
-        <ListControls canWrite={canWrite} onToast={onToast} screen={screen} onImported={() => { setPage(1); setReloadKey((k) => k + 1) }} />
+        <ListControls canWrite={canWrite} onToast={onToast} screen={screen} onImported={() => { setPage(1); setReloadKey((k) => k + 1) }} onSearch={(kw) => { setPage(1); setQ(kw) }} />
         <DataTable
           rows={rows}
           onRowOpen={LIST_DETAIL_TARGET[screen.id] ? (id) => goToEntity(LIST_DETAIL_TARGET[screen.id], id) : undefined}
@@ -2463,13 +2464,16 @@ function ListControls({
   canWrite,
   onToast,
   onImported,
+  onSearch,
 }: {
   screen: Screen
   canWrite: boolean
   onToast: (toast: Toast) => void
   onImported?: () => void
+  onSearch?: (q: string) => void
 }) {
   const fileRef = useRef<HTMLInputElement>(null)
+  const [kw, setKw] = useState('')
   const canImport = screen.id === 'project-list' || screen.id === 'project-board' // 导入目前落到项目表
 
   const doImport = async (file: File) => {
@@ -2494,19 +2498,18 @@ function ListControls({
     <div className="list-controls">
       <label className="table-search">
         <Search size={15} />
-        <input placeholder={`搜索${screen.title}`} aria-label={`搜索${screen.title}`} />
+        <input
+          placeholder={`搜索${screen.title}(回车全库检索)`}
+          aria-label={`搜索${screen.title}`}
+          value={kw}
+          onChange={(e) => setKw(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter') onSearch?.(kw.trim()) }}
+        />
       </label>
       <button
         className="secondary-button"
         type="button"
-        onClick={() =>
-          runBackendAction(onToast, '筛选已保存', {
-            action: 'list.filter.save',
-            entity_type: 'screen',
-            entity_label: screen.title,
-            after: { screen_id: screen.id, filter: 'advanced' },
-          })
-        }
+        onClick={() => onSearch?.(kw.trim())}
       >
         <Filter size={16} />
         高级筛选
