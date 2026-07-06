@@ -32,6 +32,9 @@ docker exec -i investplatform-mysql mysql --default-character-set=utf8mb4 \
 # 4d) 服务端 AI 解析任务表(cap_ai_jobs):关掉浏览器/换设备也能恢复解析
 docker exec -i investplatform-mysql mysql --default-character-set=utf8mb4 \
   -uroot -p"$PASS" capitalos < db/patch_ai_jobs.sql
+# 4e) 项目卡片 section 种子:三会 + 日程 demo(既有表补项目3的行,务必 utf8mb4)
+docker exec -i investplatform-mysql mysql --default-character-set=utf8mb4 \
+  -uroot -p"$PASS" capitalos < db/patch_project_sections.sql
 
 # 5) 账户与演示数据(bcrypt 口令 + demo.user;可选第二租户)
 cd backend && . .venv/bin/activate && pip install -r requirements.txt

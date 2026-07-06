@@ -1433,6 +1433,48 @@ def project_valuations(project_id: int, user: AuthedUser = Depends(current_user)
     return {"count": len(rows), "items": rows}
 
 
+@app.get("/api/projects/{project_id}/meetings")
+def project_meetings(project_id: int, user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
+    """三会 section:投委会/董事会/股东会(cap_meetings + 关联行动项计数)。"""
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            _assert_project(cursor, project_id, tid)
+            cursor.execute(
+                """SELECT m.meeting_title, m.meeting_kind, m.scheduled_at, m.decision_result,
+                          m.confirmation_status, m.ai_summary,
+                          (SELECT COUNT(*) FROM cap_meeting_actions a WHERE a.meeting_id=m.meeting_id) AS action_count
+                   FROM cap_meetings m WHERE m.project_id=%s ORDER BY m.scheduled_at DESC""",
+                (project_id,),
+            )
+            rows = cursor.fetchall()
+    finally:
+        connection.close()
+    return {"count": len(rows), "items": rows}
+
+
+@app.get("/api/projects/{project_id}/schedule")
+def project_schedule(project_id: int, user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
+    """日程 section:与本项目关联的日历事件(cap_calendar_events,按 linked_entity 归属)。"""
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            _assert_project(cursor, project_id, tid)
+            cursor.execute(
+                """SELECT event_title, event_kind, starts_at, ends_at, location_text
+                   FROM cap_calendar_events
+                   WHERE linked_entity_type='project' AND linked_entity_id=%s AND tenant_id=%s AND deleted_at IS NULL
+                   ORDER BY starts_at""",
+                (project_id, tid),
+            )
+            rows = cursor.fetchall()
+    finally:
+        connection.close()
+    return {"count": len(rows), "items": rows}
+
+
 @app.get("/api/projects/{project_id}/history")
 def project_history(project_id: int, user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
     """历史:该项目的审计变更记录(cap_audit_logs)。"""

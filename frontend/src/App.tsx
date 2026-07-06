@@ -1851,6 +1851,11 @@ const CF_DIR_CN: Record<string, string> = { inflow: '流入', outflow: '流出' 
 const SETTLE_CN: Record<string, string> = { settled: '已结算', pending: '待结算', failed: '失败' }
 const INV_STATUS_CN: Record<string, string> = { funded: '已出资', committed: '已认缴', exited: '已退出', writeoff: '已减记' }
 const VAL_METHOD_CN: Record<string, string> = { latest_round: '最新一轮', dcf: 'DCF', comparable: '可比公司', cost: '成本法', option: '期权定价' }
+const MEETING_KIND_CN: Record<string, string> = { investment_committee: '投委会', board: '董事会', shareholder: '股东会', portfolio_review: '投后评审', internal_review: '内部评审', other: '其他' }
+const MEETING_RESULT_CN: Record<string, string> = { pending: '待决', approved: '通过', rejected: '否决', conditional: '有条件通过', information_only: '仅通报' }
+const CONFIRM_CN: Record<string, string> = { ai_draft: 'AI 草稿', human_confirmed: '人工确认', archived: '已归档' }
+const EVENT_KIND_CN: Record<string, string> = { project: '项目', fund: '基金', meeting: '会议', workflow: '流程', personal: '个人', risk: '风控', other: '其他' }
+const dtmin = (v: unknown): string => (v ? String(v).replace('T', ' ').slice(0, 16) : '—') // ISO → YYYY-MM-DD HH:MM
 // 各 section → 端点 + 行映射(转中文键给 DataTable)。仅列出接真数据的 section。
 const SECTION_DATA: Record<string, { path: string; map: (r: Record<string, unknown>) => DataRow }> = {
   基金投资情况: {
@@ -1872,6 +1877,14 @@ const SECTION_DATA: Record<string, { path: string; map: (r: Record<string, unkno
   投后数据: {
     path: 'financials',
     map: (r) => ({ 期间: String(r.period_label ?? ''), 营业收入: wan(_n(r.revenue)), 毛利率: r.gross_margin == null ? '—' : `${(Number(r.gross_margin) * 100).toFixed(1)}%`, 净利润: wan(_n(r.net_profit)), 经营现金流: wan(_n(r.operating_cash_flow)), 员工数: r.headcount == null ? '—' : Number(r.headcount) }),
+  },
+  三会: {
+    path: 'meetings',
+    map: (r) => ({ 会议: String(r.meeting_title ?? '—'), 类型: MEETING_KIND_CN[String(r.meeting_kind)] ?? String(r.meeting_kind ?? '—'), 时间: dtmin(r.scheduled_at), 决议: MEETING_RESULT_CN[String(r.decision_result)] ?? String(r.decision_result ?? '—'), 确认状态: CONFIRM_CN[String(r.confirmation_status)] ?? String(r.confirmation_status ?? '—'), 行动项: r.action_count == null ? 0 : Number(r.action_count), 纪要摘要: String(r.ai_summary ?? '—') }),
+  },
+  日程: {
+    path: 'schedule',
+    map: (r) => ({ 事项: String(r.event_title ?? '—'), 类型: EVENT_KIND_CN[String(r.event_kind)] ?? String(r.event_kind ?? '—'), 开始: dtmin(r.starts_at), 结束: dtmin(r.ends_at), 地点: String(r.location_text ?? '—') }),
   },
 }
 const SEAT_CN: Record<string, string> = { director: '董事', observer: '观察员', other: '其他' }
@@ -2406,7 +2419,7 @@ function DetailPage({
           ) : (
             <section className="panel full-span motion-item" data-testid="section-placeholder">
               <PanelTitle icon={FileText} title={section} />
-              <p className="muted-note">「{section}」结构已就位,数据接入在下一批(日程 / 三会 / 协议条款 AI)。</p>
+              <p className="muted-note">「{section}」结构已就位,数据接入在下一批。</p>
             </section>
           )}
         </>
