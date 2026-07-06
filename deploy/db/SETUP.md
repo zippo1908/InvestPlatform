@@ -35,9 +35,12 @@ docker exec -i investplatform-mysql mysql --default-character-set=utf8mb4 \
 # 4e) 项目卡片 section 种子:三会 + 日程 demo(既有表补项目3的行,务必 utf8mb4)
 docker exec -i investplatform-mysql mysql --default-character-set=utf8mb4 \
   -uroot -p"$PASS" capitalos < db/patch_project_sections.sql
-# 4f) 页面反馈/标注表(cap_feedback_annotations):用户留言 → 汇总 → 推 GitHub Issue
+# 4f) 页面反馈/标注表(cap_feedback_annotations)+ feedback.annotate 权限位
 docker exec -i investplatform-mysql mysql --default-character-set=utf8mb4 \
   -uroot -p"$PASS" capitalos < db/patch_feedback.sql
+# 4g) 独立开发者角色(仅 feedback.annotate);账号在 setup_accounts.py 里建。见 docs/DEVELOPER-ACCOUNT.md
+docker exec -i investplatform-mysql mysql --default-character-set=utf8mb4 \
+  -uroot -p"$PASS" capitalos < db/patch_developer_role.sql
 
 # 5) 账户与演示数据(bcrypt 口令 + demo.user;可选第二租户)
 cd backend && . .venv/bin/activate && pip install -r requirements.txt
@@ -70,6 +73,7 @@ cd ../db && python setup_accounts.py --with-tenant2
 | 账号 | 角色 | 用途 |
 |---|---|---|
 | `demo.user` / `alex.gp` | 管理合伙人 | 全量操作(一键演示) |
+| `developer` | 开发者(仅反馈标注) | 只读浏览 + 右下角「反馈」提交/标注;不能业务写。详见 [DEVELOPER-ACCOUNT.md](../../docs/DEVELOPER-ACCOUNT.md) |
 | `nina.invest` | 投资经理 | 可建/改项目,不可建基金 |
 | `casey.audit` | 只读审计 | 全部写操作 403(演示 RBAC) |
 | `omar.fundops` | 基金运营 | 可建基金 |

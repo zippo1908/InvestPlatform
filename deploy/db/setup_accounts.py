@@ -75,6 +75,24 @@ def main() -> None:
                     (demo_uid,),
                 )
 
+            # 2b) developer 账号:只授 developer 角色(仅 feedback.annotate),用于收集页面反馈。
+            #     依赖 patch_developer_role.sql 已建 developer 角色;口令同 demo(默认 demo-login)。
+            cur.execute("SELECT user_id FROM cap_users WHERE login_name='developer'")
+            if cur.fetchone() is None:
+                cur.execute("SELECT org_id FROM cap_users WHERE login_name='demo.user' LIMIT 1")
+                row = cur.fetchone()
+                dev_org = row["org_id"] if row else None
+                cur.execute(
+                    """INSERT INTO cap_users (org_id, employee_no, login_name, display_name, email, password_hash, account_status)
+                       VALUES (%s,'DEV-0001','developer','Developer (Feedback)','developer@capitalos.local',%s,'active')""",
+                    (dev_org, demo_hash),
+                )
+                dev_uid = cur.lastrowid
+                cur.execute(
+                    "INSERT IGNORE INTO cap_user_roles (user_id, role_id) SELECT %s, role_id FROM cap_roles WHERE role_code='developer'",
+                    (dev_uid,),
+                )
+
             # 3) 可选:第二租户 Meridian(演示多租户隔离)
             if with_tenant2:
                 cur.execute("SELECT org_id FROM cap_organizations WHERE org_code='ORG-MER'")
