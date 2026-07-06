@@ -26,6 +26,9 @@ $MYSQL capitalos    < db/patch_auth.sql
 # 4b) 流程编排步骤:给 3 个流程模板种入有序步骤(务必带 utf8mb4,否则中文乱码)
 docker exec -i investplatform-mysql mysql --default-character-set=utf8mb4 \
   -uroot -p"$PASS" capitalos < db/patch_workflow_steps.sql
+# 4c) 项目卡片补全:评论/财务/委派/决策四表 + demo 种子(务必带 utf8mb4)
+docker exec -i investplatform-mysql mysql --default-character-set=utf8mb4 \
+  -uroot -p"$PASS" capitalos < db/patch_project_card.sql
 
 # 5) 账户与演示数据(bcrypt 口令 + demo.user;可选第二租户)
 cd backend && . .venv/bin/activate && pip install -r requirements.txt
@@ -41,6 +44,7 @@ cd ../db && python setup_accounts.py --with-tenant2
 | 3 | `patch_tenancy.sql` | **多租户隔离基石**:23 张业务表加 `tenant_id`+索引,现有数据回填到租户 1(根公司 org=1) | 列已存在会报错,只跑一次 |
 | 4 | `patch_auth.sql` | managing_partner 补 `project.edit`/`risk.manage`/`fund.export` | ✅ INSERT IGNORE |
 | 4b | `patch_workflow_steps.sql` | 3 个流程模板的有序步骤(项目:立项→尽调→投决→归档 等),支撑审批自动流转 | ✅ 按 family 清后重插 |
+| 4c | `patch_project_card.sql` | 项目卡片四表(评论/财务/委派/决策)+ 项目3 demo 种子 | ✅ IF NOT EXISTS + 按 project_id 重插 |
 | 5 | `setup_accounts.py` | 所有用户设 bcrypt 口令(默认 `demo-login`);建 `demo.user`(管理合伙人);`--with-tenant2` 种入 Meridian 第二租户(独立公司树,演示隔离) | ✅ 存在性判断 |
 
 ## 租户模型(隔离怎么生效)
