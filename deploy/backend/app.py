@@ -144,6 +144,18 @@ class UpdateProjectPayload(BaseModel):
     expected_updated_at: str | None = None
 
 
+class CreateCommentPayload(BaseModel):
+    body_text: str = Field(min_length=1, max_length=4000)
+    comment_kind: str = Field(default="comment")  # comment(评论)| qa(小组问答)
+
+    @field_validator("comment_kind")
+    @classmethod
+    def _valid_kind(cls, v: str) -> str:
+        if v not in {"comment", "qa"}:
+            raise ValueError("comment_kind 必须是 comment 或 qa")
+        return v
+
+
 class UpdateFundPayload(BaseModel):
     fund_name: str | None = Field(default=None, min_length=1, max_length=180)
     legal_name: str | None = Field(default=None, max_length=200)
@@ -1257,6 +1269,141 @@ def project_investment_summary(project_id: int, user: AuthedUser = Depends(curre
         },
         "realized": {"realized_total": realized or None, "exit_status": agg.get("exit_status")},
     }
+
+
+def _assert_project(cursor: Any, project_id: int, tid: int) -> dict[str, Any]:
+    cursor.execute(
+        "SELECT project_id, short_name FROM cap_projects WHERE project_id=%s AND tenant_id=%s AND deleted_at IS NULL",
+        (project_id, tid),
+    )
+    row = cursor.fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return row
+
+
+@app.get("/api/projects/{project_id}/financials")
+def project_financials(project_id: int, user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
+    """财务数据 tab:被投企业分期财务(cap_project_financials)。"""
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            _assert_project(cursor, project_id, tid)
+            cursor.execute(
+                """SELECT period_label, revenue, gross_margin, net_profit, operating_cash_flow, headcount
+                   FROM cap_project_financials WHERE project_id=%s AND tenant_id=%s ORDER BY period_label""",
+                (project_id, tid),
+            )
+            rows = cursor.fetchall()
+    finally:
+        connection.close()
+    return {"count": len(rows), "items": rows}
+
+
+@app.get("/api/projects/{project_id}/representatives")
+def project_representatives(project_id: int, user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
+    """委派代表 tab:我方派驻的董事/观察员(cap_project_representatives)。"""
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            _assert_project(cursor, project_id, tid)
+            cursor.execute(
+                """SELECT rep_name, seat_type, appointed_on, rep_status, note
+                   FROM cap_project_representatives WHERE project_id=%s AND tenant_id=%s ORDER BY project_representative_id""",
+                (project_id, tid),
+            )
+            rows = cursor.fetchall()
+    finally:
+        connection.close()
+    return {"count": len(rows), "items": rows}
+
+
+@app.get("/api/projects/{project_id}/decisions")
+def project_decisions(project_id: int, user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
+    """投资决策 tab:投委会/立项决议记录(cap_project_decisions)。"""
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            _assert_project(cursor, project_id, tid)
+            cursor.execute(
+                """SELECT decision_title, decision_type, decision_result, decided_on, resolution_note
+                   FROM cap_project_decisions WHERE project_id=%s AND tenant_id=%s ORDER BY decided_on DESC, project_decision_id DESC""",
+                (project_id, tid),
+            )
+            rows = cursor.fetchall()
+    finally:
+        connection.close()
+    return {"count": len(rows), "items": rows}
+
+
+@app.get("/api/projects/{project_id}/history")
+def project_history(project_id: int, user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
+    """历史:该项目的审计变更记录(cap_audit_logs)。"""
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            _assert_project(cursor, project_id, tid)
+            cursor.execute(
+                """SELECT a.action_code, a.entity_label, a.risk_level, a.occurred_at, u.display_name AS actor
+                   FROM cap_audit_logs a LEFT JOIN cap_users u ON u.user_id=a.actor_user_id
+                   WHERE a.entity_type='project' AND a.entity_id=%s AND a.tenant_id=%s
+                   ORDER BY a.audit_log_id DESC LIMIT 50""",
+                (project_id, tid),
+            )
+            rows = cursor.fetchall()
+    finally:
+        connection.close()
+    return {"count": len(rows), "items": rows}
+
+
+@app.get("/api/projects/{project_id}/comments")
+def project_comments(project_id: int, user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
+    """评论 / 小组问答(项目卡片右侧协作面板)。"""
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            _assert_project(cursor, project_id, tid)
+            cursor.execute(
+                """SELECT c.project_comment_id AS id, c.comment_kind, c.body_text, c.created_at,
+                          u.display_name AS author
+                   FROM cap_project_comments c LEFT JOIN cap_users u ON u.user_id=c.author_user_id
+                   WHERE c.project_id=%s AND c.tenant_id=%s AND c.deleted_at IS NULL
+                   ORDER BY c.project_comment_id DESC LIMIT 200""",
+                (project_id, tid),
+            )
+            rows = cursor.fetchall()
+    finally:
+        connection.close()
+    return {"count": len(rows), "items": rows}
+
+
+@app.post("/api/projects/{project_id}/comments")
+def add_project_comment(project_id: int, payload: CreateCommentPayload, user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
+    """发一条评论/问答(登录即可发,租户内)。"""
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            _assert_project(cursor, project_id, tid)
+            cursor.execute(
+                """INSERT INTO cap_project_comments (project_id, comment_kind, body_text, author_user_id, tenant_id)
+                   VALUES (%s, %s, %s, %s, %s)""",
+                (project_id, payload.comment_kind, payload.body_text, user.user_id, tid),
+            )
+            comment_id = int(cursor.lastrowid)
+            audit_id = write_audit(
+                cursor, user.user_id, "project.comment.add", "project", project_id,
+                payload.body_text[:60], after={"comment_kind": payload.comment_kind},
+            )
+        connection.commit()
+    finally:
+        connection.close()
+    return {"ok": True, "comment_id": comment_id, "audit_id": audit_id}
 
 
 @app.patch("/api/projects/{project_id}")

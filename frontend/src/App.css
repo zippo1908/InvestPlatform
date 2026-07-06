@@ -1927,3 +1927,48 @@ tbody tr:hover {
   border: 1px solid var(--line);
   border-radius: 8px;
 }
+
+/* 项目卡片:历史列表 + 评论/协作面板 */
+.card-footer { margin-top: 16px; border-top: 1px solid var(--line); padding-top: 12px; }
+.history-list {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 300px;
+  overflow: auto;
+}
+.history-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  font-size: 12.5px;
+  flex-wrap: wrap;
+}
+.history-action { font-weight: 700; color: var(--accent); }
+.history-meta { color: var(--muted); }
+.history-label { color: var(--ink); }
+
+.comment-compose { display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px; }
+.comment-compose textarea {
+  width: 100%;
+  resize: vertical;
+  font: inherit;
+  padding: 9px 11px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+.comment-list { display: flex; flex-direction: column; gap: 10px; max-height: 460px; overflow: auto; }
+.comment-item {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: #f8fafc;
+}
+.comment-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin-bottom: 4px; }
+.comment-head strong { color: var(--ink); font-size: 13px; }
+.comment-head span { color: var(--muted); font-size: 11.5px; }
+.comment-item p { color: var(--ink); font-size: 13px; line-height: 1.55; white-space: pre-wrap; margin: 0; }

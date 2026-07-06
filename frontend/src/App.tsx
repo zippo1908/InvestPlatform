@@ -1752,6 +1752,44 @@ const PROJECT_BASIC_GROUPS: Array<[string, string[]]> = [
 ]
 const PROJECT_SUBTABS = ['基本情况', '投资汇总', '财务数据', '委派代表', '投资决策'] as const
 type ProjectSubtab = (typeof PROJECT_SUBTABS)[number]
+const SEAT_CN: Record<string, string> = { director: '董事', observer: '观察员', other: '其他' }
+const REP_STATUS_CN: Record<string, string> = { active: '在任', resigned: '已卸任' }
+const DECISION_TYPE_CN: Record<string, string> = { ic: '投委会', pre_ic: '立项', follow_on: '追加', exit: '退出', other: '其他' }
+const DECISION_RESULT_CN: Record<string, string> = { approved: '通过', rejected: '否决', deferred: '暂缓' }
+// 数据 tab → 端点路径 + 行映射(转成中文键给 DataTable 渲染)。
+const TAB_DATA: Record<string, { path: string; map: (r: Record<string, unknown>) => DataRow }> = {
+  财务数据: {
+    path: 'financials',
+    map: (r) => ({
+      期间: String(r.period_label ?? ''),
+      营业收入: r.revenue == null ? '—' : `${(Number(r.revenue) / 1e4).toLocaleString('zh-CN', { maximumFractionDigits: 1 })} 万`,
+      毛利率: r.gross_margin == null ? '—' : `${(Number(r.gross_margin) * 100).toFixed(1)}%`,
+      净利润: r.net_profit == null ? '—' : `${(Number(r.net_profit) / 1e4).toLocaleString('zh-CN', { maximumFractionDigits: 1 })} 万`,
+      经营现金流: r.operating_cash_flow == null ? '—' : `${(Number(r.operating_cash_flow) / 1e4).toLocaleString('zh-CN', { maximumFractionDigits: 1 })} 万`,
+      员工数: r.headcount == null ? '—' : Number(r.headcount),
+    }),
+  },
+  委派代表: {
+    path: 'representatives',
+    map: (r) => ({
+      姓名: String(r.rep_name ?? ''),
+      席位: SEAT_CN[String(r.seat_type)] ?? String(r.seat_type ?? ''),
+      委派日期: r.appointed_on ? String(r.appointed_on) : '—',
+      状态: REP_STATUS_CN[String(r.rep_status)] ?? String(r.rep_status ?? ''),
+      备注: String(r.note ?? '—'),
+    }),
+  },
+  投资决策: {
+    path: 'decisions',
+    map: (r) => ({
+      决议: String(r.decision_title ?? ''),
+      类型: DECISION_TYPE_CN[String(r.decision_type)] ?? String(r.decision_type ?? ''),
+      结果: DECISION_RESULT_CN[String(r.decision_result)] ?? String(r.decision_result ?? ''),
+      决议日期: r.decided_on ? String(r.decided_on) : '—',
+      说明: String(r.resolution_note ?? '—'),
+    }),
+  },
+}
 type InvestSummary = {
   has_position: boolean
   performance: { DPI: number | null; MOIC: number | null; IRR: number | null }
@@ -1762,6 +1800,58 @@ type InvestSummary = {
 const wan = (v: number | null | undefined): string => (v == null ? '—' : `${(v / 1e4).toLocaleString('zh-CN', { maximumFractionDigits: 1 })} 万`)
 const pct = (v: number | null | undefined): string => (v == null ? '—' : `${(v * 100).toFixed(2)}%`)
 const num = (v: number | null | undefined): string => (v == null ? '—' : String(v))
+
+// 项目卡片右侧协作面板:评论 / 小组问答(真写 cap_project_comments)。
+function ProjectCommentPanel({ projectId, canWrite, onToast }: { projectId: number | null; canWrite: boolean; onToast: (t: Toast) => void }) {
+  const [tab, setTab] = useState<'comment' | 'qa'>('comment')
+  const [items, setItems] = useState<Array<Record<string, unknown>>>([])
+  const [input, setInput] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [reloadKey, setReloadKey] = useState(0)
+  useEffect(() => {
+    if (projectId == null) { setItems([]); return }
+    let ignore = false
+    apiGet<{ items: Array<Record<string, unknown>> }>(`/api/projects/${projectId}/comments`)
+      .then((r) => { if (!ignore) setItems(r.items ?? []) })
+      .catch(() => { if (!ignore) setItems([]) })
+    return () => { ignore = true }
+  }, [projectId, reloadKey])
+  const shown = items.filter((c) => String(c.comment_kind) === tab)
+  const send = async () => {
+    if (!input.trim() || projectId == null) return
+    setBusy(true)
+    try {
+      await apiPost(`/api/projects/${projectId}/comments`, { body_text: input.trim(), comment_kind: tab })
+      setInput(''); setReloadKey((k) => k + 1)
+      onToast({ title: tab === 'qa' ? '已提问' : '已评论', detail: '已记录到项目协作与审计' })
+    } catch (error) {
+      onToast({ title: '发送失败', detail: error instanceof Error ? error.message : 'API 调用失败' })
+    } finally { setBusy(false) }
+  }
+  return (
+    <section className="panel one-third motion-item">
+      <div className="subtab-bar">
+        <button type="button" className={classNames('subtab', tab === 'comment' && 'is-active')} onClick={() => setTab('comment')}>评论</button>
+        <button type="button" className={classNames('subtab', tab === 'qa' && 'is-active')} onClick={() => setTab('qa')}>小组问答</button>
+      </div>
+      <div className="comment-compose">
+        <textarea value={input} placeholder={tab === 'qa' ? '向小组提个问题…' : '写下你的评论…'} readOnly={!canWrite}
+          onChange={(e) => setInput(e.target.value)} rows={3} data-testid="comment-input" />
+        <button type="button" className="primary-button" disabled={!canWrite || busy || !input.trim() || projectId == null} data-testid="comment-send" onClick={send}>
+          <Bot size={15} /> {busy ? '发送中…' : (tab === 'qa' ? '提问' : '评论')}
+        </button>
+      </div>
+      <div className="comment-list" data-testid="comment-list">
+        {shown.length === 0 ? <p className="muted-note">暂无{tab === 'qa' ? '问答' : '评论'}</p> : shown.map((c) => (
+          <div className="comment-item" key={String(c.id)}>
+            <div className="comment-head"><strong>{String(c.author ?? '匿名')}</strong><span>{c.created_at ? String(c.created_at).replace('T', ' ').slice(0, 16) : ''}</span></div>
+            <p>{String(c.body_text ?? '')}</p>
+          </div>
+        ))}
+      </div>
+    </section>
+  )
+}
 
 function DetailPage({
   screen,
@@ -1796,6 +1886,11 @@ function DetailPage({
   const [summary, setSummary] = useState<InvestSummary | null>(null)
   const [summaryLoading, setSummaryLoading] = useState(false)
 
+  const [tabRows, setTabRows] = useState<DataRow[]>([])
+  const [tabLoading, setTabLoading] = useState(false)
+  const [history, setHistory] = useState<Array<Record<string, unknown>>>([])
+  const [showHistory, setShowHistory] = useState(false)
+
   // 投资汇总:切到该 tab 时按需拉取聚合(cap_investment_positions)。
   useEffect(() => {
     if (kind !== 'project' || subtab !== '投资汇总' || selectedId == null) return
@@ -1807,6 +1902,30 @@ function DetailPage({
       .finally(() => { if (!ignore) setSummaryLoading(false) })
     return () => { ignore = true }
   }, [kind, subtab, selectedId, listPath])
+
+  // 财务数据 / 委派代表 / 投资决策:切到该 tab 时拉取并映射成中文表格行。
+  useEffect(() => {
+    if (kind !== 'project' || selectedId == null) return
+    const spec = TAB_DATA[subtab]
+    if (!spec) { setTabRows([]); return }
+    let ignore = false
+    setTabLoading(true); setTabRows([])
+    apiGet<{ items: Array<Record<string, unknown>> }>(`${listPath}/${selectedId}/${spec.path}`)
+      .then((r) => { if (!ignore) setTabRows((r.items ?? []).map(spec.map)) })
+      .catch(() => { if (!ignore) setTabRows([]) })
+      .finally(() => { if (!ignore) setTabLoading(false) })
+    return () => { ignore = true }
+  }, [kind, subtab, selectedId, listPath])
+
+  // 历史:展开时拉审计。
+  useEffect(() => {
+    if (kind !== 'project' || !showHistory || selectedId == null) return
+    let ignore = false
+    apiGet<{ items: Array<Record<string, unknown>> }>(`${listPath}/${selectedId}/history`)
+      .then((r) => { if (!ignore) setHistory(r.items ?? []) })
+      .catch(() => { if (!ignore) setHistory([]) })
+    return () => { ignore = true }
+  }, [kind, showHistory, selectedId, listPath])
 
   // 路由带 ?id= 时预选该实体(从列表行「打开」进来)。
   useEffect(() => {
@@ -1996,7 +2115,7 @@ function DetailPage({
           </section>
 
           {/* 二级 tabs */}
-          <section className="panel full-span motion-item">
+          <section className="panel two-thirds motion-item">
             <div className="subtab-bar" data-testid="project-subtabs">
               {PROJECT_SUBTABS.map((t) => (
                 <button key={t} type="button" className={classNames('subtab', subtab === t && 'is-active')} onClick={() => setSubtab(t)}>{t}</button>
@@ -2075,10 +2194,38 @@ function DetailPage({
               </div>
             )}
 
-            {subtab !== '基本情况' && subtab !== '投资汇总' && (
-              <p className="muted-note" data-testid="subtab-placeholder">「{subtab}」结构已就位,数据接入在下一阶段。</p>
+            {TAB_DATA[subtab] && (
+              <div data-testid="subtab-data">
+                {tabLoading ? (
+                  <p className="muted-note">加载中…</p>
+                ) : tabRows.length === 0 ? (
+                  <p className="muted-note">该项目暂无{subtab}记录。</p>
+                ) : (
+                  <DataTable rows={tabRows} compact />
+                )}
+              </div>
+            )}
+
+            {/* 底部操作:历史(下载 WORD/PDF 在下一批接入) */}
+            <div className="button-row card-footer">
+              <button type="button" className="secondary-button" data-testid="detail-history" onClick={() => setShowHistory((v) => !v)}>
+                <Clock size={16} /> {showHistory ? '收起历史' : '历史'}
+              </button>
+            </div>
+            {showHistory && (
+              <div className="history-list" data-testid="history-list">
+                {history.length === 0 ? <p className="muted-note">暂无历史记录</p> : history.map((h, i) => (
+                  <div className="history-row" key={i}>
+                    <span className="history-action">{String(h.action_code ?? '')}</span>
+                    <span className="history-meta">{String(h.actor ?? '系统')} · {h.occurred_at ? String(h.occurred_at).replace('T', ' ').slice(0, 19) : ''}</span>
+                    {h.entity_label ? <span className="history-label">{String(h.entity_label)}</span> : null}
+                  </div>
+                ))}
+              </div>
             )}
           </section>
+
+          <ProjectCommentPanel projectId={selectedId} canWrite={canWrite} onToast={onToast} />
         </>
       ) : (
         <>
