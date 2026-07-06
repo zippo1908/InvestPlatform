@@ -17,7 +17,6 @@ import {
   Download,
   Eye,
   FileText,
-  Filter,
   Folder,
   GitBranch,
   Home,
@@ -27,7 +26,6 @@ import {
   LogOut,
   Menu,
   MessageSquare,
-  MoreHorizontal,
   Plus,
   Search,
   Send,
@@ -70,7 +68,7 @@ import type { DataRow, Project, Screen } from './data'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
 import html2canvas from 'html2canvas'
-import { API_BASE, apiDelete, apiDownload, apiGet, apiPatch, apiPost, auditDetail, getPerms, getRoles, getToken, setPerms, setRoles, streamPost, setToken } from './api'
+import { API_BASE, apiDelete, apiDownload, apiGet, apiPatch, apiPost, auditDetail, getPerms, getRoles, getToken, getUserName, setPerms, setRoles, setUserName, streamPost, setToken } from './api'
 
 marked.setOptions({ breaks: true, gfm: true })
 
@@ -651,6 +649,7 @@ function App() {
           setRoles(loginRoles)
           sessionStorage.setItem('capitalos-session', 'active')
           sessionStorage.setItem('capitalos-user-id', String((result.user as { id?: number } | undefined)?.id ?? 1))
+          setUserName(((result.user as { display_name?: string } | undefined)?.display_name) ?? null)
           setAuthed(true)
           showToast({ title: '登录成功', detail: auditDetail(result), action: 'auth.login', entity: 'user', result })
           goTo('workbench')
@@ -993,21 +992,7 @@ function PageHeader({
         <p>{current.description}</p>
       </div>
       <div className="header-actions">
-        <button
-          type="button"
-          className="secondary-button"
-          onClick={() =>
-            runBackendAction(onToast, '筛选已应用', {
-              action: 'screen.filter.apply',
-              entity_type: 'screen',
-              entity_label: current.title,
-              after: { screen_id: current.id, filter: 'advanced' },
-            })
-          }
-        >
-          <Filter size={16} />
-          高级筛选
-        </button>
+        {/* 「高级筛选」原为只发审计不过滤的占位钮 → 移除(台账已有服务端搜索 q + 表内搜索)。 */}
         {/* 「显示列」已下沉到台账表格工具条(可勾选列 + localStorage 持久化),此处不再放解耦占位钮。 */}
         {/* 文档/AI 屏的顶部通用主操作只会建占位记录,易与面板里真实入口混淆 → 隐藏。 */}
         {current.kind !== 'documents' && current.kind !== 'ai' && (
@@ -1282,6 +1267,7 @@ function AiPage({
   const [aiError, setAiError] = useState<string | null>(null)
   const [editing, setEditing] = useState(false)
   const [savedAt, setSavedAt] = useState<string | null>(null)
+  const [history, setHistory] = useState<Array<Record<string, unknown>>>([]) // 真实解析历史(cap_ai_jobs)
   const jobIdRef = useRef<number | null>(null)          // 当前解析任务 id(服务端)
   const streamRef = useRef<AbortController | null>(null) // 当前 SSE 尾随连接(切屏/清空时中断)
 
@@ -1304,6 +1290,10 @@ function AiPage({
     restoredRef.current = true
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [draftKey])
+  // 解析历史:挂载 + 每次任务忙闲切换(=有任务完成)后刷新真实记录。
+  useEffect(() => {
+    apiGet<{ items: Array<Record<string, unknown>> }>('/api/ai/jobs').then((r) => setHistory(r.items ?? [])).catch(() => setHistory([]))
+  }, [aiBusy])
   useEffect(() => {
     if (!restoredRef.current) return
     if (!text && !instruction && !answer) return // 全空不主动写/删,清空由按钮负责
@@ -1558,13 +1548,19 @@ function AiPage({
 
       <section className="panel motion-item">
         <PanelTitle icon={FileText} title="解析历史" />
-        <TaskList
-          rows={[
-            { 流程名称: 'BP 解析', 类别: '项目', 当前节点: '人工确认', 关联对象: '矩阵医疗', 到期: '2026-07-02', 状态: '待确认' },
-            { 流程名称: '协议条款抽取', 类别: '法务', 当前节点: '已入库', 关联对象: '北辰储能', 到期: '2026-07-01', 状态: '已完成' },
-            { 流程名称: '会议摘要', 类别: '投决', 当前节点: '解析失败', 关联对象: '启明细胞', 到期: '2026-07-01', 状态: '失败' },
-          ]}
-        />
+        {history.length === 0 ? (
+          <p className="muted-note">暂无解析记录。运行一次分析后会在这里留痕(真实任务)。</p>
+        ) : (
+          <DataTable
+            compact
+            rows={history.map((j) => ({
+              类型: j.job_kind === 'meeting' ? '纪要解析' : '材料分析',
+              摘要: (String(j.input_preview ?? '').slice(0, 22) || '—'),
+              状态: j.status === 'done' ? '已完成' : j.status === 'error' ? '失败' : '进行中',
+              时间: j.updated_at ? String(j.updated_at).replace('T', ' ').slice(0, 16) : '',
+            }))}
+          />
+        )}
       </section>
 
       {workspace && getRoles().some((r) => r === 'system_admin' || r === 'managing_partner') && <AiConfigPanel onToast={onToast} />}
@@ -1662,7 +1658,15 @@ function BoardPage({
       </div>
       <div className="kanban-board" data-testid="kanban-board">
         {stageNames.map((stage) => {
-          const rows = boardProjects.filter((project) => project.stage === stage)
+          // 视图真过滤:全部 / 我的负责(owner=当前用户)/ 风险优先(高风险)。
+          const rows = boardProjects.filter((project) =>
+            project.stage === stage &&
+            (boardView === 'all'
+              ? true
+              : boardView === 'mine'
+                ? String(project.owner ?? '').trim() === getUserName().trim()
+                : String(project.risk ?? '') === '高'),
+          )
           return (
             <section className="kanban-column" key={stage} data-testid={`project-stage-${stage}`}>
               <header>
@@ -3353,6 +3357,8 @@ function AdminPage({
   const { rows, source } = useBackendRows(screen.id, fallbackRows)
   const orgs = ['总经理室', '投资一部', '医疗组', '基金运营', '风控法务', 'IR', '系统管理']
   const [activeOrg, setActiveOrg] = useState(orgs[0])
+  const [audit, setAudit] = useState<Array<Record<string, unknown>>>([]) // 真实审计(cap_audit_logs)
+  useEffect(() => { apiGet<{ items: Array<Record<string, unknown>> }>('/api/audit/recent').then((r) => setAudit(r.items ?? [])).catch(() => setAudit([])) }, [])
 
   return (
     <div className="page-grid">
@@ -3423,14 +3429,20 @@ function AdminPage({
         </div>
       </section>
       <section className="panel full-span motion-item">
-        <PanelTitle icon={Clock} title="审计日志" />
-        <DataTable
-          rows={[
-            { 操作人: '系统管理员', 操作: '调整字段权限', 对象: screen.title, 结果: '成功', 时间: '2026-07-02 10:20' },
-            { 操作人: '审计访客', 操作: '查看脱敏数据', 对象: '基金列表', 结果: '成功', 时间: '2026-07-02 09:52' },
-            { 操作人: '基金运营', 操作: '导出财报', 对象: '成长一期', 结果: '等待审批', 时间: '2026-07-01 18:04' },
-          ]}
-        />
+        <PanelTitle icon={Clock} title="审计日志(实时)" />
+        {audit.length === 0 ? (
+          <p className="muted-note">暂无审计记录。</p>
+        ) : (
+          <DataTable
+            rows={audit.map((a) => ({
+              操作人: String(a.actor ?? '系统'),
+              操作: String(a.action_code ?? ''),
+              对象: String(a.entity_label ?? a.entity_type ?? ''),
+              风险: a.risk_level === 'high' ? '高' : a.risk_level === 'medium' ? '中' : '低',
+              时间: a.occurred_at ? String(a.occurred_at).replace('T', ' ').slice(0, 19) : '',
+            }))}
+          />
+        )}
       </section>
     </div>
   )
@@ -3714,8 +3726,8 @@ function ListControls({
         type="button"
         onClick={() => onSearch?.(kw.trim())}
       >
-        <Filter size={16} />
-        高级筛选
+        <Search size={16} />
+        搜索
       </button>
       <input
         ref={fileRef}
@@ -3753,22 +3765,7 @@ function ListControls({
         <Download size={16} />
         导出 CSV
       </button>
-      <button
-        className="secondary-button"
-        type="button"
-        disabled={!canWrite}
-        onClick={() =>
-          runBackendAction(onToast, '批量操作已提交', {
-            action: 'list.batch_operation.submit',
-            entity_type: screen.id,
-            entity_label: screen.title,
-            after: { selected_scope: 'current_filter', operation: 'batch_update_status' },
-          })
-        }
-      >
-        <MoreHorizontal size={16} />
-        批量操作
-      </button>
+      {/* 「批量操作」原为只发审计不干实事的占位钮 → 移除(台账勾选行后有真实「批量删除」)。 */}
     </div>
   )
 }

@@ -45,6 +45,16 @@ export function setRoles(roles: string[] | null): void {
   if (roles) localStorage.setItem(ROLES_KEY, JSON.stringify(roles))
   else localStorage.removeItem(ROLES_KEY)
 }
+
+// 当前登录用户显示名(看板「我的负责」等按 owner 过滤用)
+const NAME_KEY = 'capitalos-user-name'
+export function setUserName(name: string | null): void {
+  if (name) localStorage.setItem(NAME_KEY, name)
+  else localStorage.removeItem(NAME_KEY)
+}
+export function getUserName(): string {
+  return localStorage.getItem(NAME_KEY) || ''
+}
 export function getRoles(): string[] {
   try {
     return JSON.parse(localStorage.getItem(ROLES_KEY) || '[]')

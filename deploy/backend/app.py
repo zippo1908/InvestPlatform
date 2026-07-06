@@ -3556,6 +3556,24 @@ def create_ai_job(payload: AiJobPayload, user: AuthedUser = Depends(current_user
     return {"ok": True, "job_id": job_id, "status": "running"}
 
 
+@app.get("/api/ai/jobs")
+def list_ai_jobs(user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
+    """本人最近的解析任务(供 AI 屏「解析历史」展示真实记录)。"""
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """SELECT ai_job_id AS id, screen_id, job_kind, status, model, input_preview, updated_at
+                   FROM cap_ai_jobs WHERE owner_user_id=%s AND tenant_id=%s ORDER BY ai_job_id DESC LIMIT 20""",
+                (user.user_id, tid),
+            )
+            rows = cursor.fetchall()
+    finally:
+        connection.close()
+    return {"count": len(rows), "items": rows}
+
+
 @app.get("/api/ai/jobs/latest")
 def latest_ai_job(screen_id: str, user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
     """本人在该屏最近一次解析任务(用于关闭浏览器/换设备后恢复)。"""
