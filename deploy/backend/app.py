@@ -1109,7 +1109,11 @@ def list_projects(user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
                 """
                 SELECT p.project_id AS id, p.short_name AS name, p.stage_label AS stage,
                        p.industry_group AS sector, p.city, u.display_name AS owner,
-                       p.opportunity_status AS status, p.summary, p.updated_at
+                       p.opportunity_status AS status, p.summary, p.updated_at,
+                       (SELECT MAX(CASE ri.severity WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END)
+                          FROM cap_risk_incidents ri
+                         WHERE ri.project_id=p.project_id AND ri.tenant_id=p.tenant_id
+                           AND ri.deleted_at IS NULL AND ri.incident_status IN ('open','mitigating')) AS risk_level
                 FROM cap_projects p
                 LEFT JOIN cap_users u ON u.user_id=p.owner_user_id
                 WHERE p.deleted_at IS NULL AND p.tenant_id=%s

@@ -63,7 +63,6 @@ import {
   screens,
   stageNames,
   users,
-  workflows,
 } from './data'
 import type { DataRow, Project, Screen } from './data'
 import { marked } from 'marked'
@@ -1079,6 +1078,11 @@ function PageRenderer({
 function DashboardPage({ onToast }: { onToast: (toast: Toast) => void }) {
   const stageCounts = pipelineDistribution
   const maxCount = Math.max(1, ...stageCounts.map((s) => s.count))
+  // 今日待办 + AI 解析队列:接真数据(cap_workflow_tasks / cap_ai_jobs)。
+  const [todo, setTodo] = useState<Array<Record<string, unknown>>>([])
+  const [aiQueue, setAiQueue] = useState<Array<Record<string, unknown>>>([])
+  useEffect(() => { apiGet<{ items: Array<Record<string, unknown>> }>('/api/workflow/tasks').then((r) => setTodo(r.items ?? [])).catch(() => setTodo([])) }, [])
+  useEffect(() => { apiGet<{ items: Array<Record<string, unknown>> }>('/api/ai/jobs').then((r) => setAiQueue(r.items ?? [])).catch(() => setAiQueue([])) }, [])
   // 柱状图入场:柱子从底部 scaleY 0→1 依次长出(GSAP)。
   const chartRef = useRef<HTMLDivElement>(null)
   useLayoutEffect(() => {
@@ -1142,7 +1146,16 @@ function DashboardPage({ onToast }: { onToast: (toast: Toast) => void }) {
             })
           }
         />
-        <TaskList rows={workflows} />
+        {todo.length === 0 ? (
+          <p className="muted-note">暂无待办审批</p>
+        ) : (
+          <TaskList rows={todo.slice(0, 6).map((t) => ({
+            流程名称: String(t.task_name ?? ''),
+            关联对象: String(t.instance_title ?? ''),
+            当前节点: WF_STATUS_CN[String(t.instance_status)] ?? String(t.instance_status ?? ''),
+            状态: WF_STATUS_CN[String(t.task_status)] ?? String(t.task_status ?? ''),
+          }))} />
+        )}
       </section>
 
       <section className="panel motion-item">
@@ -1194,10 +1207,12 @@ function DashboardPage({ onToast }: { onToast: (toast: Toast) => void }) {
           }
         />
         <div className="ai-queue">
-          {['北辰储能 TS 条款抽取', '启明细胞会议纪要摘要', '成长一期披露包要点'].map((item, index) => (
-            <div className="queue-item" key={item}>
-              <span>{item}</span>
-              <StatusBadge value={index === 0 ? '待人工确认' : index === 1 ? '解析中' : '已完成'} />
+          {aiQueue.length === 0 ? (
+            <p className="muted-note">暂无解析任务</p>
+          ) : aiQueue.slice(0, 6).map((j) => (
+            <div className="queue-item" key={String(j.id)}>
+              <span>{(j.job_kind === 'meeting' ? '纪要 · ' : '材料 · ') + (String(j.input_preview ?? '').slice(0, 18) || '解析任务')}</span>
+              <StatusBadge value={j.status === 'done' ? '已完成' : j.status === 'error' ? '失败' : '解析中'} />
             </div>
           ))}
         </div>
@@ -1633,7 +1648,8 @@ function BoardPage({
             status: String(item.status ?? 'sourced'),
             fund: '后端项目池',
             amount: 0,
-            risk: '中',
+            // 真实风险:由项目未结风险事件的最高严重度派生(无未结事件=低)。
+            risk: item.risk_level === 3 ? '高' : item.risk_level === 2 ? '中' : '低',
             nextStep: String(item.summary ?? '等待下一步动作'),
           })),
         )
