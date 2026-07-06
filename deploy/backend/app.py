@@ -2435,6 +2435,68 @@ def export_project_pdf(project_id: int, user: AuthedUser = Depends(current_user)
     )
 
 
+@app.post("/api/projects/{project_id}/ai-memo")
+def create_project_memo(project_id: int, user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
+    """亮点功能:基于项目全量真实数据(卡片/投资汇总/财务/决策/委派),用大模型一键生成
+    结构化投资备忘录(IC Memo)。走 cap_ai_jobs + SSE tail,前端流式渲染。"""
+    if not llm.is_configured():
+        raise HTTPException(status_code=503, detail="AI 未配置:请在 deploy/.env 配置 LLM_*")
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            proj, agg, fins, reps, decs = _gather_project_card(cursor, project_id, tid)
+    finally:
+        connection.close()
+
+    paid = float(agg.get("paid_total") or 0)
+    val_ = float(agg.get("latest_valuation") or 0)
+    realized = float(agg.get("realized_total") or 0)
+    moic = f"{((val_ + realized) / paid):.2f}" if paid > 0 else "—"
+    own = "—" if agg.get("ownership_ratio") is None else f"{float(agg['ownership_ratio']) * 100:.2f}%"
+    fin_txt = "; ".join(
+        f"{f['period_label']} 营收{_wan(f['revenue'])}、毛利率{'' if f['gross_margin'] is None else str(round(float(f['gross_margin']) * 100, 1)) + '%'}、净利{_wan(f['net_profit'])}"
+        for f in fins
+    ) or "(无)"
+    dec_txt = "; ".join(f"{d['decision_title']}→{_dec_res_cn(d['decision_result'])}({d['decided_on']})" for d in decs) or "(无)"
+    rep_txt = "; ".join(f"{r['rep_name']}/{_seat_cn(r['seat_type'])}" for r in reps) or "(无)"
+    material = (
+        f"【企业】{proj['short_name']}（{proj.get('legal_name') or ''}）\n"
+        f"【阶段/行业/城市】{proj.get('stage_label')} / {proj.get('industry_group')} / {proj.get('city')}\n"
+        f"【项目简介】{proj.get('summary') or '(无)'}\n"
+        f"【项目亮点】{proj.get('highlight_note') or '(无)'}\n"
+        f"【主要产品】{proj.get('product_note') or '(无)'}\n"
+        f"【投资逻辑】{proj.get('thesis') or '(无)'}\n"
+        f"【投资汇总】MOIC {moic}；累计协议 {_wan(agg.get('agreement_total'))}；累计打款 {_wan(agg.get('paid_total'))}；"
+        f"最新投后估值 {_wan(agg.get('latest_valuation'))}；持股 {own}；轮次 {agg.get('round_label') or '—'}\n"
+        f"【财务】{fin_txt}\n"
+        f"【投资决策】{dec_txt}\n"
+        f"【委派代表】{rep_txt}\n"
+    )
+    instruction = (
+        "你是投资委员会秘书。基于以下项目全量信息,生成一份专业的投资备忘录(IC Memo),中文 Markdown。"
+        "严格使用这些小标题:## 一、项目概述 ## 二、投资亮点 ## 三、财务与业绩 ## 四、估值与投资条款 "
+        "## 五、主要风险与关注点 ## 六、投资建议与后续动作。措辞专业、可直接进投委会材料;"
+        "只基于所给数据,不要编造未提供的数字。"
+    )
+    messages = [{"role": "system", "content": instruction}, {"role": "user", "content": material}]
+
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """INSERT INTO cap_ai_jobs (screen_id, job_kind, instruction, input_preview, status, owner_user_id, tenant_id)
+                   VALUES ('project-memo', 'memo', %s, %s, 'running', %s, %s)""",
+                (instruction[:2000], f"投资备忘录 · {proj['short_name']}", user.user_id, tid),
+            )
+            job_id = int(cursor.lastrowid)
+        connection.commit()
+    finally:
+        connection.close()
+    threading.Thread(target=_run_ai_job, args=(job_id, tid, messages), daemon=True).start()
+    return {"ok": True, "job_id": job_id}
+
+
 @app.patch("/api/projects/{project_id}")
 def update_project(
     project_id: int,

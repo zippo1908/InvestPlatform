@@ -2110,7 +2110,7 @@ const PROJECT_BASIC_GROUPS: Array<[string, string[]]> = [
   ['基础信息', ['short_name', 'legal_name', 'industry_group', 'city', 'registered_location', 'registry_code_mask', 'source_channel']],
   ['项目描述', ['summary', 'highlight_note', 'product_note', 'thesis']],
 ]
-const PROJECT_SUBTABS = ['基本情况', '投资汇总', '财务数据', '委派代表', '投资决策'] as const
+const PROJECT_SUBTABS = ['基本情况', '投资汇总', '财务数据', '委派代表', '投资决策', 'AI 备忘录'] as const
 type ProjectSubtab = (typeof PROJECT_SUBTABS)[number]
 // 顶部 section 导航(对照反馈截图那一行)。概况=卡片主视图;其余为各专题 section。
 const PROJECT_SECTIONS = ['概况', '日程', '基金投资情况', '权益变动', '三会', '现金流', '估值', '投后数据', '协议条款(AI)'] as const
@@ -2257,6 +2257,51 @@ type InvestSummary = {
 const wan = (v: number | null | undefined): string => (v == null ? '—' : `${(v / 1e4).toLocaleString('zh-CN', { maximumFractionDigits: 1 })} 万`)
 const pct = (v: number | null | undefined): string => (v == null ? '—' : `${(v * 100).toFixed(2)}%`)
 const num = (v: number | null | undefined): string => (v == null ? '—' : String(v))
+
+// 亮点:AI 一键生成投资备忘录(IC Memo)—— 基于项目全量真实数据,流式渲染 Markdown。
+function ProjectMemoPanel({ projectId, canWrite, onToast }: { projectId: number | null; canWrite: boolean; onToast: (t: Toast) => void }) {
+  const [busy, setBusy] = useState(false)
+  const [memo, setMemo] = useState('')
+  const [err, setErr] = useState<string | null>(null)
+  const acRef = useRef<AbortController | null>(null)
+  useEffect(() => () => acRef.current?.abort(), [])
+  const generate = async () => {
+    if (projectId == null) return
+    setBusy(true); setErr(null); setMemo('')
+    try {
+      const r = await apiPost<{ job_id: number }>(`/api/projects/${projectId}/ai-memo`, {})
+      acRef.current?.abort()
+      const ac = new AbortController(); acRef.current = ac
+      let acc = ''
+      await streamPost(`/api/ai/jobs/${r.job_id}/stream`, {}, (delta) => { acc += delta; setMemo(acc) }, ac.signal)
+    } catch (e) {
+      if (!acRef.current?.signal.aborted) setErr(e instanceof Error ? e.message.replace(/^\{"detail":"?|"?\}$/g, '') : 'AI 调用失败')
+    } finally { setBusy(false) }
+  }
+  return (
+    <div data-testid="memo-panel">
+      <div className="button-row" style={{ marginBottom: 12 }}>
+        <button className="primary-button" type="button" disabled={!canWrite || busy || projectId == null} onClick={generate} data-testid="memo-generate">
+          <Bot size={16} /> {busy ? 'AI 撰写中…' : 'AI 生成投资备忘录'}
+        </button>
+        {memo && !busy && (
+          <button className="secondary-button" type="button" onClick={() => { navigator.clipboard?.writeText(memo); onToast({ title: '已复制', detail: '备忘录 Markdown 已复制到剪贴板' }) }}>
+            复制
+          </button>
+        )}
+      </div>
+      {busy && !memo ? (
+        <AiProcessing messages={['读取项目全量数据…', '分析财务与估值…', '梳理风险与条款…', '撰写投委会备忘录…']} />
+      ) : memo ? (
+        <div className="ai-answer" data-testid="memo-body"><Markdown text={memo} />{busy && <span className="stream-cursor" aria-hidden="true" />}</div>
+      ) : err ? (
+        <p className="muted-note">{err}</p>
+      ) : (
+        <p className="muted-note">基于本项目的卡片 / 投资汇总 / 财务 / 决策 / 委派等真实数据,一键生成结构化投资备忘录(IC Memo),可直接进投委会材料。</p>
+      )}
+    </div>
+  )
+}
 
 // 协议条款(AI):粘贴协议文本 → 大模型抽取关键条款入库 → 表格展示(cap_risk_clauses)。
 function ProjectClausesSection({ projectId, canWrite, onToast }: { projectId: number | null; canWrite: boolean; onToast: (t: Toast) => void }) {
@@ -2768,6 +2813,10 @@ function DetailPage({
                   <DataTable rows={tabRows} compact />
                 )}
               </div>
+            )}
+
+            {subtab === 'AI 备忘录' && (
+              <ProjectMemoPanel projectId={selectedId} canWrite={canWrite} onToast={onToast} />
             )}
 
             {/* 底部操作:下载 WORD/PDF / 历史 */}
