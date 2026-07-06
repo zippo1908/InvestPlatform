@@ -577,21 +577,19 @@ if (typeof document !== 'undefined') {
   if (saved) document.documentElement.setAttribute('data-theme', saved)
 }
 
-// 品牌标识:随主题变色的渐变徽标(上升柱=资本/增长)。
+// 品牌标识:图形符号(六边形=材料/化学质感)+ 向上光芒,主色走 --brand(默认=主题色)。
 function BrandMark() {
   return (
     <span className="brand-mark" aria-hidden="true">
       <svg viewBox="0 0 32 32" width="32" height="32">
         <defs>
           <linearGradient id="bm-g" x1="0" y1="0" x2="1" y2="1">
-            <stop offset="0" stopColor="var(--accent)" />
-            <stop offset="1" stopColor="var(--accent-2)" />
+            <stop offset="0" stopColor="var(--brand, var(--accent))" />
+            <stop offset="1" stopColor="var(--brand-2, var(--accent-2))" />
           </linearGradient>
         </defs>
-        <rect width="32" height="32" rx="8" fill="url(#bm-g)" />
-        <rect x="8" y="17" width="3.6" height="7" rx="1.2" fill="#fff" opacity="0.82" />
-        <rect x="14.2" y="13" width="3.6" height="11" rx="1.2" fill="#fff" opacity="0.92" />
-        <rect x="20.4" y="9" width="3.6" height="15" rx="1.2" fill="#fff" />
+        <polygon points="16,2.4 27.4,9 27.4,23 16,29.6 4.6,23 4.6,9" fill="url(#bm-g)" />
+        <path d="M16 9.5 L21.2 22 L16 19.2 L10.8 22 Z" fill="#fff" opacity="0.96" />
       </svg>
     </span>
   )
@@ -683,6 +681,9 @@ function App() {
     document.documentElement.setAttribute('data-theme', theme)
     localStorage.setItem('capitalos-theme', theme)
   }, [theme])
+  // 品牌:clean=纯净版(仅 CapitalOS 文字,无图形标) / tinci=TINCI 版(六边形符号 + TINCI 字标)
+  const [brand, setBrand] = useState<string>(() => localStorage.getItem('capitalos-brand') || 'clean')
+  useEffect(() => { localStorage.setItem('capitalos-brand', brand) }, [brand])
   // 全局命令面板快捷键:Cmd/Ctrl+K 开关。
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -815,10 +816,10 @@ function App() {
             {sidebarOpen ? <X size={17} /> : <Menu size={17} />}
           </button>
           <div className="brand-copy">
-            <BrandMark />
+            {brand === 'tinci' && <BrandMark />}
             <div>
-              <strong>CapitalOS</strong>
-              <small>投资运营中台</small>
+              <strong className={brand === 'tinci' ? 'brand-wordmark' : undefined}>{brand === 'tinci' ? 'TINCI' : 'CapitalOS'}</strong>
+              <small>{brand === 'tinci' ? '投资运营中台 · CapitalOS' : '投资运营中台'}</small>
             </div>
           </div>
         </div>
@@ -910,6 +911,16 @@ function App() {
               onClick={() => setTheme((t) => (t === 'blue' ? 'teal' : 'blue'))}
             >
               <Palette size={17} />
+            </button>
+            <button
+              className="icon-button"
+              type="button"
+              data-testid="brand-toggle"
+              title={brand === 'tinci' ? '品牌:TINCI(点切纯净版 CapitalOS)' : '品牌:纯净版(点切 TINCI)'}
+              aria-label="切换品牌标识"
+              onClick={() => setBrand((b) => (b === 'tinci' ? 'clean' : 'tinci'))}
+            >
+              <Briefcase size={17} />
             </button>
             <label className="role-select">
               <span>角色</span>
