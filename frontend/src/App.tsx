@@ -10,6 +10,7 @@ import {
   Briefcase,
   Calendar,
   CheckCircle,
+  ChevronLeft,
   ChevronRight,
   Clock,
   Columns,
@@ -2717,6 +2718,7 @@ function DetailPage({
   const [basicBaseline, setBasicBaseline] = useState<Record<string, string>>({}) // 进入编辑时的服务端值,供重置/取消
   const [hasBasicDraft, setHasBasicDraft] = useState(false)      // 服务端存有未提交草稿
   const [savingBasicDraft, setSavingBasicDraft] = useState(false)
+  const [view, setView] = useState<'list' | 'detail'>(() => (readRouteId() != null ? 'detail' : 'list')) // 清单页 / 明细页
   const [summary, setSummary] = useState<InvestSummary | null>(null)
   const [summaryLoading, setSummaryLoading] = useState(false)
   const sectionMap = kind === 'fund' ? FUND_SECTION_DATA : SECTION_DATA
@@ -2796,6 +2798,7 @@ function DetailPage({
     const urlId = readRouteId()
     if (urlId != null) setSelectedId(urlId)
     setSection('概况')
+    setView(urlId != null ? 'detail' : 'list') // 带 ?id= 进来直达明细,否则先看清单
   }, [screen.id])
 
   // 载入实体列表(供选择)。
@@ -2955,29 +2958,52 @@ function DetailPage({
 
   const dirLabel = kind === 'project' ? '项目' : '基金'
 
+  // 清单页:卡片网格(自动换行),点一个进该对象明细。
+  if (view === 'list') {
+    return (
+      <div className="page-grid">
+        <section className="panel detail-hero full-span motion-item">
+          <div>
+            <span className="page-kicker">{screen.group}</span>
+            <h2>{dirLabel}清单</h2>
+            <p>选择一个{dirLabel}查看主档、阶段、投资情况、投后数据等全部信息。</p>
+          </div>
+        </section>
+        <section className="panel full-span motion-item">
+          {loading ? (
+            <p className="muted-note">加载中…</p>
+          ) : entities.length === 0 ? (
+            <p className="muted-note">暂无{dirLabel}。</p>
+          ) : (
+            <div className="entity-picker-grid" data-testid="entity-picker">
+              {entities.map((e) => (
+                <button
+                  key={String(e.id)}
+                  type="button"
+                  className="entity-picker-card"
+                  onClick={() => { setSelectedId(Number(e.id)); setView('detail') }}
+                  data-testid={`entity-picker-card-${e.id}`}
+                >
+                  <strong>{String(e[nameKey] ?? e.name ?? e.id)}</strong>
+                  <span className="entity-picker-meta">{String(e.stage_label ?? e.fund_status ?? '—')}</span>
+                  <span className="entity-picker-sub">{[e.sector, e.city].filter(Boolean).map(String).join(' · ') || '—'}</span>
+                </button>
+              ))}
+            </div>
+          )}
+        </section>
+      </div>
+    )
+  }
+
   return (
     <div className="page-grid" ref={stageRef}>
-      {/* 次一级导航栏:切换不同的项目/基金 → 下方展示所选对象的明细 */}
-      <nav className="panel entity-subnav full-span motion-item" data-testid="entity-directory">
-        <span className="entity-subnav-label">{dirLabel}</span>
-        <div className="entity-subnav-list">
-          {loading ? (
-            <span className="muted-note">加载中…</span>
-          ) : entities.length === 0 ? (
-            <span className="muted-note">暂无{dirLabel}</span>
-          ) : entities.map((e) => (
-            <button
-              key={String(e.id)}
-              type="button"
-              className={classNames('entity-subnav-item', Number(e.id) === selectedId && 'is-active')}
-              onClick={() => setSelectedId(Number(e.id))}
-              data-testid={`entity-subnav-item-${e.id}`}
-            >
-              {String(e[nameKey] ?? e.name ?? e.id)}
-            </button>
-          ))}
-        </div>
-      </nav>
+      {/* 返回清单页 */}
+      <div className="full-span entity-detail-back">
+        <button type="button" className="secondary-button" onClick={() => setView('list')} data-testid="entity-back-to-list">
+          <ChevronLeft size={16} /> {dirLabel}清单
+        </button>
+      </div>
       <section className="panel detail-hero full-span motion-item">
         <div>
           <span className="page-kicker">{screen.group}</span>
