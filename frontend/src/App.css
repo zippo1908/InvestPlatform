@@ -19,7 +19,10 @@
 }
 
 .sidebar-collapsed {
-  width: 76px;
+  width: 0;
+  min-width: 0;
+  border-right-width: 0;
+  overflow: hidden;
 }
 
 .sidebar-collapsed .brand-copy div,
@@ -2131,3 +2134,8 @@ tbody tr:hover {
 .sidebar-collapsed .nav-search-btn { display: none; }
 
 .brand-wordmark { letter-spacing: 2px; font-weight: 800; }
+
+/* 侧栏收起时的「展开导航」按钮 */
+.nav-reopen { display: none; }
+.nav-reopen.is-shown { display: inline-flex; }
+@media (max-width: 860px) { .nav-reopen { display: inline-flex; } }

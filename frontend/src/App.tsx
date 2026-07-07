@@ -886,9 +886,10 @@ function App() {
           <div className="topbar-left">
             <button
               type="button"
-              className="icon-button mobile-only"
+              className={classNames('icon-button', 'nav-reopen', !sidebarOpen && 'is-shown')}
               onClick={() => setSidebarOpen((value) => !value)}
-              aria-label="切换导航"
+              aria-label="展开导航"
+              title="展开导航"
             >
               <Menu size={18} />
             </button>
