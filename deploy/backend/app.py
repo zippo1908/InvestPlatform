@@ -7,6 +7,8 @@ import os
 import re
 import threading
 import urllib.request
+import urllib.error
+import urllib.parse
 import uuid
 from datetime import datetime, timedelta
 from json import dumps, loads
@@ -1717,6 +1719,112 @@ def _create_github_issue(title: str, body: str) -> tuple[int, str]:
     return int(obj["number"]), str(obj["html_url"])
 
 
+# ── 反馈截图/附件 → GitHub:传成 release 资产,内嵌进 issue 正文 ─────────────
+_MEDIA_RELEASE_TAG = "feedback-media"
+_media_release_id: int | None = None
+
+
+def _github_repo() -> str:
+    return os.getenv("GITHUB_REPO", "zippo1908/InvestPlatform")
+
+
+def _gh_api(method: str, url: str, data: bytes | None = None, content_type: str | None = None, timeout: int = 30) -> Any:
+    tok = _github_token()
+    headers = {"Authorization": f"Bearer {tok}", "Accept": "application/vnd.github+json", "User-Agent": "CapitalOS-Feedback"}
+    if content_type:
+        headers["Content-Type"] = content_type
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read().decode("utf-8")
+    return loads(raw) if raw else {}
+
+
+def _gh_media_release_id() -> int | None:
+    """取(或建)feedback-media release,缓存 id。用来托管反馈截图/附件。失败返回 None。"""
+    global _media_release_id
+    if _media_release_id:
+        return _media_release_id
+    if not _github_token():
+        return None
+    repo = _github_repo()
+    try:
+        rel = _gh_api("GET", f"https://api.github.com/repos/{repo}/releases/tags/{_MEDIA_RELEASE_TAG}")
+        _media_release_id = int(rel["id"])
+        return _media_release_id
+    except urllib.error.HTTPError as exc:
+        if exc.code != 404:
+            return None
+    except Exception:
+        return None
+    try:
+        rel = _gh_api(
+            "POST", f"https://api.github.com/repos/{repo}/releases",
+            data=dumps({"tag_name": _MEDIA_RELEASE_TAG, "name": "Feedback media (auto)",
+                        "body": "反馈截图/附件自动托管,供 issue 内嵌引用。请勿删除。", "make_latest": "false"}).encode("utf-8"),
+            content_type="application/json",
+        )
+        _media_release_id = int(rel["id"])
+        return _media_release_id
+    except Exception:
+        return None
+
+
+def _gh_upload_asset(name: str, path: str, mime: str) -> str | None:
+    """把本地文件传成 release 资产,返回 browser_download_url;同名已存在则复用。失败 None。"""
+    rid = _gh_media_release_id()
+    if rid is None or not os.path.exists(path):
+        return None
+    repo = _github_repo()
+    try:
+        with open(path, "rb") as fh:
+            blob = fh.read()
+        obj = _gh_api(
+            "POST",
+            f"https://uploads.github.com/repos/{repo}/releases/{rid}/assets?name={urllib.parse.quote(name)}",
+            data=blob, content_type=mime or "application/octet-stream", timeout=60,
+        )
+        return str(obj.get("browser_download_url") or "") or None
+    except urllib.error.HTTPError as exc:
+        if exc.code == 422:  # 同名已存在 → 找回已有资产 URL
+            try:
+                for a in _gh_api("GET", f"https://api.github.com/repos/{repo}/releases/{rid}/assets?per_page=100"):
+                    if a.get("name") == name:
+                        return str(a.get("browser_download_url") or "") or None
+            except Exception:
+                return None
+        return None
+    except Exception:
+        return None
+
+
+def _feedback_media_block(cursor: Any, fid: int, fb: dict[str, Any]) -> str:
+    """上传该反馈的截图 + 手动附件到 GitHub,拼成内嵌 markdown(图片内联,其它给下载链接)。"""
+    files: list[tuple[str, str, str]] = []  # (asset_name, local_path, mime)
+    shot = fb.get("screenshot_path")
+    if shot:
+        base = os.path.basename(str(shot))
+        files.append((base, os.path.join(_FEEDBACK_SHOTS_DIR, base), "image/jpeg"))
+    try:
+        cursor.execute(
+            "SELECT file_name, file_path, mime_type FROM cap_feedback_attachments WHERE feedback_id=%s ORDER BY attachment_id",
+            (fid,),
+        )
+        for a in cursor.fetchall():
+            base = os.path.basename(str(a["file_path"]))
+            files.append((base, os.path.join(_FEEDBACK_SHOTS_DIR, base), str(a.get("mime_type") or "application/octet-stream")))
+    except Exception:
+        pass
+    lines: list[str] = []
+    for name, path, mime in files:
+        url = _gh_upload_asset(name, path, mime)
+        if not url:
+            continue
+        lines.append(f"![{name}]({url})" if str(mime).startswith("image/") else f"[{name}]({url})")
+    if not lines:
+        return ""
+    return "\n\n**截图 / 附件:**\n\n" + "\n\n".join(lines) + "\n"
+
+
 _FEEDBACK_SHOTS_DIR = os.path.join(os.path.dirname(__file__), "feedback_shots")
 
 
@@ -1895,13 +2003,12 @@ def list_feedback(user: AuthedUser = Depends(require_roles("system_admin", "mana
 def _feedback_issue_text(fb: dict[str, Any], fid: int) -> tuple[str, str]:
     cat = _FEEDBACK_CATEGORY_LABEL.get(fb["category"], fb["category"])
     title = f"[用户反馈] {fb.get('screen_title') or fb.get('screen_id') or '页面'} · {cat}"
-    shot_note = "\n**截图**:已随反馈附带,见 CapitalOS 汇总页。" if fb.get("screenshot_path") else ""
     body = (
         f"**页面**:{fb.get('screen_title') or ''}(`{fb.get('screen_id') or ''}`)\n"
         f"**组件**:{fb.get('component_label') or '(未指定)'}\n"
         f"**类别**:{cat}\n"
         f"**提交人**:{fb.get('author') or '匿名'}\n"
-        f"**页面地址**:{fb.get('page_url') or ''}{shot_note}\n\n"
+        f"**页面地址**:{fb.get('page_url') or ''}\n\n"
         f"**意见**:\n{fb['message']}\n\n"
         f"---\n_由 CapitalOS 页面标注工具自动同步(feedback #{fid})_"
     )
@@ -1928,6 +2035,7 @@ def push_feedback_github_batch(user: AuthedUser = Depends(require_roles("system_
                 fid = int(fb["feedback_id"])
                 try:
                     title, body = _feedback_issue_text(fb, fid)
+                    body += _feedback_media_block(cursor, fid, fb)
                     number, url = _create_github_issue(title, body)
                     cursor.execute(
                         "UPDATE cap_feedback_annotations SET status='pushed', github_issue_number=%s, github_issue_url=%s WHERE feedback_id=%s AND tenant_id=%s",
@@ -1956,7 +2064,7 @@ def push_feedback_github(feedback_id: int, user: AuthedUser = Depends(require_ro
         with connection.cursor() as cursor:
             cursor.execute(
                 """SELECT f.feedback_id, f.screen_id, f.screen_title, f.page_url, f.component_label, f.category,
-                          f.message, f.status, f.github_issue_url, u.display_name AS author
+                          f.message, f.status, f.github_issue_url, f.screenshot_path, u.display_name AS author
                    FROM cap_feedback_annotations f LEFT JOIN cap_users u ON u.user_id=f.author_user_id
                    WHERE f.feedback_id=%s AND f.tenant_id=%s""",
                 (feedback_id, tid),
@@ -1968,6 +2076,7 @@ def push_feedback_github(feedback_id: int, user: AuthedUser = Depends(require_ro
                 return {"ok": True, "already": True, "github_issue_url": fb["github_issue_url"]}
 
             title, body = _feedback_issue_text(fb, feedback_id)
+            body += _feedback_media_block(cursor, feedback_id, fb)
             number, url = _create_github_issue(title, body)
             cursor.execute(
                 "UPDATE cap_feedback_annotations SET status='pushed', github_issue_number=%s, github_issue_url=%s WHERE feedback_id=%s AND tenant_id=%s",
