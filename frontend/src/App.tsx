@@ -2309,17 +2309,7 @@ const PROJECT_BASIC_GROUPS: Array<[string, string[]]> = [
 const PROJECT_SUBTABS = ['基本情况', '投资汇总', '财务数据', '委派代表', '投资决策', 'AI 备忘录'] as const
 type ProjectSubtab = (typeof PROJECT_SUBTABS)[number]
 // 顶部 section 导航(对照反馈截图那一行)。概况=卡片主视图;其余为各专题 section。
-// 反馈 #7:项目详情「左侧目录」—— 在不推翻现有卡片的前提下,把既有 section 归成三大目录入口。
-const PROJECT_DIRECTORY: Array<{ label: string; sections: string[] }> = [
-  { label: '概况', sections: ['概况', '日程', '协议条款(AI)'] },
-  { label: '投资关系', sections: ['基金投资情况', '权益变动', '估值', '三会'] },
-  { label: '投后数据', sections: ['投后数据', '现金流'] },
-]
-// 从哪个「项目详情-xx」入口进来,默认落到对应目录的首个 section。
-const SECTION_DEFAULT_BY_SCREEN: Record<string, string> = {
-  'project-detail-investment': '基金投资情况',
-  'project-detail-postdata': '投后数据',
-}
+const PROJECT_SECTIONS = ['概况', '日程', '基金投资情况', '权益变动', '三会', '现金流', '估值', '投后数据', '协议条款(AI)'] as const
 const _n = (v: unknown): number | null => (v == null || v === '' ? null : Number(v))
 const CF_KIND_CN: Record<string, string> = { project_return: '项目回款', capital_call: '出资', investment: '投资打款', management_fee: '管理费', distribution: '分配', expense: '费用' }
 const CF_DIR_CN: Record<string, string> = { inflow: '流入', outflow: '流出' }
@@ -2727,6 +2717,7 @@ function DetailPage({
   const [basicBaseline, setBasicBaseline] = useState<Record<string, string>>({}) // 进入编辑时的服务端值,供重置/取消
   const [hasBasicDraft, setHasBasicDraft] = useState(false)      // 服务端存有未提交草稿
   const [savingBasicDraft, setSavingBasicDraft] = useState(false)
+  const [dirQuery, setDirQuery] = useState('') // 左侧项目/基金目录搜索
   const [summary, setSummary] = useState<InvestSummary | null>(null)
   const [summaryLoading, setSummaryLoading] = useState(false)
   const sectionMap = kind === 'fund' ? FUND_SECTION_DATA : SECTION_DATA
@@ -2805,7 +2796,7 @@ function DetailPage({
   useEffect(() => {
     const urlId = readRouteId()
     if (urlId != null) setSelectedId(urlId)
-    setSection(SECTION_DEFAULT_BY_SCREEN[screen.id] ?? '概况')
+    setSection('概况')
   }, [screen.id])
 
   // 载入实体列表(供选择)。
@@ -2963,29 +2954,56 @@ function DetailPage({
   const fundStatus = String(form.fund_status ?? detail.fund_status ?? '')
   const fundStage = FUND_STAGE_INDEX[fundStatus] ?? 0
 
+  const dirLabel = kind === 'project' ? '项目' : '基金'
+  const dirFiltered = entities.filter((e) => {
+    const q = dirQuery.trim().toLowerCase()
+    if (!q) return true
+    return [e[nameKey], e.name, e.stage_label, e.sector, e.city].some((v) => String(v ?? '').toLowerCase().includes(q))
+  })
+
   return (
-    <div className="page-grid" ref={stageRef}>
+    <div className="entity-master-detail">
+      {/* 左侧目录:选不同的对象(项目/基金)→ 右侧看该对象明细 */}
+      <aside className="entity-rail" data-testid="entity-directory">
+        <div className="entity-rail-head">
+          <strong>{dirLabel}目录</strong>
+          <span className="entity-rail-count">{entities.length}</span>
+        </div>
+        <input
+          className="entity-rail-search"
+          placeholder={`搜索${dirLabel}…`}
+          value={dirQuery}
+          onChange={(e) => setDirQuery(e.target.value)}
+          data-testid="entity-directory-search"
+        />
+        <div className="entity-rail-list">
+          {loading ? (
+            <p className="muted-note" style={{ padding: '8px 10px' }}>加载中…</p>
+          ) : dirFiltered.length === 0 ? (
+            <p className="muted-note" style={{ padding: '8px 10px' }}>无匹配{dirLabel}</p>
+          ) : dirFiltered.map((e) => (
+            <button
+              key={String(e.id)}
+              type="button"
+              className={classNames('entity-rail-item', Number(e.id) === selectedId && 'is-active')}
+              onClick={() => setSelectedId(Number(e.id))}
+              data-testid={`entity-rail-item-${e.id}`}
+            >
+              <span className="entity-rail-name">{String(e[nameKey] ?? e.name ?? e.id)}</span>
+              <span className="entity-rail-sub">{String(e.stage_label ?? e.fund_status ?? e.sector ?? '')}</span>
+            </button>
+          ))}
+        </div>
+      </aside>
+
+      <div className="entity-detail-main page-grid" ref={stageRef}>
       <section className="panel detail-hero full-span motion-item">
         <div>
           <span className="page-kicker">{screen.group}</span>
           <h2>{entityName}</h2>
-          <p>真实主档:选择对象后加载后端数据,修改并保存直接落库(租户内 + 权限校验)。</p>
+          <p>从左侧{dirLabel}目录选择对象,右侧加载其后端数据;修改并保存直接落库(租户内 + 权限校验)。</p>
         </div>
         <div className="detail-actions">
-          <label className="detail-picker">
-            <span>选择{kind === 'project' ? '项目' : '基金'}</span>
-            <select
-              value={selectedId ?? ''}
-              onChange={(event) => setSelectedId(Number(event.target.value))}
-              data-testid="detail-entity-picker"
-            >
-              {entities.map((e) => (
-                <option key={String(e.id)} value={String(e.id)}>
-                  {String(e[nameKey] ?? e.name ?? e.id)}
-                </option>
-              ))}
-            </select>
-          </label>
           {kind === 'project' && (
             <button
               type="button"
@@ -3013,25 +3031,12 @@ function DetailPage({
 
       {kind === 'project' ? (
         <>
-          {/* 反馈 #7:左侧目录(概况/投资关系/投后数据)+ 该目录下的 section 二级导航 */}
+          {/* 顶部 section 导航(概况/日程/基金投资情况/…/协议条款AI) */}
           <section className="panel full-span motion-item section-tabbar">
-            <div className="project-dir-layout">
-              <nav className="project-dir" data-testid="project-directory">
-                {PROJECT_DIRECTORY.map((d) => {
-                  const active = d.sections.includes(section)
-                  return (
-                    <button key={d.label} type="button" className={classNames('project-dir-item', active && 'is-active')}
-                      onClick={() => { if (!d.sections.includes(section)) setSection(d.sections[0]) }}>
-                      {d.label}
-                    </button>
-                  )
-                })}
-              </nav>
-              <div className="subtab-bar project-dir-sections" data-testid="project-sections">
-                {(PROJECT_DIRECTORY.find((d) => d.sections.includes(section)) ?? PROJECT_DIRECTORY[0]).sections.map((s) => (
-                  <button key={s} type="button" className={classNames('subtab', section === s && 'is-active')} onClick={() => setSection(s)}>{s}</button>
-                ))}
-              </div>
+            <div className="subtab-bar" data-testid="project-sections">
+              {PROJECT_SECTIONS.map((s) => (
+                <button key={s} type="button" className={classNames('subtab', section === s && 'is-active')} onClick={() => setSection(s)}>{s}</button>
+              ))}
             </div>
           </section>
 
@@ -3329,6 +3334,7 @@ function DetailPage({
           )}
         </>
       )}
+      </div>
     </div>
   )
 }

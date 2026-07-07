@@ -1216,6 +1216,29 @@ tbody tr:hover {
   width: 100%;
 }
 
+/* 项目/基金详情:左侧目录(选对象)+ 右侧明细 主从布局 */
+.entity-master-detail { display: flex; align-items: flex-start; gap: 16px; }
+.entity-detail-main { flex: 1; min-width: 0; }
+.entity-rail {
+  flex: none; width: 240px; position: sticky; top: 12px; align-self: flex-start;
+  background: var(--surface, #fff); border: 1px solid var(--line); border-radius: 12px;
+  padding: 10px; max-height: calc(100vh - 96px); display: flex; flex-direction: column; gap: 8px;
+}
+.entity-rail-head { display: flex; align-items: center; justify-content: space-between; padding: 2px 4px; color: var(--ink); }
+.entity-rail-count { font-size: 12px; color: var(--muted); background: #f1f5f9; border-radius: 999px; padding: 1px 8px; }
+.entity-rail-search { width: 100%; box-sizing: border-box; padding: 6px 9px; border: 1px solid var(--line); border-radius: 8px; font-size: 13px; }
+.entity-rail-list { overflow-y: auto; display: flex; flex-direction: column; gap: 2px; }
+.entity-rail-item { text-align: left; display: flex; flex-direction: column; gap: 1px; padding: 8px 10px; border: none; border-radius: 8px; background: transparent; cursor: pointer; }
+.entity-rail-item:hover { background: #f1f5f9; }
+.entity-rail-item.is-active { background: #eef2ff; }
+.entity-rail-name { font-size: 13.5px; font-weight: 600; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.entity-rail-item.is-active .entity-rail-name { color: var(--accent, #4f46e5); }
+.entity-rail-sub { font-size: 11.5px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@media (max-width: 860px) {
+  .entity-master-detail { flex-direction: column; }
+  .entity-rail { width: 100%; position: static; max-height: 240px; }
+}
+
 .detail-hero {
   display: flex;
   align-items: center;
@@ -1998,18 +2021,6 @@ tbody tr:hover {
 .section-tabbar { padding: 4px 10px; }
 .section-tabbar .subtab-bar { margin-bottom: 0; border-bottom: none; }
 
-/* 反馈 #7:项目详情左侧目录 */
-.project-dir-layout { display: flex; align-items: stretch; gap: 12px; }
-.project-dir { display: flex; flex-direction: column; gap: 4px; padding-right: 12px; border-right: 1px solid var(--line); flex: none; min-width: 92px; }
-.project-dir-item { text-align: left; padding: 7px 12px; border: none; border-radius: 8px; background: transparent; color: var(--muted);
-  font-size: 13px; font-weight: 600; cursor: pointer; white-space: nowrap; }
-.project-dir-item:hover { background: #f1f5f9; color: var(--ink); }
-.project-dir-item.is-active { background: #eef2ff; color: var(--accent, #4f46e5); }
-.project-dir-sections { display: flex; flex-wrap: wrap; align-items: center; }
-@media (max-width: 720px) {
-  .project-dir-layout { flex-direction: column; }
-  .project-dir { flex-direction: row; flex-wrap: wrap; border-right: none; border-bottom: 1px solid var(--line); padding-right: 0; padding-bottom: 8px; }
-}
 
 /* ── 页面反馈 / 标注工具 ── */
 .fb-widget { position: fixed; right: 20px; bottom: 20px; z-index: 60; }
