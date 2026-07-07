@@ -26,6 +26,7 @@ import {
   LogOut,
   Menu,
   MessageSquare,
+  Paperclip,
   Palette,
   Plus,
   Search,
@@ -69,7 +70,7 @@ import type { DataRow, Project, Screen } from './data'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
 import html2canvas from 'html2canvas'
-import { API_BASE, apiDelete, apiDownload, apiGet, apiPatch, apiPost, auditDetail, getPerms, getRoles, getToken, getUserName, setPerms, setRoles, setUserName, streamPost, setToken } from './api'
+import { API_BASE, apiDelete, apiDownload, apiGet, apiPatch, apiPost, apiPut, auditDetail, getPerms, getRoles, getToken, getUserName, setPerms, setRoles, setUserName, streamPost, setToken } from './api'
 
 marked.setOptions({ breaks: true, gfm: true })
 
@@ -391,9 +392,11 @@ function FeedbackWidget({ onToast }: { onToast: (t: Toast) => void }) {
   const [picking, setPicking] = useState(false)
   const [busy, setBusy] = useState(false)
   const [withShot, setWithShot] = useState(true) // 一键截图(默认开)
+  const [attachments, setAttachments] = useState<Array<{ name: string; data_url: string }>>([]) // 手动上传附件(反馈 #8)
   const [items, setItems] = useState<Array<Record<string, unknown>>>([])
   const [reloadKey, setReloadKey] = useState(0)
   const [shotView, setShotView] = useState<Record<number, string>>({}) // 已加载的截图 objectURL
+  const [attList, setAttList] = useState<Record<number, Array<{ id: number; file_name: string; mime_type: string }>>>({}) // 汇总页展开的附件列表
 
   // 组件拾取:进入后 hover 高亮、点击捕获描述并退出;排除工具自身。
   useEffect(() => {
@@ -434,6 +437,20 @@ function FeedbackWidget({ onToast }: { onToast: (t: Toast) => void }) {
     } catch (e) { console.warn('[feedback] 截图失败:', e); return undefined }
   }
 
+  // 读取手动上传附件为 data URL(限图片/PDF,单个 ≤12MB,最多 6 个)。
+  const onFiles = async (files: FileList | null) => {
+    if (!files) return
+    const picked: Array<{ name: string; data_url: string }> = []
+    for (const file of Array.from(files)) {
+      if (file.size > 12 * 1024 * 1024) { onToast({ title: '附件过大', detail: `${file.name} 超过 12MB,已跳过` }); continue }
+      const data_url = await new Promise<string>((res) => {
+        const fr = new FileReader(); fr.onload = () => res(String(fr.result)); fr.onerror = () => res(''); fr.readAsDataURL(file)
+      })
+      if (data_url) picked.push({ name: file.name, data_url })
+    }
+    setAttachments((prev) => [...prev, ...picked].slice(0, 6))
+  }
+
   const submit = async () => {
     if (!message.trim()) return
     setBusy(true)
@@ -441,12 +458,26 @@ function FeedbackWidget({ onToast }: { onToast: (t: Toast) => void }) {
       const screen_id = location.hash.replace(/^#\//, '').split('?')[0] || 'unknown'
       const screen_title = document.querySelector('[data-testid="screen-title"]')?.textContent?.trim() || screen_id
       const screenshot = withShot ? await captureShot() : undefined
-      await apiPost('/api/feedback', { message: message.trim(), component_label: component || undefined, category, screen_id, screen_title, page_url: location.href.slice(0, 300), screenshot })
-      onToast({ title: '反馈已提交', detail: screenshot ? '已收集(含截图),开发会从「汇总」整理并同步 GitHub' : '已收集,开发会从「汇总」整理并同步 GitHub' })
-      setMessage(''); setComponent('')
+      await apiPost('/api/feedback', { message: message.trim(), component_label: component || undefined, category, screen_id, screen_title, page_url: location.href.slice(0, 300), screenshot, attachments: attachments.length ? attachments : undefined })
+      const extras = [screenshot ? '含截图' : '', attachments.length ? `含 ${attachments.length} 个附件` : ''].filter(Boolean).join('、')
+      onToast({ title: '反馈已提交', detail: `已收集${extras ? `(${extras})` : ''},开发会从「汇总」整理并同步 GitHub` })
+      setMessage(''); setComponent(''); setAttachments([])
     } catch (error) {
       onToast({ title: '提交失败', detail: error instanceof Error ? error.message : 'API 调用失败' })
     } finally { setBusy(false) }
+  }
+
+  // 汇总页:展开某条反馈的手动附件列表(再点收起)。
+  const loadAttachments = async (id: number) => {
+    if (attList[id]) { setAttList((m) => { const n = { ...m }; delete n[id]; return n }); return }
+    try {
+      const r = await apiGet<{ items: Array<{ id: number; file_name: string; mime_type: string }> }>(`/api/feedback/${id}/attachments`)
+      setAttList((m) => ({ ...m, [id]: r.items ?? [] }))
+    } catch { onToast({ title: '附件加载失败', detail: '' }) }
+  }
+  const downloadAttachment = async (fid: number, att: { id: number; file_name: string }) => {
+    try { await apiDownload(`/api/feedback/${fid}/attachments/${att.id}`, att.file_name || `attachment-${att.id}`) }
+    catch (e) { onToast({ title: '下载失败', detail: e instanceof Error ? e.message : '' }) }
   }
 
   const pushAll = async () => {
@@ -527,6 +558,21 @@ function FeedbackWidget({ onToast }: { onToast: (t: Toast) => void }) {
                 <input type="checkbox" checked={withShot} onChange={(e) => setWithShot(e.target.checked)} data-testid="feedback-withshot" />
                 <span>附带当前页面截图</span>
               </label>
+              <label className="fb-field">
+                <span>附件(可选,图片/PDF,最多 6 个)</span>
+                <input type="file" multiple accept="image/*,application/pdf" data-testid="feedback-files"
+                  onChange={(e) => { onFiles(e.target.files); e.currentTarget.value = '' }} />
+              </label>
+              {attachments.length > 0 && (
+                <div className="fb-attachments" data-testid="feedback-attachments">
+                  {attachments.map((a, i) => (
+                    <span key={i} className="fb-att-chip">
+                      {a.name}
+                      <button type="button" className="fb-att-remove" aria-label="移除附件" onClick={() => setAttachments((p) => p.filter((_, j) => j !== i))}>×</button>
+                    </span>
+                  ))}
+                </div>
+              )}
               <button type="button" className="primary-button full-width" disabled={busy || !message.trim()} onClick={submit} data-testid="feedback-submit">
                 <Send size={15} /> {busy ? (withShot ? '截图并提交…' : '提交中…') : '提交反馈'}
               </button>
@@ -547,12 +593,26 @@ function FeedbackWidget({ onToast }: { onToast: (t: Toast) => void }) {
                   <p className="fb-msg">{String(f.message)}</p>
                   <div className="fb-meta">{String(f.screen_title ?? '')} · {f.component_label ? String(f.component_label) : '未指定组件'} · {String(f.author ?? '')}</div>
                   {shotView[Number(f.id)] && <img className="fb-shot" src={shotView[Number(f.id)]} alt="反馈截图" />}
+                  {attList[Number(f.id)] && (
+                    <div className="fb-att-list" data-testid={`fb-att-list-${f.id}`}>
+                      {attList[Number(f.id)].length === 0 ? <span className="muted-note">无附件</span> : attList[Number(f.id)].map((a) => (
+                        <button key={a.id} type="button" className="fb-att-chip" onClick={() => downloadAttachment(Number(f.id), a)} title="下载/预览">
+                          <Paperclip size={12} /> {a.file_name}
+                        </button>
+                      ))}
+                    </div>
+                  )}
                   <div className="fb-actions">
                     {f.screenshot_path ? (
                       <button type="button" className="link-button" onClick={() => loadShot(Number(f.id))} data-testid={`fb-shot-${f.id}`}>
                         {shotView[Number(f.id)] ? '收起截图' : '看截图'}
                       </button>
                     ) : null}
+                    {Number(f.attachment_count) > 0 && (
+                      <button type="button" className="link-button" onClick={() => loadAttachments(Number(f.id))} data-testid={`fb-att-${f.id}`}>
+                        {attList[Number(f.id)] ? '收起附件' : `附件 ${Number(f.attachment_count)}`}
+                      </button>
+                    )}
                     {f.github_issue_url ? (
                       <a className="link-button" href={String(f.github_issue_url)} target="_blank" rel="noreferrer">查看 Issue #{String(f.github_issue_number)}</a>
                     ) : (
@@ -2249,7 +2309,17 @@ const PROJECT_BASIC_GROUPS: Array<[string, string[]]> = [
 const PROJECT_SUBTABS = ['基本情况', '投资汇总', '财务数据', '委派代表', '投资决策', 'AI 备忘录'] as const
 type ProjectSubtab = (typeof PROJECT_SUBTABS)[number]
 // 顶部 section 导航(对照反馈截图那一行)。概况=卡片主视图;其余为各专题 section。
-const PROJECT_SECTIONS = ['概况', '日程', '基金投资情况', '权益变动', '三会', '现金流', '估值', '投后数据', '协议条款(AI)'] as const
+// 反馈 #7:项目详情「左侧目录」—— 在不推翻现有卡片的前提下,把既有 section 归成三大目录入口。
+const PROJECT_DIRECTORY: Array<{ label: string; sections: string[] }> = [
+  { label: '概况', sections: ['概况', '日程', '协议条款(AI)'] },
+  { label: '投资关系', sections: ['基金投资情况', '权益变动', '估值', '三会'] },
+  { label: '投后数据', sections: ['投后数据', '现金流'] },
+]
+// 从哪个「项目详情-xx」入口进来,默认落到对应目录的首个 section。
+const SECTION_DEFAULT_BY_SCREEN: Record<string, string> = {
+  'project-detail-investment': '基金投资情况',
+  'project-detail-postdata': '投后数据',
+}
 const _n = (v: unknown): number | null => (v == null || v === '' ? null : Number(v))
 const CF_KIND_CN: Record<string, string> = { project_return: '项目回款', capital_call: '出资', investment: '投资打款', management_fee: '管理费', distribution: '分配', expense: '费用' }
 const CF_DIR_CN: Record<string, string> = { inflow: '流入', outflow: '流出' }
@@ -2396,44 +2466,120 @@ const num = (v: number | null | undefined): string => (v == null ? '—' : Strin
 
 // 亮点:AI 一键生成投资备忘录(IC Memo)—— 基于项目全量真实数据,流式渲染 Markdown。
 function ProjectMemoPanel({ projectId, canWrite, onToast }: { projectId: number | null; canWrite: boolean; onToast: (t: Toast) => void }) {
-  const [busy, setBusy] = useState(false)
-  const [memo, setMemo] = useState('')
+  const [busy, setBusy] = useState(false)        // AI 生成中
+  const [memo, setMemo] = useState('')           // 已提交的现行备忘录(查看态)
+  const [editing, setEditing] = useState(false)  // 编辑态
+  const [draft, setDraft] = useState('')         // 编辑区文本
+  const [hasSavedDraft, setHasSavedDraft] = useState(false) // 服务端存有未提交草稿
+  const [saving, setSaving] = useState(false)
   const [err, setErr] = useState<string | null>(null)
   const acRef = useRef<AbortController | null>(null)
+  const editingRef = useRef(false); editingRef.current = editing
+
+  // 载入现行备忘录 + 是否有草稿。切换项目时重置编辑态。
+  useEffect(() => {
+    acRef.current?.abort()
+    setEditing(false); setDraft(''); setMemo(''); setErr(null); setHasSavedDraft(false)
+    if (projectId == null) return
+    let alive = true
+    apiGet<{ memo: { content: string } | null }>(`/api/projects/${projectId}/memo`)
+      .then((r) => { if (alive) setMemo(r.memo?.content || '') })
+      .catch(() => {})
+    if (canWrite) {
+      apiGet<{ draft: { content?: string } | null }>(`/api/projects/${projectId}/drafts/ai_memo`)
+        .then((r) => { if (alive) setHasSavedDraft(!!r.draft?.content) })
+        .catch(() => {})
+    }
+    return () => { alive = false }
+  }, [projectId, canWrite])
   useEffect(() => () => acRef.current?.abort(), [])
+
+  // AI 生成:进入编辑态,流式写入编辑区,生成后用户再改。
   const generate = async () => {
     if (projectId == null) return
-    setBusy(true); setErr(null); setMemo('')
+    setBusy(true); setErr(null); setEditing(true); setDraft('')
     try {
       const r = await apiPost<{ job_id: number }>(`/api/projects/${projectId}/ai-memo`, {})
       acRef.current?.abort()
       const ac = new AbortController(); acRef.current = ac
       let acc = ''
-      await streamPost(`/api/ai/jobs/${r.job_id}/stream`, {}, (delta) => { acc += delta; setMemo(acc) }, ac.signal)
+      await streamPost(`/api/ai/jobs/${r.job_id}/stream`, {}, (delta) => { acc += delta; setDraft(acc) }, ac.signal)
     } catch (e) {
       if (!acRef.current?.signal.aborted) setErr(e instanceof Error ? e.message.replace(/^\{"detail":"?|"?\}$/g, '') : 'AI 调用失败')
     } finally { setBusy(false) }
   }
+
+  const enterEdit = async () => {
+    // 有草稿则恢复草稿,否则以现行备忘录起编。
+    let start = memo
+    try {
+      const r = await apiGet<{ draft: { content?: string } | null }>(`/api/projects/${projectId}/drafts/ai_memo`)
+      if (r.draft?.content) start = r.draft.content
+    } catch { /* 忽略,用现行备忘录起编 */ }
+    setDraft(start); setEditing(true)
+  }
+  const saveDraft = async () => {
+    if (projectId == null) return
+    setSaving(true)
+    try { await apiPut(`/api/projects/${projectId}/drafts/ai_memo`, { draft: { content: draft } }); setHasSavedDraft(true); onToast({ title: '草稿已保存', detail: '未提交,下次可继续编辑' }) }
+    catch (e) { onToast({ title: '保存草稿失败', detail: e instanceof Error ? e.message : '' }) }
+    finally { setSaving(false) }
+  }
+  const submit = async () => {
+    if (projectId == null || !draft.trim()) return
+    setSaving(true)
+    try {
+      await apiPut(`/api/projects/${projectId}/memo`, { content: draft })
+      await apiDelete(`/api/projects/${projectId}/drafts/ai_memo`).catch(() => {})
+      setMemo(draft); setEditing(false); setHasSavedDraft(false)
+      onToast({ title: '备忘录已提交', detail: '已保存为现行版本' })
+    } catch (e) { onToast({ title: '提交失败', detail: e instanceof Error ? e.message : '' }) }
+    finally { setSaving(false) }
+  }
+  const reset = () => { setDraft(memo); onToast({ title: '已重置', detail: '编辑区已恢复为现行版本' }) }
+  const cancel = () => { acRef.current?.abort(); setBusy(false); setEditing(false); setDraft('') }
+
   return (
     <div data-testid="memo-panel">
-      <div className="button-row" style={{ marginBottom: 12 }}>
+      <div className="button-row" style={{ marginBottom: 12, flexWrap: 'wrap' }}>
         <button className="primary-button" type="button" disabled={!canWrite || busy || projectId == null} onClick={generate} data-testid="memo-generate">
-          <Bot size={16} /> {busy ? 'AI 撰写中…' : 'AI 生成投资备忘录'}
+          <Bot size={16} /> {busy ? 'AI 撰写中…' : memo || editing ? 'AI 重新生成' : 'AI 生成投资备忘录'}
         </button>
-        {memo && !busy && (
-          <button className="secondary-button" type="button" onClick={() => { navigator.clipboard?.writeText(memo); onToast({ title: '已复制', detail: '备忘录 Markdown 已复制到剪贴板' }) }}>
-            复制
-          </button>
+        {!editing && memo && canWrite && (
+          <button className="secondary-button" type="button" onClick={enterEdit} data-testid="memo-edit">修改</button>
+        )}
+        {!editing && memo && (
+          <button className="secondary-button" type="button" onClick={() => { navigator.clipboard?.writeText(memo); onToast({ title: '已复制', detail: '备忘录 Markdown 已复制到剪贴板' }) }}>复制</button>
+        )}
+        {editing && (
+          <>
+            <button className="primary-button" type="button" disabled={saving || busy || !draft.trim()} onClick={submit} data-testid="memo-submit">提交</button>
+            <button className="secondary-button" type="button" disabled={saving || busy} onClick={saveDraft} data-testid="memo-save-draft">保存草稿</button>
+            <button className="secondary-button" type="button" disabled={saving || busy} onClick={reset}>重置</button>
+            <button className="secondary-button" type="button" disabled={saving} onClick={cancel}>取消</button>
+          </>
+        )}
+        {!editing && hasSavedDraft && canWrite && (
+          <button className="secondary-button" type="button" onClick={enterEdit} data-testid="memo-resume-draft">继续编辑草稿</button>
         )}
       </div>
-      {busy && !memo ? (
+      {editing ? (
+        <textarea
+          className="memo-editor"
+          data-testid="memo-textarea"
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          placeholder="在此编辑投资备忘录(Markdown)。可先点「AI 重新生成」让模型起草,再修改。"
+          style={{ width: '100%', minHeight: 360, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 13, lineHeight: 1.6, padding: 12, resize: 'vertical' }}
+        />
+      ) : busy ? (
         <AiProcessing messages={['读取项目全量数据…', '分析财务与估值…', '梳理风险与条款…', '撰写投委会备忘录…']} />
       ) : memo ? (
-        <div className="ai-answer" data-testid="memo-body"><Markdown text={memo} />{busy && <span className="stream-cursor" aria-hidden="true" />}</div>
+        <div className="ai-answer" data-testid="memo-body"><Markdown text={memo} /></div>
       ) : err ? (
         <p className="muted-note">{err}</p>
       ) : (
-        <p className="muted-note">基于本项目的卡片 / 投资汇总 / 财务 / 决策 / 委派等真实数据,一键生成结构化投资备忘录(IC Memo),可直接进投委会材料。</p>
+        <p className="muted-note">基于本项目的卡片 / 投资汇总 / 财务 / 决策 / 委派等真实数据,一键生成结构化投资备忘录(IC Memo);生成后可修改、保存草稿、提交为现行版本。</p>
       )}
     </div>
   )
@@ -2577,6 +2723,10 @@ function DetailPage({
   const [sectionRows, setSectionRows] = useState<DataRow[]>([])
   const [sectionLoading, setSectionLoading] = useState(false)
   const [subtab, setSubtab] = useState<ProjectSubtab>('基本情况') // 项目卡片二级 tab
+  const [editingBasic, setEditingBasic] = useState(false)        // 基本情况编辑态(反馈 #6)
+  const [basicBaseline, setBasicBaseline] = useState<Record<string, string>>({}) // 进入编辑时的服务端值,供重置/取消
+  const [hasBasicDraft, setHasBasicDraft] = useState(false)      // 服务端存有未提交草稿
+  const [savingBasicDraft, setSavingBasicDraft] = useState(false)
   const [summary, setSummary] = useState<InvestSummary | null>(null)
   const [summaryLoading, setSummaryLoading] = useState(false)
   const sectionMap = kind === 'fund' ? FUND_SECTION_DATA : SECTION_DATA
@@ -2655,7 +2805,7 @@ function DetailPage({
   useEffect(() => {
     const urlId = readRouteId()
     if (urlId != null) setSelectedId(urlId)
-    setSection('概况')
+    setSection(SECTION_DEFAULT_BY_SCREEN[screen.id] ?? '概况')
   }, [screen.id])
 
   // 载入实体列表(供选择)。
@@ -2690,8 +2840,8 @@ function DetailPage({
     return () => { ignore = true }
   }, [selectedId, listPath])
 
-  const save = async () => {
-    if (selectedId == null) return
+  const save = async (): Promise<boolean> => {
+    if (selectedId == null) return false
     setSaving(true)
     try {
       const body: Record<string, unknown> = {}
@@ -2713,12 +2863,62 @@ function DetailPage({
       apiGet<Record<string, unknown>>(`${listPath}/${selectedId}`)
         .then((d) => setLoadedAt(d.updated_at ? String(d.updated_at) : null))
         .catch(() => undefined)
+      return true
     } catch (error) {
       onToast({ title: '保存失败', detail: error instanceof Error ? error.message : 'API 调用失败' })
+      return false
     } finally {
       setSaving(false)
     }
   }
+
+  // ── 基本情况编辑态:修改 → 保存草稿/提交/重置(反馈 #6)────────────────
+  const basicKeys = PROJECT_BASIC_GROUPS.flatMap(([, keys]) => keys)
+  const basicSubset = (src: Record<string, string>): Record<string, string> => {
+    const out: Record<string, string> = {}
+    for (const k of basicKeys) out[k] = src[k] ?? ''
+    return out
+  }
+  // 切换项目/退出卡片时收起编辑态,并检查是否有草稿。
+  useEffect(() => {
+    setEditingBasic(false); setHasBasicDraft(false)
+    if (kind !== 'project' || selectedId == null || !canWrite) return
+    let alive = true
+    apiGet<{ draft: Record<string, string> | null }>(`${listPath}/${selectedId}/drafts/basic_info`)
+      .then((r) => { if (alive) setHasBasicDraft(!!r.draft && Object.keys(r.draft).length > 0) })
+      .catch(() => {})
+    return () => { alive = false }
+  }, [selectedId, kind, canWrite, listPath])
+
+  const enterEditBasic = async (useDraft: boolean) => {
+    setBasicBaseline(basicSubset(form)) // 当前服务端值作为重置基线
+    if (useDraft) {
+      try {
+        const r = await apiGet<{ draft: Record<string, string> | null }>(`${listPath}/${selectedId}/drafts/basic_info`)
+        if (r.draft) setForm((prev) => ({ ...prev, ...r.draft }))
+      } catch { /* 用现值起编 */ }
+    }
+    setEditingBasic(true)
+  }
+  const saveBasicDraft = async () => {
+    if (selectedId == null) return
+    setSavingBasicDraft(true)
+    try {
+      await apiPut(`${listPath}/${selectedId}/drafts/basic_info`, { draft: basicSubset(form) })
+      setHasBasicDraft(true)
+      onToast({ title: '草稿已保存', detail: '未提交,下次可继续编辑' })
+    } catch (e) { onToast({ title: '保存草稿失败', detail: e instanceof Error ? e.message : '' }) }
+    finally { setSavingBasicDraft(false) }
+  }
+  const submitBasic = async () => {
+    const ok = await save()
+    if (ok) {
+      await apiDelete(`${listPath}/${selectedId}/drafts/basic_info`).catch(() => {})
+      setEditingBasic(false); setHasBasicDraft(false)
+    }
+  }
+  const resetBasic = () => { setForm((prev) => ({ ...prev, ...basicBaseline })); onToast({ title: '已重置', detail: '基本情况已恢复为保存前的值' }) }
+  const cancelBasic = () => { setForm((prev) => ({ ...prev, ...basicBaseline })); setEditingBasic(false) }
 
   const advance = async () => {
     if (selectedId == null) return
@@ -2813,12 +3013,25 @@ function DetailPage({
 
       {kind === 'project' ? (
         <>
-          {/* 顶部 section 导航(对照反馈:概况/日程/基金投资情况/…/协议条款AI) */}
+          {/* 反馈 #7:左侧目录(概况/投资关系/投后数据)+ 该目录下的 section 二级导航 */}
           <section className="panel full-span motion-item section-tabbar">
-            <div className="subtab-bar" data-testid="project-sections">
-              {PROJECT_SECTIONS.map((s) => (
-                <button key={s} type="button" className={classNames('subtab', section === s && 'is-active')} onClick={() => setSection(s)}>{s}</button>
-              ))}
+            <div className="project-dir-layout">
+              <nav className="project-dir" data-testid="project-directory">
+                {PROJECT_DIRECTORY.map((d) => {
+                  const active = d.sections.includes(section)
+                  return (
+                    <button key={d.label} type="button" className={classNames('project-dir-item', active && 'is-active')}
+                      onClick={() => { if (!d.sections.includes(section)) setSection(d.sections[0]) }}>
+                      {d.label}
+                    </button>
+                  )
+                })}
+              </nav>
+              <div className="subtab-bar project-dir-sections" data-testid="project-sections">
+                {(PROJECT_DIRECTORY.find((d) => d.sections.includes(section)) ?? PROJECT_DIRECTORY[0]).sections.map((s) => (
+                  <button key={s} type="button" className={classNames('subtab', section === s && 'is-active')} onClick={() => setSection(s)}>{s}</button>
+                ))}
+              </div>
             </div>
           </section>
 
@@ -2880,10 +3093,10 @@ function DetailPage({
                           <label key={k} className={f.long ? 'span-2' : undefined}>
                             <span>{f.label}</span>
                             {f.long ? (
-                              <textarea value={form[k] ?? ''} readOnly={!canWrite} data-field={k} rows={3}
+                              <textarea value={form[k] ?? ''} readOnly={!canWrite || !editingBasic} data-field={k} rows={3}
                                 onChange={(e) => setForm((prev) => ({ ...prev, [k]: e.target.value }))} />
                             ) : (
-                              <input type="text" value={form[k] ?? ''} readOnly={!canWrite} data-field={k}
+                              <input type="text" value={form[k] ?? ''} readOnly={!canWrite || !editingBasic} data-field={k}
                                 onChange={(e) => setForm((prev) => ({ ...prev, [k]: e.target.value }))} />
                             )}
                           </label>
@@ -2892,10 +3105,28 @@ function DetailPage({
                     </div>
                   </fieldset>
                 ))}
-                <div className="button-row" style={{ marginTop: 14 }}>
-                  <button type="button" className="primary-button" disabled={!canWrite || saving || selectedId == null} data-testid="detail-save" onClick={save}>
-                    <CheckCircle size={16} /> {saving ? '保存中…' : '修改'}
-                  </button>
+                <div className="button-row" style={{ marginTop: 14, flexWrap: 'wrap' }}>
+                  {!editingBasic ? (
+                    <>
+                      <button type="button" className="primary-button" disabled={!canWrite || selectedId == null} data-testid="detail-edit" onClick={() => enterEditBasic(false)}>
+                        <CheckCircle size={16} /> 修改
+                      </button>
+                      {hasBasicDraft && canWrite && (
+                        <button type="button" className="secondary-button" data-testid="detail-resume-draft" onClick={() => enterEditBasic(true)}>继续编辑草稿</button>
+                      )}
+                    </>
+                  ) : (
+                    <>
+                      <button type="button" className="primary-button" disabled={saving || savingBasicDraft} data-testid="detail-submit" onClick={submitBasic}>
+                        <CheckCircle size={16} /> {saving ? '提交中…' : '提交'}
+                      </button>
+                      <button type="button" className="secondary-button" disabled={saving || savingBasicDraft} data-testid="detail-save-draft" onClick={saveBasicDraft}>
+                        {savingBasicDraft ? '保存中…' : '保存草稿'}
+                      </button>
+                      <button type="button" className="secondary-button" disabled={saving || savingBasicDraft} onClick={resetBasic}>重置</button>
+                      <button type="button" className="secondary-button" disabled={saving} onClick={cancelBasic}>取消</button>
+                    </>
+                  )}
                 </div>
               </div>
             )}

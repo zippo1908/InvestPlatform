@@ -199,6 +199,11 @@ class ExtractClausesPayload(BaseModel):
     text: str = Field(min_length=1)
 
 
+class FeedbackAttachmentIn(BaseModel):
+    name: str = Field(default="attachment", max_length=200)
+    data_url: str  # data:<mime>;base64,.... 用户手动上传的附件(图片/PDF 等)
+
+
 class CreateFeedbackPayload(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
     screen_id: str | None = Field(default=None, max_length=80)
@@ -207,6 +212,7 @@ class CreateFeedbackPayload(BaseModel):
     component_label: str | None = Field(default=None, max_length=300)
     category: str = Field(default="other", max_length=40)
     screenshot: str | None = None  # data:image/jpeg;base64,... 一键截图(可选)
+    attachments: list[FeedbackAttachmentIn] = Field(default_factory=list)  # 手动上传附件(可多)
 
 
 class FeedbackStatusPayload(BaseModel):
@@ -711,6 +717,56 @@ def ensure_ui_action_table(cursor: Any) -> None:
           CONSTRAINT fk_cap_ui_action_actor
             FOREIGN KEY (actor_user_id) REFERENCES cap_users (user_id)
             ON DELETE SET NULL
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """
+    )
+
+
+def ensure_feature_tables(cursor: Any) -> None:
+    """启动时幂等建出反馈#5–#8 用到的三张表(草稿 / 项目备忘录 / 反馈附件)。
+    与 ensure_ui_action_table 同风格:CREATE TABLE IF NOT EXISTS,重启即生效,无需手动迁移。"""
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS cap_card_drafts (
+          draft_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+          tenant_id BIGINT UNSIGNED NOT NULL,
+          project_id BIGINT UNSIGNED NOT NULL,
+          card_kind VARCHAR(40) NOT NULL,
+          draft_json JSON NOT NULL,
+          author_user_id BIGINT UNSIGNED NULL,
+          updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+          PRIMARY KEY (draft_id),
+          UNIQUE KEY uq_card_draft (tenant_id, project_id, card_kind, author_user_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """
+    )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS cap_project_memos (
+          memo_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+          tenant_id BIGINT UNSIGNED NOT NULL,
+          project_id BIGINT UNSIGNED NOT NULL,
+          content MEDIUMTEXT NOT NULL,
+          status VARCHAR(20) NOT NULL DEFAULT 'submitted',
+          updated_by BIGINT UNSIGNED NULL,
+          updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+          PRIMARY KEY (memo_id),
+          UNIQUE KEY uq_project_memo (tenant_id, project_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """
+    )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS cap_feedback_attachments (
+          attachment_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+          feedback_id BIGINT UNSIGNED NOT NULL,
+          tenant_id BIGINT UNSIGNED NOT NULL,
+          file_name VARCHAR(255) NOT NULL,
+          file_path VARCHAR(255) NOT NULL,
+          mime_type VARCHAR(100) NULL,
+          created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          PRIMARY KEY (attachment_id),
+          KEY idx_fb_att (feedback_id)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """
     )
@@ -1664,6 +1720,34 @@ def _create_github_issue(title: str, body: str) -> tuple[int, str]:
 _FEEDBACK_SHOTS_DIR = os.path.join(os.path.dirname(__file__), "feedback_shots")
 
 
+_MIME_EXT = {
+    "image/png": "png", "image/jpeg": "jpg", "image/jpg": "jpg", "image/gif": "gif",
+    "image/webp": "webp", "application/pdf": "pdf", "text/plain": "txt",
+}
+
+
+def _save_feedback_attachment(fid: int, idx: int, data_url: str) -> tuple[str, str] | None:
+    """存一个手动上传附件(data:<mime>;base64,...),返回 (相对文件名, mime)。失败返回 None。"""
+    try:
+        mime = "application/octet-stream"
+        b64 = data_url
+        if data_url.startswith("data:") and "," in data_url:
+            header, b64 = data_url.split(",", 1)
+            m = re.match(r"data:([^;]+)", header)
+            if m:
+                mime = m.group(1)
+        raw = base64.b64decode(b64)
+        if len(raw) > 12 * 1024 * 1024:  # 单附件上限 12MB
+            return None
+        os.makedirs(_FEEDBACK_SHOTS_DIR, exist_ok=True)
+        rel = f"fb-{fid}-att{idx}.{_MIME_EXT.get(mime, 'bin')}"
+        with open(os.path.join(_FEEDBACK_SHOTS_DIR, rel), "wb") as fh:
+            fh.write(raw)
+        return rel, mime
+    except Exception:  # noqa: BLE001 单个附件失败不拖累反馈本身
+        return None
+
+
 def _save_feedback_screenshot(fid: int, data_url: str) -> str | None:
     """把 data:image/...;base64,... 存成文件,返回相对路径(存不了返回 None)。"""
     try:
@@ -1701,10 +1785,20 @@ def create_feedback(payload: CreateFeedbackPayload, user: AuthedUser = Depends(r
                 shot = _save_feedback_screenshot(fid, payload.screenshot)
                 if shot:
                     cursor.execute("UPDATE cap_feedback_annotations SET screenshot_path=%s WHERE feedback_id=%s", (shot, fid))
+            saved_attachments = 0
+            for idx, att in enumerate(payload.attachments[:6]):  # 最多 6 个手动附件
+                saved = _save_feedback_attachment(fid, idx, att.data_url)
+                if saved:
+                    rel, mime = saved
+                    cursor.execute(
+                        "INSERT INTO cap_feedback_attachments (feedback_id, tenant_id, file_name, file_path, mime_type) VALUES (%s,%s,%s,%s,%s)",
+                        (fid, tid, (att.name or "attachment")[:255], rel, mime[:100]),
+                    )
+                    saved_attachments += 1
         connection.commit()
     finally:
         connection.close()
-    return {"ok": True, "feedback_id": fid}
+    return {"ok": True, "feedback_id": fid, "attachments": saved_attachments}
 
 
 @app.get("/api/feedback/{feedback_id}/screenshot")
@@ -1726,6 +1820,45 @@ def feedback_screenshot(feedback_id: int, user: AuthedUser = Depends(require_rol
     return FileResponse(path, media_type="image/jpeg")
 
 
+@app.get("/api/feedback/{feedback_id}/attachments")
+def list_feedback_attachments(feedback_id: int, user: AuthedUser = Depends(require_roles("system_admin", "managing_partner"))) -> dict[str, Any]:
+    """列某条反馈的手动上传附件(管理员汇总页展开时取)。"""
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT attachment_id AS id, file_name, mime_type FROM cap_feedback_attachments WHERE feedback_id=%s AND tenant_id=%s ORDER BY attachment_id",
+                (feedback_id, tid),
+            )
+            rows = cursor.fetchall()
+    finally:
+        connection.close()
+    return {"items": rows}
+
+
+@app.get("/api/feedback/{feedback_id}/attachments/{attachment_id}")
+def download_feedback_attachment(feedback_id: int, attachment_id: int, user: AuthedUser = Depends(require_roles("system_admin", "managing_partner"))) -> FileResponse:
+    """下载/预览某个反馈附件。"""
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT file_name, file_path, mime_type FROM cap_feedback_attachments WHERE attachment_id=%s AND feedback_id=%s AND tenant_id=%s",
+                (attachment_id, feedback_id, tid),
+            )
+            row = cursor.fetchone()
+    finally:
+        connection.close()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    path = os.path.join(_FEEDBACK_SHOTS_DIR, os.path.basename(str(row["file_path"])))
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Attachment file missing")
+    return FileResponse(path, media_type=row["mime_type"] or "application/octet-stream", filename=row["file_name"] or None)
+
+
 @app.get("/api/feedback")
 def list_feedback(user: AuthedUser = Depends(require_roles("system_admin", "managing_partner")), status: str | None = None) -> dict[str, Any]:
     """汇总所有标注(管理员/开发账号审阅)。可选按 status 过滤。"""
@@ -1737,7 +1870,8 @@ def list_feedback(user: AuthedUser = Depends(require_roles("system_admin", "mana
                 cursor.execute(
                     """SELECT f.feedback_id AS id, f.screen_id, f.screen_title, f.page_url, f.component_label,
                               f.screenshot_path, f.category, f.message, f.status, f.github_issue_number, f.github_issue_url,
-                              f.created_at, u.display_name AS author
+                              f.created_at, u.display_name AS author,
+                              (SELECT COUNT(*) FROM cap_feedback_attachments a WHERE a.feedback_id=f.feedback_id) AS attachment_count
                        FROM cap_feedback_annotations f LEFT JOIN cap_users u ON u.user_id=f.author_user_id
                        WHERE f.tenant_id=%s AND f.status=%s ORDER BY f.feedback_id DESC LIMIT 500""",
                     (tid, status),
@@ -1746,7 +1880,8 @@ def list_feedback(user: AuthedUser = Depends(require_roles("system_admin", "mana
                 cursor.execute(
                     """SELECT f.feedback_id AS id, f.screen_id, f.screen_title, f.page_url, f.component_label,
                               f.screenshot_path, f.category, f.message, f.status, f.github_issue_number, f.github_issue_url,
-                              f.created_at, u.display_name AS author
+                              f.created_at, u.display_name AS author,
+                              (SELECT COUNT(*) FROM cap_feedback_attachments a WHERE a.feedback_id=f.feedback_id) AS attachment_count
                        FROM cap_feedback_annotations f LEFT JOIN cap_users u ON u.user_id=f.author_user_id
                        WHERE f.tenant_id=%s ORDER BY f.feedback_id DESC LIMIT 500""",
                     (tid,),
@@ -2534,6 +2669,130 @@ def update_project(
     finally:
         connection.close()
     return {"ok": True, "project_id": project_id, "updated_fields": list(fields), "audit_id": audit_id}
+
+
+# ── 可编辑卡片:服务端草稿 + AI 备忘录落地(反馈 #5 / #6)────────────────────────
+_DRAFT_KINDS = {"basic_info", "ai_memo"}
+
+
+class CardDraftPayload(BaseModel):
+    draft: dict[str, Any] = Field(default_factory=dict)
+
+
+class ProjectMemoPayload(BaseModel):
+    content: str = Field(min_length=1, max_length=100000)
+
+
+def _draft_json_to_obj(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    try:
+        return loads(value) if value else {}
+    except (TypeError, ValueError):
+        return {}
+
+
+@app.get("/api/projects/{project_id}/drafts/{card_kind}")
+def get_card_draft(project_id: int, card_kind: str, user: AuthedUser = Depends(require_permission("project.edit"))) -> dict[str, Any]:
+    """读当前用户在此项目此卡片上的草稿(每人每卡一份)。无则 draft=None。"""
+    if card_kind not in _DRAFT_KINDS:
+        raise HTTPException(status_code=400, detail="Unknown card_kind")
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT draft_json, updated_at FROM cap_card_drafts WHERE tenant_id=%s AND project_id=%s AND card_kind=%s AND author_user_id=%s",
+                (tid, project_id, card_kind, user.user_id),
+            )
+            row = cursor.fetchone()
+    finally:
+        connection.close()
+    if not row:
+        return {"draft": None, "updated_at": None}
+    return {"draft": _draft_json_to_obj(row["draft_json"]),
+            "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None}
+
+
+@app.put("/api/projects/{project_id}/drafts/{card_kind}")
+def put_card_draft(project_id: int, card_kind: str, payload: CardDraftPayload, user: AuthedUser = Depends(require_permission("project.edit"))) -> dict[str, Any]:
+    """存/覆盖草稿(不动正式表)。提交成功后由前端调 DELETE 清掉。"""
+    if card_kind not in _DRAFT_KINDS:
+        raise HTTPException(status_code=400, detail="Unknown card_kind")
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """INSERT INTO cap_card_drafts (tenant_id, project_id, card_kind, draft_json, author_user_id)
+                   VALUES (%s,%s,%s,%s,%s)
+                   ON DUPLICATE KEY UPDATE draft_json=VALUES(draft_json)""",
+                (tid, project_id, card_kind, dumps(payload.draft, ensure_ascii=False), user.user_id),
+            )
+        connection.commit()
+    finally:
+        connection.close()
+    return {"ok": True}
+
+
+@app.delete("/api/projects/{project_id}/drafts/{card_kind}")
+def delete_card_draft(project_id: int, card_kind: str, user: AuthedUser = Depends(require_permission("project.edit"))) -> dict[str, Any]:
+    """丢弃草稿(重置或提交后调用)。"""
+    if card_kind not in _DRAFT_KINDS:
+        raise HTTPException(status_code=400, detail="Unknown card_kind")
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "DELETE FROM cap_card_drafts WHERE tenant_id=%s AND project_id=%s AND card_kind=%s AND author_user_id=%s",
+                (tid, project_id, card_kind, user.user_id),
+            )
+        connection.commit()
+    finally:
+        connection.close()
+    return {"ok": True}
+
+
+@app.get("/api/projects/{project_id}/memo")
+def get_project_memo(project_id: int, user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
+    """取项目当前已提交的投资备忘录(编辑面板载入用)。无则 memo=None。"""
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT content, status, updated_at FROM cap_project_memos WHERE tenant_id=%s AND project_id=%s",
+                (tid, project_id),
+            )
+            row = cursor.fetchone()
+    finally:
+        connection.close()
+    if not row:
+        return {"memo": None}
+    return {"memo": {"content": row["content"], "status": row["status"],
+                     "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None}}
+
+
+@app.put("/api/projects/{project_id}/memo")
+def put_project_memo(project_id: int, payload: ProjectMemoPayload, user: AuthedUser = Depends(require_permission("project.edit"))) -> dict[str, Any]:
+    """提交(定稿)投资备忘录 —— 用户在 AI 生成基础上编辑后保存的正式版。每项目一条现行版。"""
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """INSERT INTO cap_project_memos (tenant_id, project_id, content, status, updated_by)
+                   VALUES (%s,%s,%s,'submitted',%s)
+                   ON DUPLICATE KEY UPDATE content=VALUES(content), status='submitted', updated_by=VALUES(updated_by)""",
+                (tid, project_id, payload.content, user.user_id),
+            )
+            write_audit(cursor, user.user_id, "project.memo.submit", "project", project_id,
+                        "投资备忘录", after={"length": len(payload.content)})
+        connection.commit()
+    finally:
+        connection.close()
+    return {"ok": True}
 
 
 def _soft_delete(cursor, *, table: str, id_col: str, obj_type: str, obj_id: int, label: str, user: "AuthedUser") -> None:
@@ -4007,6 +4266,16 @@ def _load_ai_settings_into_env() -> None:
 @app.on_event("startup")
 def _startup_load_ai_settings() -> None:
     _load_ai_settings_into_env()
+    try:
+        connection = connect_db()
+        try:
+            with connection.cursor() as cursor:
+                ensure_feature_tables(cursor)
+            connection.commit()
+        finally:
+            connection.close()
+    except Exception:  # noqa: BLE001 建表失败不该阻断启动;端点首次用到会再报清楚
+        pass
 
 
 @app.get("/api/ai/config")

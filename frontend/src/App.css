@@ -1998,6 +1998,19 @@ tbody tr:hover {
 .section-tabbar { padding: 4px 10px; }
 .section-tabbar .subtab-bar { margin-bottom: 0; border-bottom: none; }
 
+/* 反馈 #7:项目详情左侧目录 */
+.project-dir-layout { display: flex; align-items: stretch; gap: 12px; }
+.project-dir { display: flex; flex-direction: column; gap: 4px; padding-right: 12px; border-right: 1px solid var(--line); flex: none; min-width: 92px; }
+.project-dir-item { text-align: left; padding: 7px 12px; border: none; border-radius: 8px; background: transparent; color: var(--muted);
+  font-size: 13px; font-weight: 600; cursor: pointer; white-space: nowrap; }
+.project-dir-item:hover { background: #f1f5f9; color: var(--ink); }
+.project-dir-item.is-active { background: #eef2ff; color: var(--accent, #4f46e5); }
+.project-dir-sections { display: flex; flex-wrap: wrap; align-items: center; }
+@media (max-width: 720px) {
+  .project-dir-layout { flex-direction: column; }
+  .project-dir { flex-direction: row; flex-wrap: wrap; border-right: none; border-bottom: 1px solid var(--line); padding-right: 0; padding-bottom: 8px; }
+}
+
 /* ── 页面反馈 / 标注工具 ── */
 .fb-widget { position: fixed; right: 20px; bottom: 20px; z-index: 60; }
 .fb-fab {
@@ -2047,6 +2060,16 @@ tbody tr:hover {
 .fb-check input { width: 14px; height: 14px; }
 .fb-shot { width: 100%; border: 1px solid var(--line); border-radius: 8px; margin: 6px 0; display: block; }
 .fb-review .full-width { margin-bottom: 10px; }
+
+/* 反馈附件(#8):提交区选中态 chip + 汇总区可下载 chip */
+.fb-attachments, .fb-att-list { display: flex; flex-wrap: wrap; gap: 6px; margin: 2px 0 4px; }
+.fb-att-chip { display: inline-flex; align-items: center; gap: 5px; max-width: 100%; padding: 3px 8px; font-size: 12px;
+  border: 1px solid var(--line); border-radius: 999px; background: #eef2ff; color: var(--ink); cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fb-att-chip:hover { background: #e0e7ff; }
+.fb-att-remove { border: none; background: transparent; color: var(--muted); cursor: pointer; font-size: 14px; line-height: 1; padding: 0 2px; }
+
+/* AI 备忘录编辑区(#5) */
+.memo-editor { border: 1px solid var(--line); border-radius: 10px; background: var(--surface, #fff); color: var(--ink); box-sizing: border-box; }
 
 /* 系统管理:权限预览 + 内联新增表单 */
 .perm-preview { margin-top: 12px; border: 1px solid var(--line); border-radius: 8px; padding: 12px; background: #f8fafc; }

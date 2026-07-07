@@ -107,6 +107,13 @@ export function apiPatch<T = ApiResult>(path: string, body: unknown = {}): Promi
   })
 }
 
+export function apiPut<T = ApiResult>(path: string, body: unknown = {}): Promise<T> {
+  return request<T>(path, {
+    method: 'PUT',
+    body: JSON.stringify(body),
+  })
+}
+
 export function apiDelete<T = ApiResult>(path: string): Promise<T> {
   return request<T>(path, { method: 'DELETE' })
 }
