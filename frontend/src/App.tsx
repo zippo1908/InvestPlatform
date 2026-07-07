@@ -2717,7 +2717,6 @@ function DetailPage({
   const [basicBaseline, setBasicBaseline] = useState<Record<string, string>>({}) // 进入编辑时的服务端值,供重置/取消
   const [hasBasicDraft, setHasBasicDraft] = useState(false)      // 服务端存有未提交草稿
   const [savingBasicDraft, setSavingBasicDraft] = useState(false)
-  const [dirQuery, setDirQuery] = useState('') // 左侧项目/基金目录搜索
   const [summary, setSummary] = useState<InvestSummary | null>(null)
   const [summaryLoading, setSummaryLoading] = useState(false)
   const sectionMap = kind === 'fund' ? FUND_SECTION_DATA : SECTION_DATA
@@ -2955,48 +2954,30 @@ function DetailPage({
   const fundStage = FUND_STAGE_INDEX[fundStatus] ?? 0
 
   const dirLabel = kind === 'project' ? '项目' : '基金'
-  const dirFiltered = entities.filter((e) => {
-    const q = dirQuery.trim().toLowerCase()
-    if (!q) return true
-    return [e[nameKey], e.name, e.stage_label, e.sector, e.city].some((v) => String(v ?? '').toLowerCase().includes(q))
-  })
 
   return (
-    <div className="entity-master-detail">
-      {/* 左侧目录:选不同的对象(项目/基金)→ 右侧看该对象明细 */}
-      <aside className="entity-rail" data-testid="entity-directory">
-        <div className="entity-rail-head">
-          <strong>{dirLabel}目录</strong>
-          <span className="entity-rail-count">{entities.length}</span>
-        </div>
-        <input
-          className="entity-rail-search"
-          placeholder={`搜索${dirLabel}…`}
-          value={dirQuery}
-          onChange={(e) => setDirQuery(e.target.value)}
-          data-testid="entity-directory-search"
-        />
-        <div className="entity-rail-list">
+    <div className="page-grid" ref={stageRef}>
+      {/* 次一级导航栏:切换不同的项目/基金 → 下方展示所选对象的明细 */}
+      <nav className="panel entity-subnav full-span motion-item" data-testid="entity-directory">
+        <span className="entity-subnav-label">{dirLabel}</span>
+        <div className="entity-subnav-list">
           {loading ? (
-            <p className="muted-note" style={{ padding: '8px 10px' }}>加载中…</p>
-          ) : dirFiltered.length === 0 ? (
-            <p className="muted-note" style={{ padding: '8px 10px' }}>无匹配{dirLabel}</p>
-          ) : dirFiltered.map((e) => (
+            <span className="muted-note">加载中…</span>
+          ) : entities.length === 0 ? (
+            <span className="muted-note">暂无{dirLabel}</span>
+          ) : entities.map((e) => (
             <button
               key={String(e.id)}
               type="button"
-              className={classNames('entity-rail-item', Number(e.id) === selectedId && 'is-active')}
+              className={classNames('entity-subnav-item', Number(e.id) === selectedId && 'is-active')}
               onClick={() => setSelectedId(Number(e.id))}
-              data-testid={`entity-rail-item-${e.id}`}
+              data-testid={`entity-subnav-item-${e.id}`}
             >
-              <span className="entity-rail-name">{String(e[nameKey] ?? e.name ?? e.id)}</span>
-              <span className="entity-rail-sub">{String(e.stage_label ?? e.fund_status ?? e.sector ?? '')}</span>
+              {String(e[nameKey] ?? e.name ?? e.id)}
             </button>
           ))}
         </div>
-      </aside>
-
-      <div className="entity-detail-main page-grid" ref={stageRef}>
+      </nav>
       <section className="panel detail-hero full-span motion-item">
         <div>
           <span className="page-kicker">{screen.group}</span>
@@ -3334,7 +3315,6 @@ function DetailPage({
           )}
         </>
       )}
-      </div>
     </div>
   )
 }

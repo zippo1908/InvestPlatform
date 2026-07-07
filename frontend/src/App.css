@@ -1216,28 +1216,14 @@ tbody tr:hover {
   width: 100%;
 }
 
-/* 项目/基金详情:左侧目录(选对象)+ 右侧明细 主从布局 */
-.entity-master-detail { display: flex; align-items: flex-start; gap: 16px; }
-.entity-detail-main { flex: 1; min-width: 0; }
-.entity-rail {
-  flex: none; width: 240px; position: sticky; top: 12px; align-self: flex-start;
-  background: var(--surface, #fff); border: 1px solid var(--line); border-radius: 12px;
-  padding: 10px; max-height: calc(100vh - 96px); display: flex; flex-direction: column; gap: 8px;
-}
-.entity-rail-head { display: flex; align-items: center; justify-content: space-between; padding: 2px 4px; color: var(--ink); }
-.entity-rail-count { font-size: 12px; color: var(--muted); background: #f1f5f9; border-radius: 999px; padding: 1px 8px; }
-.entity-rail-search { width: 100%; box-sizing: border-box; padding: 6px 9px; border: 1px solid var(--line); border-radius: 8px; font-size: 13px; }
-.entity-rail-list { overflow-y: auto; display: flex; flex-direction: column; gap: 2px; }
-.entity-rail-item { text-align: left; display: flex; flex-direction: column; gap: 1px; padding: 8px 10px; border: none; border-radius: 8px; background: transparent; cursor: pointer; }
-.entity-rail-item:hover { background: #f1f5f9; }
-.entity-rail-item.is-active { background: #eef2ff; }
-.entity-rail-name { font-size: 13.5px; font-weight: 600; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.entity-rail-item.is-active .entity-rail-name { color: var(--accent, #4f46e5); }
-.entity-rail-sub { font-size: 11.5px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-@media (max-width: 860px) {
-  .entity-master-detail { flex-direction: column; }
-  .entity-rail { width: 100%; position: static; max-height: 240px; }
-}
+/* 项目/基金详情:内容区次一级导航栏(横向切换对象) */
+.entity-subnav { display: flex; align-items: center; gap: 10px; padding: 8px 12px; }
+.entity-subnav-label { flex: none; font-size: 12px; font-weight: 600; color: var(--muted); }
+.entity-subnav-list { display: flex; gap: 6px; overflow-x: auto; padding-bottom: 2px; scrollbar-width: thin; }
+.entity-subnav-item { flex: none; padding: 6px 14px; border: 1px solid var(--line); border-radius: 999px; background: transparent;
+  color: var(--ink); font-size: 13px; font-weight: 600; cursor: pointer; white-space: nowrap; }
+.entity-subnav-item:hover { background: #f1f5f9; }
+.entity-subnav-item.is-active { background: var(--accent, #4f46e5); border-color: var(--accent, #4f46e5); color: #fff; }
 
 .detail-hero {
   display: flex;
