@@ -4352,6 +4352,8 @@ function ListControls({
   const fileRef = useRef<HTMLInputElement>(null)
   const [kw, setKw] = useState('')
   const canImport = screen.id === 'project-list' || screen.id === 'project-board' // 导入目前落到项目表
+  // 新增按钮跳转到对应的独立新建页(反馈 issue #11)。
+  const addTarget = ({ 'project-list': 'project-add', 'project-board': 'project-add', 'fund-list': 'fund-add' } as Record<string, string>)[screen.id]
 
   const doImport = async (file: File) => {
     try {
@@ -4427,6 +4429,18 @@ function ListControls({
         <Download size={16} />
         导出 CSV
       </button>
+      {addTarget && (
+        <button
+          className="primary-button"
+          type="button"
+          disabled={!canWrite}
+          onClick={() => goTo(addTarget)}
+          data-testid="list-add-entity"
+        >
+          <Plus size={16} />
+          {screen.id === 'fund-list' ? '新增基金' : '新增项目'}
+        </button>
+      )}
       {/* 「批量操作」原为只发审计不干实事的占位钮 → 移除(台账勾选行后有真实「批量删除」)。 */}
     </div>
   )
