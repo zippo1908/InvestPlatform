@@ -2719,6 +2719,7 @@ function DetailPage({
   const [hasBasicDraft, setHasBasicDraft] = useState(false)      // 服务端存有未提交草稿
   const [savingBasicDraft, setSavingBasicDraft] = useState(false)
   const [view, setView] = useState<'list' | 'detail'>(() => (readRouteId() != null ? 'detail' : 'list')) // 清单页 / 明细页
+  const [dirQuery, setDirQuery] = useState('') // 清单页关键字检索(反馈 issue #10)
   const [summary, setSummary] = useState<InvestSummary | null>(null)
   const [summaryLoading, setSummaryLoading] = useState(false)
   const sectionMap = kind === 'fund' ? FUND_SECTION_DATA : SECTION_DATA
@@ -2799,6 +2800,7 @@ function DetailPage({
     if (urlId != null) setSelectedId(urlId)
     setSection('概况')
     setView(urlId != null ? 'detail' : 'list') // 带 ?id= 进来直达明细,否则先看清单
+    setDirQuery('')
   }, [screen.id])
 
   // 载入实体列表(供选择)。
@@ -2958,8 +2960,12 @@ function DetailPage({
 
   const dirLabel = kind === 'project' ? '项目' : '基金'
 
-  // 清单页:卡片网格(自动换行),点一个进该对象明细。
+  // 清单页:卡片网格(自动换行),点一个进该对象明细;顶部关键字检索(名称/阶段/行业/城市全字段匹配)。
   if (view === 'list') {
+    const dq = dirQuery.trim().toLowerCase()
+    const matched = dq
+      ? entities.filter((e) => Object.values(e).join(' ').toLowerCase().includes(dq))
+      : entities
     return (
       <div className="page-grid">
         <section className="panel detail-hero full-span motion-item">
@@ -2970,13 +2976,28 @@ function DetailPage({
           </div>
         </section>
         <section className="panel full-span motion-item">
+          <div className="list-controls">
+            <label className="table-search">
+              <Search size={15} />
+              <input
+                value={dirQuery}
+                onChange={(e) => setDirQuery(e.target.value)}
+                placeholder={`输入${dirLabel}关键字检索(名称 / 阶段 / 行业 / 城市)`}
+                aria-label={`检索${dirLabel}`}
+                data-testid="entity-picker-search"
+              />
+            </label>
+            {dq ? <span className="muted-note">匹配 {matched.length} / {entities.length} 个{dirLabel}</span> : null}
+          </div>
           {loading ? (
             <p className="muted-note">加载中…</p>
           ) : entities.length === 0 ? (
             <p className="muted-note">暂无{dirLabel}。</p>
+          ) : matched.length === 0 ? (
+            <p className="muted-note">没有匹配「{dirQuery.trim()}」的{dirLabel},换个关键字试试。</p>
           ) : (
             <div className="entity-picker-grid" data-testid="entity-picker">
-              {entities.map((e) => (
+              {matched.map((e) => (
                 <button
                   key={String(e.id)}
                   type="button"
