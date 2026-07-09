@@ -2292,3 +2292,44 @@ tbody tr:hover {
 .external-fill-error { color: #dc2626; font-size: 13px; margin: 0; }
 .external-fill-done { font-size: 15px; }
 .external-fill-footer { color: #94a3b8; font-size: 12px; margin: 6px 0 0; }
+
+/* ── 实体明细抽屉(列表行点击滑出;导航裁剪后明细不再占侧栏) ── */
+.entity-drawer-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.42);
+  z-index: 80;
+  display: flex;
+  justify-content: flex-end;
+}
+.entity-drawer {
+  width: min(1180px, 94vw);
+  height: 100vh;
+  background: #f8fafc;
+  box-shadow: -24px 0 64px rgba(15, 23, 42, 0.25);
+  display: flex;
+  flex-direction: column;
+  animation: entity-drawer-in 0.28s cubic-bezier(0.22, 1, 0.36, 1);
+}
+@keyframes entity-drawer-in {
+  from { transform: translateX(48px); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .entity-drawer { animation: none; }
+}
+.entity-drawer-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 22px;
+  background: white;
+  border-bottom: 1px solid var(--line);
+  flex: 0 0 auto;
+}
+.entity-drawer-head strong { font-size: 15px; }
+.entity-drawer-body {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 18px 22px 32px;
+}

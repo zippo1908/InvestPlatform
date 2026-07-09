@@ -684,12 +684,12 @@ function CommandPalette({ open, onClose }: { open: boolean; onClose: () => void 
     const kw = q.trim().toLowerCase()
     const hit = (s: string) => !kw || s.toLowerCase().includes(kw)
     const list: CmdItem[] = []
-    appScreens.filter((s) => hit(s.title) || hit(s.group)).slice(0, kw ? 8 : 6).forEach((s) =>
+    appScreens.filter((s) => !s.hidden && (hit(s.title) || hit(s.group))).slice(0, kw ? 8 : 6).forEach((s) =>
       list.push({ type: '页面', label: s.title, sub: s.group, run: () => { goTo(s.id); onClose() } }))
     ents.projects.filter((p) => hit(String(p.name))).slice(0, 6).forEach((p) =>
-      list.push({ type: '项目', label: String(p.name), sub: String(p.sector ?? p.stage ?? ''), run: () => { goToEntity('project-detail-overview', Number(p.id)); onClose() } }))
+      list.push({ type: '项目', label: String(p.name), sub: String(p.sector ?? p.stage ?? ''), run: () => { goToEntity('project-list', Number(p.id)); onClose() } }))
     ents.funds.filter((f) => hit(String(f.name))).slice(0, 6).forEach((f) =>
-      list.push({ type: '基金', label: String(f.name), sub: String(f.status ?? ''), run: () => { goToEntity('fund-detail-overview', Number(f.id)); onClose() } }))
+      list.push({ type: '基金', label: String(f.name), sub: String(f.status ?? ''), run: () => { goToEntity('fund-list', Number(f.id)); onClose() } }))
     ents.investors.filter((i) => hit(String(i.name))).slice(0, 6).forEach((i) =>
       list.push({ type: '投资人', label: String(i.name), sub: String(i.investor_kind ?? ''), run: () => { goToEntity('investor-detail', Number(i.id)); onClose() } }))
     return list
@@ -817,6 +817,7 @@ function App() {
           .map((group) => ({
             group,
             items: appScreens.filter((screen) => {
+              if (screen.hidden) return false // 动作页/抽屉化明细页不进侧栏
               const haystack = `${screen.title} ${screen.description} ${screen.group}`.toLowerCase()
               return screen.group === group && (!query || haystack.includes(query))
             }),
@@ -3195,7 +3196,7 @@ function EquityChangeTable({ projectId, canWrite, onToast }: {
                       if (col === '项目名称') {
                         return (
                           <td key={col}>
-                            <button type="button" className="link-button eq-project-link" onClick={() => goToEntity('project-detail-overview', r.project_id)}>
+                            <button type="button" className="link-button eq-project-link" onClick={() => goToEntity('project-list', r.project_id)}>
                               {cellOf(r, col)}
                             </button>
                           </td>
@@ -4068,10 +4069,12 @@ function DetailPage({
   screen,
   canWrite,
   onToast,
+  fixedId,
 }: {
   screen: Screen
   canWrite: boolean
   onToast: (toast: Toast) => void
+  fixedId?: number // 抽屉模式:固定渲染该实体明细,不显示清单页/返回按钮
 }) {
   const kind: 'project' | 'fund' | null = screen.id.startsWith('project-detail')
     ? 'project'
@@ -4088,7 +4091,7 @@ function DetailPage({
   const nameKey = fields[0].key
 
   const [entities, setEntities] = useState<Array<Record<string, unknown>>>([])
-  const [selectedId, setSelectedId] = useState<number | null>(() => readRouteId()) // 支持从列表行 ?id= 预选
+  const [selectedId, setSelectedId] = useState<number | null>(() => fixedId ?? readRouteId()) // 支持从列表行 ?id= 预选
   const [form, setForm] = useState<Record<string, string>>({})
   const [detail, setDetail] = useState<Record<string, unknown>>({}) // 原始详情(阶段/入库时间/负责人等非编辑字段)
   const [loadedAt, setLoadedAt] = useState<string | null>(null) // 乐观锁:加载时的 updated_at
@@ -4102,7 +4105,7 @@ function DetailPage({
   const [basicBaseline, setBasicBaseline] = useState<Record<string, string>>({}) // 进入编辑时的服务端值,供重置/取消
   const [hasBasicDraft, setHasBasicDraft] = useState(false)      // 服务端存有未提交草稿
   const [savingBasicDraft, setSavingBasicDraft] = useState(false)
-  const [view, setView] = useState<'list' | 'detail'>(() => (readRouteId() != null ? 'detail' : 'list')) // 清单页 / 明细页
+  const [view, setView] = useState<'list' | 'detail'>(() => ((fixedId ?? readRouteId()) != null ? 'detail' : 'list')) // 清单页 / 明细页
   const [dirQuery, setDirQuery] = useState('') // 清单页关键字检索(反馈 issue #10)
   const [summary, setSummary] = useState<InvestSummary | null>(null)
   const [summaryLoading, setSummaryLoading] = useState(false)
@@ -4181,12 +4184,13 @@ function DetailPage({
 
   // 路由带 ?id= 时预选该实体(从列表行「打开」进来);换屏回到概况 section。
   useEffect(() => {
-    const urlId = readRouteId()
+    const urlId = fixedId ?? readRouteId()
     if (urlId != null) setSelectedId(urlId)
     setSection('概况')
     setView(urlId != null ? 'detail' : 'list') // 带 ?id= 进来直达明细,否则先看清单
     setDirQuery('')
-  }, [screen.id])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [screen.id, fixedId])
 
   // 载入实体列表(供选择)。
   useEffect(() => {
@@ -4404,12 +4408,14 @@ function DetailPage({
 
   return (
     <div className="page-grid" ref={stageRef}>
-      {/* 返回清单页 */}
-      <div className="full-span entity-detail-back">
-        <button type="button" className="secondary-button" onClick={() => setView('list')} data-testid="entity-back-to-list">
-          <ChevronLeft size={16} /> {dirLabel}清单
-        </button>
-      </div>
+      {/* 返回清单页(抽屉模式由抽屉自带 X 关闭,无需返回) */}
+      {fixedId == null && (
+        <div className="full-span entity-detail-back">
+          <button type="button" className="secondary-button" onClick={() => setView('list')} data-testid="entity-back-to-list">
+            <ChevronLeft size={16} /> {dirLabel}清单
+          </button>
+        </div>
+      )}
       <section className="panel detail-hero full-span motion-item">
         <div>
           <span className="page-kicker">{screen.group}</span>
@@ -5660,7 +5666,28 @@ function ListPage({
   const [page, setPage] = useState(1)
   const [reloadKey, setReloadKey] = useState(0)
   const [q, setQ] = useState('')
-  useEffect(() => { setPage(1); setQ('') }, [screen.id]) // 换屏回到第一页 + 清搜索
+  // 明细抽屉:行点击从右侧滑出完整实体卡片(项目/基金),X 关闭回列表;带 ?id= 深链直接打开。
+  const detailScreen = useMemo(() => (LIST_DETAIL_TARGET[screen.id] ? screens.find((s) => s.id === LIST_DETAIL_TARGET[screen.id]) ?? null : null), [screen.id])
+  const [drawerId, setDrawerId] = useState<number | null>(() => (LIST_DETAIL_TARGET[screen.id] ? readRouteId() : null))
+  const closeDrawer = () => {
+    setDrawerId(null)
+    if (readRouteId() != null) window.history.replaceState(null, '', `#/${screen.id}`) // 抹掉 ?id=,不触发路由重载
+  }
+  useEffect(() => {
+    if (drawerId == null) return
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') closeDrawer() }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [drawerId])
+  useEffect(() => { setPage(1); setQ(''); setDrawerId(LIST_DETAIL_TARGET[screen.id] ? readRouteId() : null) }, [screen.id]) // 换屏回到第一页 + 清搜索
+  useEffect(() => {
+    // 同屏深链(#/project-list?id=N 只变 query 不换屏)也要能拉开抽屉。
+    if (!LIST_DETAIL_TARGET[screen.id]) return
+    const onHash = () => { const id = readRouteId(); if (id != null) setDrawerId(id) }
+    window.addEventListener('hashchange', onHash)
+    return () => window.removeEventListener('hashchange', onHash)
+  }, [screen.id])
   const { rows, source, total, pageSize } = useBackendRows(screen.id, fallbackRows, page, reloadKey, q)
   const totalPages = total != null ? Math.max(1, Math.ceil(total / pageSize)) : null
 
@@ -5686,7 +5713,7 @@ function ListPage({
         <DataTable
           rows={rows}
           storageKey={screen.id}
-          onRowOpen={LIST_DETAIL_TARGET[screen.id] ? (id) => goToEntity(LIST_DETAIL_TARGET[screen.id], id) : undefined}
+          onRowOpen={detailScreen ? (id) => setDrawerId(id) : undefined}
           onBatchDelete={deleteBase ? batchDelete : undefined}
         />
         {totalPages != null && (
@@ -5722,6 +5749,21 @@ function ListPage({
           查看任务中心
         </button>
       </section>
+      {drawerId != null && detailScreen && (
+        <div className="entity-drawer-backdrop" onClick={closeDrawer} data-testid="entity-drawer">
+          <div className="entity-drawer" onClick={(e) => e.stopPropagation()} role="dialog" aria-label={`${screen.title}明细`}>
+            <div className="entity-drawer-head">
+              <strong>{screen.id === 'fund-list' ? '基金明细' : '项目明细'}</strong>
+              <button type="button" className="icon-button" aria-label="关闭明细" onClick={closeDrawer} data-testid="entity-drawer-close">
+                <X size={18} />
+              </button>
+            </div>
+            <div className="entity-drawer-body">
+              <DetailPage screen={detailScreen} canWrite={canWrite} onToast={onToast} fixedId={drawerId} />
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

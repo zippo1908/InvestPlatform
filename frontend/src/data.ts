@@ -22,6 +22,8 @@ export type Screen = {
   kind: PageKind
   primaryAction: string
   tabs?: string[]
+  /** 不在侧栏/命令面板出现,但路由仍可达(动作页、旧深链、抽屉化的明细页)。 */
+  hidden?: boolean
 }
 
 export type DataRow = Record<string, string | number>
@@ -139,6 +141,7 @@ export const screens: Screen[] = [
   },
   {
     id: 'project-add',
+    hidden: true, // 新增走项目列表按钮
     title: '新增项目',
     group: '项目管理',
     description: 'BP 上传、AI 解析填充、项目基础信息和描述字段',
@@ -147,6 +150,7 @@ export const screens: Screen[] = [
   },
   {
     id: 'project-detail-overview',
+    hidden: true, // 明细改为列表行点击滑出抽屉
     title: '项目详情-概况',
     group: '项目管理',
     description: '项目主档、阶段历史、负责人、摘要和关键动作',
@@ -156,15 +160,16 @@ export const screens: Screen[] = [
   },
   {
     id: 'project-detail-investment',
-    title: '项目详情-投资关系',
+    title: '投资关系',
     group: '项目管理',
-    description: '基金投资情况、权益变动和估值记录',
+    description: '跨项目投资/权益变动记录台账,点项目名进入项目卡片',
     kind: 'detail',
     primaryAction: '新增投资记录',
     tabs: ['投资主体', '打款记录', '持股结构', '估值记录', '退出安排', '审计'],
   },
   {
     id: 'project-detail-postdata',
+    hidden: true, // 与投后管理「投后数据收集」重复
     title: '项目详情-投后数据',
     group: '项目管理',
     description: '月度/季度经营数据、财务指标、填报状态和附件',
@@ -190,6 +195,7 @@ export const screens: Screen[] = [
   },
   {
     id: 'fund-add',
+    hidden: true, // 新增走基金列表按钮
     title: '新增基金',
     group: '基金管理',
     description: '基础信息、规模、期限、投资策略、管理费、分配、治理和披露',
@@ -198,6 +204,7 @@ export const screens: Screen[] = [
   },
   {
     id: 'fund-detail-overview',
+    hidden: true, // 明细改为列表行点击滑出抽屉
     title: '基金详情-概况',
     group: '基金管理',
     description: '基金条款、规模、出资节奏、组合表现和关键时间',
@@ -207,6 +214,7 @@ export const screens: Screen[] = [
   },
   {
     id: 'fund-detail-cashflow',
+    hidden: true, // 与基金明细重复
     title: '基金详情-现金流',
     group: '基金管理',
     description: '投资人现金流、项目现金流、其他现金流和回款分配',
@@ -216,6 +224,7 @@ export const screens: Screen[] = [
   },
   {
     id: 'fund-detail-financials',
+    hidden: true, // 与基金明细重复
     title: '基金详情-财报数据',
     group: '基金管理',
     description: '基金财务报表、净值、估值和披露材料',
@@ -233,6 +242,7 @@ export const screens: Screen[] = [
   },
   {
     id: 'equity-change',
+    hidden: true, // 与项目管理「投资关系」重复
     title: '权益变动',
     group: '基金管理',
     description: '股权变更原因、协议时间、轮次、领投、投资方式和股比变化',
