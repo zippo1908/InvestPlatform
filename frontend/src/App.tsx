@@ -1258,6 +1258,8 @@ function PageRenderer({
   onToast: (toast: Toast) => void
 }) {
   if (screen.id === 'workbench') return <DashboardPage onToast={onToast} />
+  // 反馈 #12:投资关系入口与「权益变动」台账屏都渲染记录台账。
+  if (screen.id === 'project-detail-investment' || screen.id === 'equity-change') return <EquityLedgerPage screen={screen} canWrite={canWrite} onToast={onToast} />
   if (screen.kind === 'ai') return <AiPage screen={screen} canWrite={canWrite} onToast={onToast} />
   if (screen.kind === 'board') return <BoardPage canWrite={canWrite} onToast={onToast} />
   if (screen.kind === 'form') return <FormPage screen={screen} canWrite={canWrite} onToast={onToast} />
@@ -2680,6 +2682,593 @@ function ProjectCommentPanel({ projectId, canWrite, onToast }: { projectId: numb
   )
 }
 
+// ── 权益变动台账(反馈 #12/#13):跨项目记录表与项目内页签共用 ──
+const EQUITY_REASONS = ['首次投资', '追加投资', '退出', '被动稀释(再融资)']
+const EQUITY_REASON_TONE: Record<string, string> = { 首次投资: 'magenta', 追加投资: 'teal', 退出: 'blue', '被动稀释(再融资)': 'orange' }
+
+type EquityRow = {
+  equity_change_id: number
+  project_id: number
+  project_name?: string
+  fund_id: number | null
+  fund_name: string
+  change_reason: string
+  agreement_date: string | null
+  approval_date: string | null
+  round_label: string
+  is_lead_investor: number
+  investment_method: string
+  investment_method_label: string | null
+  pre_money_ratio: string | number | null
+  post_money_ratio: string | number | null
+  co_investors: string | null
+  notes: string | null
+}
+
+// 股比:库里存小数(0.078),展示为「7.8 %」;空值一律「—」。
+function eqPct(v: unknown): string {
+  if (v == null || v === '') return '—'
+  const n = Number(v)
+  if (Number.isNaN(n)) return '—'
+  return `${+(n * 100).toFixed(2)} %`
+}
+
+function eqMethod(row: EquityRow): string {
+  return row.investment_method_label || ({ equity: '增资', convertible_note: '可转债', safe: 'SAFE', secondary: '老股转让', option: '期权', other: '—' }[row.investment_method] ?? '—')
+}
+
+type EquityOption = { id: number; name: string }
+
+function EquityChangeModal({ initial, projectId, projOpts, fundOpts, onClose, onSaved, onToast }: {
+  initial: EquityRow | null   // null = 新增
+  projectId?: number          // 项目内页签:项目固定
+  projOpts: EquityOption[]
+  fundOpts: EquityOption[]
+  onClose: () => void
+  onSaved: () => void
+  onToast: (toast: Toast) => void
+}) {
+  const [form, setForm] = useState(() => ({
+    project_id: initial ? String(initial.project_id) : projectId != null ? String(projectId) : '',
+    fund_id: initial?.fund_id ? String(initial.fund_id) : '',
+    change_reason: initial?.change_reason ?? '首次投资',
+    agreement_date: initial?.agreement_date ?? '',
+    approval_date: initial?.approval_date ?? '',
+    round_label: initial?.round_label && initial.round_label !== '-' ? initial.round_label : '',
+    is_lead_investor: initial ? Boolean(initial.is_lead_investor) : false,
+    investment_method_label: initial ? (initial.investment_method_label ?? '') : '',
+    pre_pct: initial?.pre_money_ratio != null ? String(+(Number(initial.pre_money_ratio) * 100).toFixed(4)) : '',
+    post_pct: initial?.post_money_ratio != null ? String(+(Number(initial.post_money_ratio) * 100).toFixed(4)) : '',
+    co_investors: initial?.co_investors ?? '',
+    notes: initial?.notes ?? '',
+  }))
+  const [saving, setSaving] = useState(false)
+  const set = (k: string, v: string | boolean) => setForm((f) => ({ ...f, [k]: v }))
+  const reasonOptions = EQUITY_REASONS.includes(form.change_reason) || !form.change_reason ? EQUITY_REASONS : [form.change_reason, ...EQUITY_REASONS]
+
+  const save = async () => {
+    if (!initial && !form.project_id) { onToast({ title: '请选择项目', detail: '新增权益变动需先选定所属项目' }); return }
+    if (!form.change_reason.trim()) { onToast({ title: '请选择股权变更原因', detail: '该字段必填' }); return }
+    const num = (s: string) => { const n = Number(s); return s.trim() === '' || Number.isNaN(n) ? null : +(n / 100).toFixed(6) }
+    const payload: Record<string, unknown> = {
+      fund_id: form.fund_id ? Number(form.fund_id) : null,
+      change_reason: form.change_reason.trim(),
+      agreement_date: form.agreement_date || null,
+      approval_date: form.approval_date || null,
+      round_label: form.round_label.trim() || '-',
+      is_lead_investor: form.is_lead_investor,
+      investment_method_label: form.investment_method_label.trim() || null,
+      pre_money_ratio: num(form.pre_pct),
+      post_money_ratio: num(form.post_pct),
+      co_investors: form.co_investors.trim() || null,
+      notes: form.notes.trim() || null,
+    }
+    setSaving(true)
+    try {
+      if (initial) {
+        await apiPatch(`/api/equity-changes/${initial.equity_change_id}`, payload)
+        onToast({ title: '权益变动已更新', detail: '修改已写入台账', action: 'equity_change.update', entity: 'cap_equity_changes' })
+      } else {
+        await apiPost('/api/equity-changes', { ...payload, project_id: Number(form.project_id) })
+        onToast({ title: '权益变动已新增', detail: '记录已写入台账', action: 'equity_change.create', entity: 'cap_equity_changes' })
+      }
+      onSaved()
+      onClose()
+    } catch (error) {
+      onToast({ title: initial ? '更新失败' : '新增失败', detail: error instanceof Error ? error.message : 'API 调用失败' })
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <div className="eq-modal-backdrop" onClick={onClose} data-testid="equity-modal">
+      <div className="eq-modal" onClick={(e) => e.stopPropagation()}>
+        <div className="eq-modal-head">
+          <h3>{initial ? '编辑权益变动' : '新增权益变动'}</h3>
+          <button type="button" className="icon-button" aria-label="关闭" onClick={onClose}><X size={18} /></button>
+        </div>
+        <div className="form-grid">
+          {projectId == null && (
+            <label>
+              <span>项目{!initial && <i>必填</i>}</span>
+              {initial ? (
+                <input value={initial.project_name ?? String(initial.project_id)} readOnly />
+              ) : (
+                <select value={form.project_id} onChange={(e) => set('project_id', e.target.value)} data-testid="eq-project">
+                  <option value="">请选择项目</option>
+                  {projOpts.map((p) => <option key={p.id} value={String(p.id)}>{p.name}</option>)}
+                </select>
+              )}
+            </label>
+          )}
+          <label>
+            <span>投资主体(基金)</span>
+            <select value={form.fund_id} onChange={(e) => set('fund_id', e.target.value)} data-testid="eq-fund">
+              <option value="">—</option>
+              {fundOpts.map((f) => <option key={f.id} value={String(f.id)}>{f.name}</option>)}
+            </select>
+          </label>
+          <label>
+            <span>股权变更原因<i>必填</i></span>
+            <select value={form.change_reason} onChange={(e) => set('change_reason', e.target.value)} data-testid="eq-reason">
+              {reasonOptions.map((r) => <option key={r} value={r}>{r}</option>)}
+            </select>
+          </label>
+          <label>
+            <span>协议时间</span>
+            <input type="date" value={form.agreement_date} onChange={(e) => set('agreement_date', e.target.value)} />
+          </label>
+          <label>
+            <span>投决会通过时间</span>
+            <input type="date" value={form.approval_date} onChange={(e) => set('approval_date', e.target.value)} />
+          </label>
+          <label>
+            <span>轮次</span>
+            <input value={form.round_label} onChange={(e) => set('round_label', e.target.value)} placeholder="如 A / B+ / Pre-IPO" />
+          </label>
+          <label>
+            <span>是否领投</span>
+            <select value={form.is_lead_investor ? '1' : '0'} onChange={(e) => set('is_lead_investor', e.target.value === '1')}>
+              <option value="1">是</option>
+              <option value="0">否</option>
+            </select>
+          </label>
+          <label>
+            <span>投资方式</span>
+            <input value={form.investment_method_label} onChange={(e) => set('investment_method_label', e.target.value)} placeholder="如 增资+可转债+老股转让" />
+          </label>
+          <label>
+            <span>交易前股比(%)</span>
+            <input type="number" step="0.01" min="0" value={form.pre_pct} onChange={(e) => set('pre_pct', e.target.value)} placeholder="如 9.09" />
+          </label>
+          <label>
+            <span>交易后占比(%)</span>
+            <input type="number" step="0.01" min="0" value={form.post_pct} onChange={(e) => set('post_pct', e.target.value)} placeholder="如 7.79" />
+          </label>
+          <label>
+            <span>本轮其他投资机构</span>
+            <input value={form.co_investors} onChange={(e) => set('co_investors', e.target.value)} placeholder="多家用顿号分隔" />
+          </label>
+          <label className="span-2">
+            <span>备注</span>
+            <input value={form.notes} onChange={(e) => set('notes', e.target.value)} />
+          </label>
+        </div>
+        <div className="button-row eq-modal-actions">
+          <button type="button" className="primary-button" disabled={saving} onClick={save} data-testid="eq-save">
+            <CheckCircle size={15} /> {saving ? '保存中…' : '保存'}
+          </button>
+          <button type="button" className="secondary-button" onClick={onClose}>取消</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// 极简 CSV:导出加 BOM;导入支持双引号包裹(含逗号/换行的值)。
+function csvCell(v: unknown): string {
+  const s = v == null ? '' : String(v)
+  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
+}
+
+function parseCsv(text: string): string[][] {
+  const rows: string[][] = []
+  let cell = '', row: string[] = [], inQuote = false
+  const src = text.replace(/^﻿/, '')
+  for (let i = 0; i < src.length; i++) {
+    const c = src[i]
+    if (inQuote) {
+      if (c === '"') { if (src[i + 1] === '"') { cell += '"'; i++ } else inQuote = false }
+      else cell += c
+    } else if (c === '"') inQuote = true
+    else if (c === ',') { row.push(cell); cell = '' }
+    else if (c === '\n' || c === '\r') {
+      if (c === '\r' && src[i + 1] === '\n') i++
+      row.push(cell); cell = ''
+      if (row.some((x) => x.trim() !== '')) rows.push(row)
+      row = []
+    } else cell += c
+  }
+  row.push(cell)
+  if (row.some((x) => x.trim() !== '')) rows.push(row)
+  return rows
+}
+
+function EquityChangeTable({ projectId, canWrite, onToast }: {
+  projectId?: number
+  canWrite: boolean
+  onToast: (toast: Toast) => void
+}) {
+  const [rows, setRows] = useState<EquityRow[]>([])
+  const [loading, setLoading] = useState(true)
+  const [reloadKey, setReloadKey] = useState(0)
+  const reload = () => setReloadKey((k) => k + 1)
+  const ledger = projectId == null
+
+  // 关键字回车检索(反馈 #10 参考格式:输入关键字回车);项目内由「筛选」展开。
+  const [kw, setKw] = useState('')
+  const [q, setQ] = useState('')
+  const [showFilter, setShowFilter] = useState(ledger)
+  const [sortAsc, setSortAsc] = useState(false) // 协议时间排序,默认最新在前
+  const [page, setPage] = useState(1)
+  const [pageSize, setPageSize] = useState(10)
+  const [selected, setSelected] = useState<Set<number>>(new Set())
+  const [editing, setEditing] = useState<EquityRow | 'new' | null>(null)
+  const [colMenu, setColMenu] = useState(false)
+  const [hidden, setHidden] = useState<Set<string>>(new Set())
+  const fileRef = useRef<HTMLInputElement>(null)
+  const [projOpts, setProjOpts] = useState<EquityOption[]>([])
+  const [fundOpts, setFundOpts] = useState<EquityOption[]>([])
+
+  useEffect(() => {
+    let ignore = false
+    setLoading(true)
+    const path = projectId != null ? `/api/projects/${projectId}/equity-changes` : '/api/equity-changes'
+    apiGet<{ items: EquityRow[] }>(path)
+      .then((r) => { if (!ignore) { setRows(r.items ?? []); setSelected(new Set()) } })
+      .catch(() => !ignore && setRows([]))
+      .finally(() => !ignore && setLoading(false))
+    return () => { ignore = true }
+  }, [projectId, reloadKey])
+
+  useEffect(() => {
+    let ignore = false
+    if (ledger) {
+      apiGet<{ items: Array<Record<string, unknown>> }>('/api/projects')
+        .then((r) => !ignore && setProjOpts((r.items ?? []).map((p) => ({ id: Number(p.id), name: String(p.short_name ?? p.id) }))))
+        .catch(() => undefined)
+    }
+    apiGet<{ items: Array<Record<string, unknown>> }>('/api/funds')
+      .then((r) => !ignore && setFundOpts((r.items ?? []).map((f) => ({ id: Number(f.id), name: String(f.fund_name ?? f.id) }))))
+      .catch(() => undefined)
+    return () => { ignore = true }
+  }, [ledger])
+
+  const allColumns = [
+    ...(ledger ? ['项目名称'] : []),
+    '投资主体', '股权变更原因', '协议时间', '投决会通过时间', '轮次', '是否领投', '投资方式',
+    '交易前股比', '交易后占比', '本轮其他投资机构',
+  ]
+  const columns = allColumns.filter((c) => !hidden.has(c))
+  const cellOf = (r: EquityRow, col: string): string => {
+    switch (col) {
+      case '项目名称': return String(r.project_name ?? r.project_id)
+      case '投资主体': return r.fund_name === '-' ? '—' : String(r.fund_name ?? '—')
+      case '股权变更原因': return String(r.change_reason ?? '—')
+      case '协议时间': return r.agreement_date ? String(r.agreement_date) : '—'
+      case '投决会通过时间': return r.approval_date ? String(r.approval_date) : '—'
+      case '轮次': return r.round_label && r.round_label !== '-' ? String(r.round_label) : '—'
+      case '是否领投': return r.is_lead_investor ? '是' : '否'
+      case '投资方式': return eqMethod(r)
+      case '交易前股比': return eqPct(r.pre_money_ratio)
+      case '交易后占比': return eqPct(r.post_money_ratio)
+      case '本轮其他投资机构': return r.co_investors ? String(r.co_investors) : '—'
+      default: return '—'
+    }
+  }
+
+  const dq = q.trim().toLowerCase()
+  const filtered = dq
+    ? rows.filter((r) => allColumns.map((c) => cellOf(r, c)).concat(r.notes ?? '').join(' ').toLowerCase().includes(dq))
+    : rows
+  const sorted = [...filtered].sort((a, b) => {
+    const av = a.agreement_date ?? '', bv = b.agreement_date ?? ''
+    return sortAsc ? av.localeCompare(bv) : bv.localeCompare(av)
+  })
+  const totalPages = Math.max(1, Math.ceil(sorted.length / pageSize))
+  const curPage = Math.min(page, totalPages)
+  const pageRows = sorted.slice((curPage - 1) * pageSize, curPage * pageSize)
+  const pageIds = pageRows.map((r) => r.equity_change_id)
+  const allPageSelected = pageIds.length > 0 && pageIds.every((id) => selected.has(id))
+
+  const doSearch = () => { setQ(kw.trim()); setPage(1) }
+
+  const removeOne = async (r: EquityRow) => {
+    if (!window.confirm(`确认删除该权益变动记录(${cellOf(r, '股权变更原因')} / ${cellOf(r, '协议时间')})?`)) return
+    try {
+      await apiDelete(`/api/equity-changes/${r.equity_change_id}`)
+      onToast({ title: '已删除权益变动', detail: '记录已移除(软删,可在回收站恢复)', action: 'equity_change.delete', entity: 'cap_equity_changes' })
+      reload()
+    } catch (error) {
+      onToast({ title: '删除失败', detail: error instanceof Error ? error.message : 'API 调用失败' })
+    }
+  }
+
+  const removeSelected = async () => {
+    const ids = [...selected]
+    if (!ids.length || !window.confirm(`确认删除选中的 ${ids.length} 条记录?`)) return
+    let ok = 0, fail = 0
+    for (const id of ids) {
+      try { await apiDelete(`/api/equity-changes/${id}`); ok++ } catch { fail++ }
+    }
+    onToast({ title: `批量删除完成:成功 ${ok} 条${fail ? `,失败 ${fail} 条` : ''}`, detail: '记录已移除(软删)', action: 'equity_change.delete', entity: 'cap_equity_changes' })
+    reload()
+  }
+
+  const exportCsv = () => {
+    const header = [...columns, '备注']
+    const lines = [header.map(csvCell).join(',')]
+    for (const r of sorted) lines.push([...columns.map((c) => { const v = cellOf(r, c); return v === '—' ? '' : v }), r.notes ?? ''].map(csvCell).join(','))
+    const blob = new Blob([`﻿${lines.join('\n')}`], { type: 'text/csv;charset=utf-8' })
+    const a = document.createElement('a')
+    a.href = URL.createObjectURL(blob)
+    a.download = ledger ? '权益变动台账.csv' : `权益变动-项目${projectId}.csv`
+    a.click()
+    URL.revokeObjectURL(a.href)
+    onToast({ title: '已导出 CSV', detail: `${sorted.length} 条权益变动记录` })
+  }
+
+  const importCsv = async (file: File) => {
+    const grid = parseCsv(await file.text())
+    if (grid.length < 2) { onToast({ title: '导入失败', detail: 'CSV 里没有数据行(第一行应为表头)' }); return }
+    const header = grid[0].map((h) => h.trim())
+    const idx = (name: string) => header.indexOf(name)
+    if (ledger && idx('项目名称') < 0) { onToast({ title: '导入失败', detail: '缺少「项目名称」列' }); return }
+    if (idx('股权变更原因') < 0) { onToast({ title: '导入失败', detail: '缺少「股权变更原因」列' }); return }
+    const projByName = new Map(projOpts.map((p) => [p.name, p.id]))
+    const fundByName = new Map(fundOpts.map((f) => [f.name, f.id]))
+    const cell = (row: string[], name: string) => { const i = idx(name); return i >= 0 ? (row[i] ?? '').trim() : '' }
+    const pctNum = (s: string) => { const n = Number(s.replace('%', '').trim()); return s.trim() === '' || Number.isNaN(n) ? null : +(n / 100).toFixed(6) }
+    let ok = 0
+    const errors: string[] = []
+    for (let i = 1; i < grid.length; i++) {
+      const row = grid[i]
+      const pid = ledger ? projByName.get(cell(row, '项目名称')) : projectId
+      if (!pid) { errors.push(`第 ${i + 1} 行:项目「${cell(row, '项目名称')}」不存在`); continue }
+      if (!cell(row, '股权变更原因')) { errors.push(`第 ${i + 1} 行:股权变更原因为空`); continue }
+      const fundName = cell(row, '投资主体')
+      try {
+        await apiPost('/api/equity-changes', {
+          project_id: pid,
+          fund_id: fundName ? (fundByName.get(fundName) ?? null) : null,
+          change_reason: cell(row, '股权变更原因'),
+          agreement_date: cell(row, '协议时间') || null,
+          approval_date: cell(row, '投决会通过时间') || null,
+          round_label: cell(row, '轮次') || '-',
+          is_lead_investor: cell(row, '是否领投') === '是',
+          investment_method_label: cell(row, '投资方式') || null,
+          pre_money_ratio: pctNum(cell(row, '交易前股比')),
+          post_money_ratio: pctNum(cell(row, '交易后占比')),
+          co_investors: cell(row, '本轮其他投资机构') || null,
+          notes: cell(row, '备注') || null,
+        })
+        ok++
+      } catch (error) {
+        errors.push(`第 ${i + 1} 行:${error instanceof Error ? error.message : '写入失败'}`)
+      }
+    }
+    onToast({
+      title: `导入完成:新增 ${ok} 条${errors.length ? `,${errors.length} 行有误` : ''}`,
+      detail: errors.slice(0, 5).join('\n') || '全部行写入成功',
+      action: 'equity_change.import',
+      entity: 'cap_equity_changes',
+    })
+    reload()
+  }
+
+  return (
+    <div className="equity-table" data-testid={ledger ? 'equity-ledger' : 'equity-section'}>
+      <div className="list-controls">
+        {showFilter && (
+          <>
+            <label className="table-search">
+              <Search size={15} />
+              <input
+                value={kw}
+                onChange={(e) => setKw(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter') doSearch() }}
+                placeholder="输入关键字回车"
+                aria-label="检索权益变动"
+                data-testid="equity-search"
+              />
+            </label>
+            {dq && <span className="muted-note">匹配 {filtered.length} / {rows.length} 条</span>}
+          </>
+        )}
+        <button type="button" className="primary-button" disabled={!canWrite} onClick={() => setEditing('new')} data-testid="equity-add">
+          <Plus size={15} /> 新增
+        </button>
+        {!ledger && (
+          <button type="button" className="secondary-button" onClick={() => { setShowFilter((v) => !v); if (showFilter) { setKw(''); setQ('') } }}>
+            <Search size={15} /> 筛选
+          </button>
+        )}
+        <div className="col-config">
+          <button type="button" className="secondary-button" onClick={() => setColMenu((v) => !v)} data-testid="equity-cols">
+            <Columns size={14} /> 显示列 ({columns.length}/{allColumns.length})
+          </button>
+          {colMenu && (
+            <div className="col-config-menu">
+              {allColumns.map((col) => (
+                <label key={col}>
+                  <input
+                    type="checkbox"
+                    checked={!hidden.has(col)}
+                    onChange={() => setHidden((prev) => {
+                      const next = new Set(prev)
+                      if (next.has(col)) next.delete(col)
+                      else if (allColumns.length - next.size > 1) next.add(col)
+                      return next
+                    })}
+                  />
+                  <span>{col}</span>
+                </label>
+              ))}
+              <button type="button" className="link-button" onClick={() => setHidden(new Set())}>重置为全部显示</button>
+            </div>
+          )}
+        </div>
+        <input
+          ref={fileRef}
+          type="file"
+          accept=".csv,text/csv"
+          style={{ display: 'none' }}
+          onChange={(e) => { const f = e.target.files?.[0]; if (f) void importCsv(f); e.target.value = '' }}
+        />
+        <button type="button" className="secondary-button" disabled={!canWrite} onClick={() => fileRef.current?.click()} title="按导出的 CSV 表头批量导入">
+          <Upload size={15} /> 导入
+        </button>
+        <button type="button" className="secondary-button" onClick={exportCsv}>
+          <Download size={15} /> 导出
+        </button>
+        <button type="button" className="danger-button" disabled={!canWrite || selected.size === 0} onClick={removeSelected} data-testid="equity-batch-delete">
+          <Trash size={14} /> 删除{selected.size ? ` (${selected.size})` : ''}
+        </button>
+      </div>
+      {loading ? (
+        <p className="muted-note">加载中…</p>
+      ) : sorted.length === 0 ? (
+        <p className="muted-note">{dq ? `没有匹配「${q}」的记录。` : '暂无权益变动记录。'}</p>
+      ) : (
+        <>
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>
+                    <input
+                      type="checkbox"
+                      checked={allPageSelected}
+                      onChange={(e) => setSelected((prev) => {
+                        const next = new Set(prev)
+                        pageIds.forEach((id) => { if (e.target.checked) next.add(id); else next.delete(id) })
+                        return next
+                      })}
+                      aria-label="全选本页"
+                    />
+                  </th>
+                  <th>序号</th>
+                  {columns.map((col) => col === '协议时间' ? (
+                    <th key={col} className="eq-sortable" onClick={() => setSortAsc((v) => !v)} title="点击切换排序">
+                      协议时间 {sortAsc ? '▲' : '▼'}
+                    </th>
+                  ) : (
+                    <th key={col}>{col}</th>
+                  ))}
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                {pageRows.map((r, i) => (
+                  <tr key={r.equity_change_id}>
+                    <td>
+                      <input
+                        type="checkbox"
+                        checked={selected.has(r.equity_change_id)}
+                        onChange={(e) => setSelected((prev) => {
+                          const next = new Set(prev)
+                          if (e.target.checked) next.add(r.equity_change_id)
+                          else next.delete(r.equity_change_id)
+                          return next
+                        })}
+                        aria-label={`选择第 ${i + 1} 行`}
+                      />
+                    </td>
+                    <td>{(curPage - 1) * pageSize + i + 1}</td>
+                    {columns.map((col) => {
+                      if (col === '项目名称') {
+                        return (
+                          <td key={col}>
+                            <button type="button" className="link-button eq-project-link" onClick={() => goToEntity('project-detail-overview', r.project_id)}>
+                              {cellOf(r, col)}
+                            </button>
+                          </td>
+                        )
+                      }
+                      if (col === '股权变更原因') {
+                        const v = cellOf(r, col)
+                        return <td key={col}><span className={`eq-tag tone-${EQUITY_REASON_TONE[v] ?? 'gray'}`}>{v}</span></td>
+                      }
+                      if (col === '是否领投') {
+                        const lead = Boolean(r.is_lead_investor)
+                        return <td key={col}><span className={`eq-tag ${lead ? 'tone-magenta' : 'tone-teal'}`}>{lead ? '是' : '否'}</span></td>
+                      }
+                      return <td key={col}>{cellOf(r, col)}</td>
+                    })}
+                    <td className="eq-row-actions">
+                      <button type="button" className="link-button" disabled={!canWrite} onClick={() => setEditing(r)} data-testid={`equity-edit-${r.equity_change_id}`}>编辑</button>
+                      <span className="eq-action-sep">|</span>
+                      <button type="button" className="link-button eq-danger-link" disabled={!canWrite} onClick={() => void removeOne(r)}>删除</button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div className="eq-pagination">
+            <button type="button" className="secondary-button" disabled={curPage <= 1} onClick={() => setPage(curPage - 1)} aria-label="上一页">
+              <ChevronLeft size={15} />
+            </button>
+            {Array.from({ length: totalPages }, (_, n) => n + 1).slice(Math.max(0, curPage - 3), curPage + 2).map((n) => (
+              <button key={n} type="button" className={classNames('secondary-button eq-page-btn', n === curPage && 'is-active')} onClick={() => setPage(n)}>{n}</button>
+            ))}
+            <button type="button" className="secondary-button" disabled={curPage >= totalPages} onClick={() => setPage(curPage + 1)} aria-label="下一页">
+              <ChevronRight size={15} />
+            </button>
+            <span className="muted-note">
+              共 {sorted.length} 条,每页显示
+              <select value={String(pageSize)} onChange={(e) => { setPageSize(Number(e.target.value)); setPage(1) }} aria-label="每页条数">
+                {[10, 20, 50].map((n) => <option key={n} value={String(n)}>{n}</option>)}
+              </select>
+              条
+            </span>
+          </div>
+        </>
+      )}
+      {editing !== null && (
+        <EquityChangeModal
+          initial={editing === 'new' ? null : editing}
+          projectId={projectId}
+          projOpts={projOpts}
+          fundOpts={fundOpts}
+          onClose={() => setEditing(null)}
+          onSaved={reload}
+          onToast={onToast}
+        />
+      )}
+    </div>
+  )
+}
+
+// #12:投资关系入口 = 跨项目权益变动记录台账(参照系统同构)。
+function EquityLedgerPage({ screen, canWrite, onToast }: { screen: Screen; canWrite: boolean; onToast: (toast: Toast) => void }) {
+  return (
+    <div className="page-grid">
+      <section className="panel detail-hero full-span motion-item">
+        <div>
+          <span className="page-kicker">{screen.group}</span>
+          <h2>{screen.title}</h2>
+          <p>跨项目的投资/权益变动记录台账,点项目名称进入该项目卡片。</p>
+        </div>
+      </section>
+      <section className="panel full-span motion-item">
+        <EquityChangeTable canWrite={canWrite} onToast={onToast} />
+      </section>
+    </div>
+  )
+}
+
 function DetailPage({
   screen,
   canWrite,
@@ -2727,6 +3316,7 @@ function DetailPage({
   // 顶部各专题 section 按需拉取(项目/基金各自的 SECTION_DATA)。
   useEffect(() => {
     if (kind == null || selectedId == null) return
+    if (kind === 'project' && section === '权益变动') { setSectionRows([]); return } // #13:该 section 由 EquityChangeTable 自取数
     const spec = sectionMap[section]
     if (!spec) { setSectionRows([]); return }
     let ignore = false
@@ -3250,6 +3840,11 @@ function DetailPage({
           </>
           ) : section === '协议条款(AI)' ? (
             <ProjectClausesSection projectId={selectedId} canWrite={canWrite} onToast={onToast} />
+          ) : section === '权益变动' && selectedId != null ? (
+            <section className="panel full-span motion-item" data-testid="section-equity">
+              <PanelTitle icon={FileText} title="权益变动" />
+              <EquityChangeTable projectId={selectedId} canWrite={canWrite} onToast={onToast} />
+            </section>
           ) : SECTION_DATA[section] ? (
             <section className="panel full-span motion-item" data-testid="section-data">
               <PanelTitle icon={FileText} title={section} />

@@ -221,6 +221,22 @@ class FeedbackStatusPayload(BaseModel):
     status: str  # new | pushed | resolved | dismissed
 
 
+class EquityChangePayload(BaseModel):
+    """权益变动台账新增/编辑(反馈 #12/#13)。股比按小数存(0.078=7.8%),前端负责 % 换算。"""
+    project_id: int | None = None   # 新增必填;编辑不允许改
+    fund_id: int | None = None      # 投资主体(基金)
+    change_reason: str | None = Field(default=None, max_length=160)
+    agreement_date: str | None = None   # YYYY-MM-DD
+    approval_date: str | None = None    # 投决会通过时间
+    round_label: str | None = Field(default=None, max_length=80)
+    is_lead_investor: bool | None = None
+    investment_method_label: str | None = Field(default=None, max_length=160)  # 如「增资+可转债+老股转让」
+    pre_money_ratio: float | None = None
+    post_money_ratio: float | None = None
+    co_investors: str | None = Field(default=None, max_length=300)
+    notes: str | None = Field(default=None, max_length=2000)
+
+
 class CreateUserPayload(BaseModel):
     login_name: str = Field(min_length=1, max_length=80)
     display_name: str = Field(min_length=1, max_length=120)
@@ -404,13 +420,17 @@ LEDGER_QUERIES: dict[str, str] = {
         ORDER BY i.investment_position_id DESC
         """,
     "equity-change": """
-        SELECT COALESCE(p.short_name, '-') AS '项目名称', e.change_reason AS '变更原因',
-               e.round_label AS '轮次', e.before_pct AS '交易前股比',
-               e.after_pct AS '交易后股比', e.signed_on AS '协议时间',
-               e.created_at AS '创建时间'
+        SELECT COALESCE(p.short_name, '-') AS '项目名称', COALESCE(f.fund_name, '-') AS '投资主体',
+               e.change_reason AS '股权变更原因', e.agreement_date AS '协议时间',
+               e.approval_date AS '投决会通过时间', e.round_label AS '轮次',
+               e.is_lead_investor AS '是否领投',
+               COALESCE(e.investment_method_label, e.investment_method) AS '投资方式',
+               e.pre_money_ratio AS '交易前股比', e.post_money_ratio AS '交易后占比',
+               e.co_investors AS '本轮其他投资机构'
         FROM cap_equity_changes e
         LEFT JOIN cap_projects p ON p.project_id=e.project_id
-        WHERE e.tenant_id=%s
+        LEFT JOIN cap_funds f ON f.fund_id=e.fund_id
+        WHERE e.tenant_id=%s AND e.deleted_at IS NULL
         ORDER BY e.equity_change_id DESC
         """,
     "investor-list": """
@@ -724,9 +744,37 @@ def ensure_ui_action_table(cursor: Any) -> None:
     )
 
 
+def _ensure_column(cursor: Any, table: str, column: str, ddl: str) -> None:
+    """幂等加列:列不存在才 ALTER,与建表同在启动时执行。"""
+    cursor.execute(
+        "SELECT COUNT(*) AS n FROM information_schema.columns "
+        "WHERE table_schema=DATABASE() AND table_name=%s AND column_name=%s",
+        (table, column),
+    )
+    if not int(cursor.fetchone()["n"]):
+        cursor.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+
+
+def _ensure_nullable(cursor: Any, table: str, column: str, ddl: str) -> None:
+    """幂等放开 NOT NULL:仍是 NO 才 MODIFY(反馈 #12 台账新增记录不再强绑投资持仓)。"""
+    cursor.execute(
+        "SELECT IS_NULLABLE AS n FROM information_schema.columns "
+        "WHERE table_schema=DATABASE() AND table_name=%s AND column_name=%s",
+        (table, column),
+    )
+    row = cursor.fetchone()
+    if row and row["n"] == "NO":
+        cursor.execute(f"ALTER TABLE {table} MODIFY COLUMN {ddl}")
+
+
 def ensure_feature_tables(cursor: Any) -> None:
     """启动时幂等建出反馈#5–#8 用到的三张表(草稿 / 项目备忘录 / 反馈附件)。
     与 ensure_ui_action_table 同风格:CREATE TABLE IF NOT EXISTS,重启即生效,无需手动迁移。"""
+    # 反馈 #12/#13:权益变动台账补两列(本轮其他投资机构 / 投资方式中文组合标签),持仓外键放开必填。
+    _ensure_column(cursor, "cap_equity_changes", "co_investors", "co_investors VARCHAR(300) NULL")
+    _ensure_column(cursor, "cap_equity_changes", "investment_method_label", "investment_method_label VARCHAR(160) NULL")
+    _ensure_nullable(cursor, "cap_equity_changes", "investment_position_id", "investment_position_id BIGINT UNSIGNED NULL")
+    _ensure_nullable(cursor, "cap_equity_changes", "fund_id", "fund_id BIGINT UNSIGNED NULL")
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS cap_card_drafts (
@@ -2239,16 +2287,156 @@ def project_equity_changes(project_id: int, user: AuthedUser = Depends(current_u
         with connection.cursor() as cursor:
             _assert_project(cursor, project_id, tid)
             cursor.execute(
-                """SELECT change_reason, round_label, is_lead_investor, pre_money_ratio, post_money_ratio,
-                          share_count_delta, agreement_date, notes
-                   FROM cap_equity_changes WHERE project_id=%s AND tenant_id=%s AND deleted_at IS NULL
-                   ORDER BY agreement_date""",
+                """SELECT e.equity_change_id, e.fund_id, COALESCE(f.fund_name, '-') AS fund_name,
+                          e.change_reason, e.round_label, e.is_lead_investor,
+                          e.investment_method, e.investment_method_label,
+                          e.pre_money_ratio, e.post_money_ratio, e.co_investors,
+                          e.share_count_delta, e.agreement_date, e.approval_date, e.notes
+                   FROM cap_equity_changes e
+                   LEFT JOIN cap_funds f ON f.fund_id=e.fund_id
+                   WHERE e.project_id=%s AND e.tenant_id=%s AND e.deleted_at IS NULL
+                   ORDER BY e.agreement_date DESC""",
                 (project_id, tid),
             )
             rows = cursor.fetchall()
     finally:
         connection.close()
     return {"count": len(rows), "items": rows}
+
+
+_EQUITY_EDITABLE = {
+    "fund_id", "change_reason", "agreement_date", "approval_date", "round_label",
+    "is_lead_investor", "investment_method_label", "pre_money_ratio", "post_money_ratio",
+    "co_investors", "notes",
+}
+
+
+@app.get("/api/equity-changes")
+def list_equity_changes(user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
+    """投资关系台账(反馈 #12):跨项目权益变动记录,一行一条,带项目/基金名。"""
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """SELECT e.equity_change_id, e.project_id, COALESCE(p.short_name, '-') AS project_name,
+                          e.fund_id, COALESCE(f.fund_name, '-') AS fund_name,
+                          e.change_reason, e.agreement_date, e.approval_date, e.round_label,
+                          e.is_lead_investor, e.investment_method, e.investment_method_label,
+                          e.pre_money_ratio, e.post_money_ratio, e.co_investors, e.notes
+                   FROM cap_equity_changes e
+                   LEFT JOIN cap_projects p ON p.project_id=e.project_id
+                   LEFT JOIN cap_funds f ON f.fund_id=e.fund_id
+                   WHERE e.tenant_id=%s AND e.deleted_at IS NULL
+                   ORDER BY e.agreement_date DESC, e.equity_change_id DESC""",
+                (tid,),
+            )
+            rows = cursor.fetchall()
+    finally:
+        connection.close()
+    return {"count": len(rows), "items": rows}
+
+
+@app.post("/api/equity-changes")
+def create_equity_change(payload: EquityChangePayload, user: AuthedUser = Depends(require_permission("project.edit"))) -> dict[str, Any]:
+    """新增权益变动记录(反馈 #12/#13)。"""
+    if not payload.project_id:
+        raise HTTPException(status_code=400, detail="project_id is required")
+    if not (payload.change_reason or "").strip():
+        raise HTTPException(status_code=400, detail="change_reason is required")
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            _assert_project(cursor, payload.project_id, tid)
+            if payload.fund_id:
+                cursor.execute("SELECT fund_id FROM cap_funds WHERE fund_id=%s AND tenant_id=%s AND deleted_at IS NULL", (payload.fund_id, tid))
+                if cursor.fetchone() is None:
+                    raise HTTPException(status_code=404, detail="Fund not found")
+            cursor.execute(
+                """INSERT INTO cap_equity_changes
+                     (project_id, fund_id, change_code, change_reason, agreement_date, approval_date,
+                      round_label, is_lead_investor, investment_method, investment_method_label,
+                      pre_money_ratio, post_money_ratio, co_investors, notes, created_by, tenant_id)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'other', %s, %s, %s, %s, %s, %s, %s)""",
+                (
+                    payload.project_id, payload.fund_id or None,
+                    f"EQ-{uuid.uuid4().hex[:10].upper()}",
+                    payload.change_reason.strip(),
+                    payload.agreement_date or None, payload.approval_date or None,
+                    payload.round_label or "-", 1 if payload.is_lead_investor else 0,
+                    payload.investment_method_label,
+                    payload.pre_money_ratio, payload.post_money_ratio,
+                    payload.co_investors, payload.notes, user.user_id, tid,
+                ),
+            )
+            change_id = int(cursor.lastrowid)
+            audit_id = write_audit(cursor, user.user_id, "equity_change.create", "equity_change", change_id,
+                                   payload.change_reason.strip(), after=payload.model_dump(exclude_none=True))
+        connection.commit()
+    finally:
+        connection.close()
+    return {"ok": True, "equity_change_id": change_id, "audit_id": audit_id}
+
+
+@app.patch("/api/equity-changes/{change_id}")
+def update_equity_change(change_id: int, payload: EquityChangePayload, user: AuthedUser = Depends(require_permission("project.edit"))) -> dict[str, Any]:
+    """编辑权益变动记录:只更新传入字段,project_id 不可改。"""
+    tid = tenant_of(user)
+    fields = payload.model_dump(exclude_unset=True)
+    fields.pop("project_id", None)
+    updates = {k: v for k, v in fields.items() if k in _EQUITY_EDITABLE}
+    if not updates:
+        raise HTTPException(status_code=400, detail="No editable fields provided")
+    if "is_lead_investor" in updates:
+        updates["is_lead_investor"] = 1 if updates["is_lead_investor"] else 0
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT equity_change_id, change_reason FROM cap_equity_changes WHERE equity_change_id=%s AND tenant_id=%s AND deleted_at IS NULL",
+                (change_id, tid),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail="Equity change not found")
+            if updates.get("fund_id"):
+                cursor.execute("SELECT fund_id FROM cap_funds WHERE fund_id=%s AND tenant_id=%s AND deleted_at IS NULL", (updates["fund_id"], tid))
+                if cursor.fetchone() is None:
+                    raise HTTPException(status_code=404, detail="Fund not found")
+            assignments = ", ".join(f"{k}=%s" for k in updates)
+            cursor.execute(
+                f"UPDATE cap_equity_changes SET {assignments} WHERE equity_change_id=%s AND tenant_id=%s",
+                (*updates.values(), change_id, tid),
+            )
+            audit_id = write_audit(cursor, user.user_id, "equity_change.update", "equity_change", change_id,
+                                   str(row["change_reason"]), after=updates)
+        connection.commit()
+    finally:
+        connection.close()
+    return {"ok": True, "audit_id": audit_id}
+
+
+@app.delete("/api/equity-changes/{change_id}")
+def delete_equity_change(change_id: int, user: AuthedUser = Depends(require_permission("project.edit"))) -> dict[str, Any]:
+    """删除权益变动记录(软删,与其余台账一致)。"""
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT change_reason FROM cap_equity_changes WHERE equity_change_id=%s AND tenant_id=%s AND deleted_at IS NULL",
+                (change_id, tid),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail="Equity change not found")
+            cursor.execute("UPDATE cap_equity_changes SET deleted_at=NOW() WHERE equity_change_id=%s AND tenant_id=%s", (change_id, tid))
+            audit_id = write_audit(cursor, user.user_id, "equity_change.delete", "equity_change", change_id, str(row["change_reason"]))
+        connection.commit()
+    finally:
+        connection.close()
+    return {"ok": True, "audit_id": audit_id}
 
 
 @app.get("/api/projects/{project_id}/cashflows")
