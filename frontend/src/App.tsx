@@ -2318,7 +2318,9 @@ const PROJECT_BASIC_GROUPS: Array<[string, string[]]> = [
 const PROJECT_SUBTABS = ['基本情况', '投资汇总', '财务数据', '委派代表', '投资决策', 'AI 备忘录'] as const
 type ProjectSubtab = (typeof PROJECT_SUBTABS)[number]
 // 顶部 section 导航(对照反馈截图那一行)。概况=卡片主视图;其余为各专题 section。
-const PROJECT_SECTIONS = ['概况', '日程', '基金投资情况', '权益变动', '三会', '现金流', '估值', '投后数据', '协议条款(AI)'] as const
+// 「投资关系」= 原 基金投资情况 + 权益变动 两个页签合并(对应老导航「项目详情-投资关系」);
+// 「投后数据」= 收集配置 + 填报数据明细(对应老导航「项目详情-投后数据」,原财务表在二级 tab「财务数据」)。
+const PROJECT_SECTIONS = ['概况', '日程', '投资关系', '三会', '现金流', '估值', '投后数据', '协议条款(AI)'] as const
 const _n = (v: unknown): number | null => (v == null || v === '' ? null : Number(v))
 const CF_KIND_CN: Record<string, string> = { project_return: '项目回款', capital_call: '出资', investment: '投资打款', management_fee: '管理费', distribution: '分配', expense: '费用' }
 const CF_DIR_CN: Record<string, string> = { inflow: '流入', outflow: '流出' }
@@ -3547,7 +3549,7 @@ function PostdataDetailView({ projectId, canWrite, onToast, onBack }: {
   projectId: number
   canWrite: boolean
   onToast: (toast: Toast) => void
-  onBack: () => void
+  onBack?: () => void // 缺省 = 嵌在项目卡片「投后数据」section 里,不显示返回
 }) {
   const [data, setData] = useState<PostdataDetail | null>(null)
   const [reloadKey, setReloadKey] = useState(0)
@@ -3634,9 +3636,11 @@ function PostdataDetailView({ projectId, canWrite, onToast, onBack }: {
 
   return (
     <div className="page-grid" data-testid="postdata-detail">
-      <div className="full-span entity-detail-back">
-        <button type="button" className="secondary-button" onClick={onBack}><ChevronLeft size={16} /> 收集列表</button>
-      </div>
+      {onBack && (
+        <div className="full-span entity-detail-back">
+          <button type="button" className="secondary-button" onClick={onBack}><ChevronLeft size={16} /> 收集列表</button>
+        </div>
+      )}
       <section className="panel full-span motion-item">
         <h2 className="pd-title">{data.project_name}</h2>
         <div className="pd-info-grid" data-testid="pd-info">
@@ -4114,8 +4118,9 @@ function DetailPage({
   // 顶部各专题 section 按需拉取(项目/基金各自的 SECTION_DATA)。
   useEffect(() => {
     if (kind == null || selectedId == null) return
-    if (kind === 'project' && section === '权益变动') { setSectionRows([]); return } // #13:该 section 由 EquityChangeTable 自取数
-    const spec = sectionMap[section]
+    if (kind === 'project' && section === '投后数据') { setSectionRows([]); return } // #15:收集/填报明细组件自取数
+    // 「投资关系」上半屏复用 基金投资情况 的数据源;权益变动表由 EquityChangeTable 自取数。
+    const spec = kind === 'project' && section === '投资关系' ? SECTION_DATA['基金投资情况'] : sectionMap[section]
     if (!spec) { setSectionRows([]); return }
     let ignore = false
     setSectionLoading(true); setSectionRows([])
@@ -4641,11 +4646,27 @@ function DetailPage({
           </>
           ) : section === '协议条款(AI)' ? (
             <ProjectClausesSection projectId={selectedId} canWrite={canWrite} onToast={onToast} />
-          ) : section === '权益变动' && selectedId != null ? (
-            <section className="panel full-span motion-item" data-testid="section-equity">
-              <PanelTitle icon={FileText} title="权益变动" />
-              <EquityChangeTable projectId={selectedId} canWrite={canWrite} onToast={onToast} />
-            </section>
+          ) : section === '投资关系' && selectedId != null ? (
+            <>
+              <section className="panel full-span motion-item" data-testid="section-invest-positions">
+                <PanelTitle icon={FileText} title="基金投资情况" />
+                {sectionLoading ? (
+                  <p className="muted-note">加载中…</p>
+                ) : sectionRows.length === 0 ? (
+                  <p className="muted-note">该项目暂无基金投资记录。</p>
+                ) : (
+                  <DataTable rows={sectionRows} compact />
+                )}
+              </section>
+              <section className="panel full-span motion-item" data-testid="section-equity">
+                <PanelTitle icon={FileText} title="权益变动" />
+                <EquityChangeTable projectId={selectedId} canWrite={canWrite} onToast={onToast} />
+              </section>
+            </>
+          ) : section === '投后数据' && selectedId != null ? (
+            <div className="full-span" data-testid="section-postdata">
+              <PostdataDetailView projectId={selectedId} canWrite={canWrite} onToast={onToast} />
+            </div>
           ) : SECTION_DATA[section] ? (
             <section className="panel full-span motion-item" data-testid="section-data">
               <PanelTitle icon={FileText} title={section} />
