@@ -2228,3 +2228,67 @@ tbody tr:hover {
   background: white;
 }
 .eq-modal-actions { margin-top: 16px; }
+
+/* ── 投后数据收集(反馈 #14/#15) ── */
+.pd-title { margin: 0 0 14px; }
+.pd-info-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
+}
+.pd-info-cell {
+  display: grid;
+  grid-template-columns: 120px 1fr;
+  border-bottom: 1px solid var(--line);
+  border-right: 1px solid var(--line);
+  min-height: 44px;
+}
+.pd-info-cell:nth-child(3n) { border-right: none; }
+.pd-info-cell:nth-last-child(-n+3) { border-bottom: none; }
+.pd-info-key {
+  background: #f8fafc;
+  color: #475569;
+  font-size: 12px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  padding: 0 12px;
+  border-right: 1px solid var(--line);
+}
+.pd-info-val { display: flex; align-items: center; padding: 0 12px; font-size: 13px; }
+@media (max-width: 1100px) {
+  .pd-info-grid { grid-template-columns: 1fr; }
+  .pd-info-cell, .pd-info-cell:nth-child(3n) { border-right: none; }
+  .pd-info-cell:nth-last-child(-n+3) { border-bottom: 1px solid var(--line); }
+  .pd-info-cell:last-child { border-bottom: none; }
+}
+.pd-reports-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+.pd-reports-head h3 { margin: 0; }
+.pd-actions { margin-top: 16px; flex-wrap: wrap; }
+
+/* 外部免登录填报页 */
+.external-fill-shell {
+  min-height: 100vh;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 48px 16px;
+  background: #f1f5f9;
+}
+.external-fill-card {
+  width: min(880px, 96vw);
+  background: white;
+  border-radius: 16px;
+  padding: 28px 32px;
+  box-shadow: 0 16px 48px rgba(15, 23, 42, 0.12);
+  display: grid;
+  gap: 14px;
+}
+.external-fill-card h2 { margin: 0; }
+.external-fill-subtitle { margin: 6px 0 0; font-size: 14px; }
+.external-fill-input { width: 110px; border: 1px solid var(--line); border-radius: 6px; min-height: 32px; padding: 0 8px; }
+.external-fill-error { color: #dc2626; font-size: 13px; margin: 0; }
+.external-fill-done { font-size: 15px; }
+.external-fill-footer { color: #94a3b8; font-size: 12px; margin: 6px 0 0; }

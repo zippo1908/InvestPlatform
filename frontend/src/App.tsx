@@ -839,6 +839,9 @@ function App() {
       return { ...prev, [domain]: openNow } // openNow→收起(true);否则展开(false)
     })
 
+  // 外部免登录填报页(邮件链接落地):在登录闸门之前放行,凭 URL token 与后端交互。
+  if (route === 'external-fill') return <ExternalFillPage />
+
   const showLogin = !authed || route === 'login'
 
   if (showLogin) {
@@ -1260,6 +1263,8 @@ function PageRenderer({
   if (screen.id === 'workbench') return <DashboardPage onToast={onToast} />
   // 反馈 #12:投资关系入口与「权益变动」台账屏都渲染记录台账。
   if (screen.id === 'project-detail-investment' || screen.id === 'equity-change') return <EquityLedgerPage screen={screen} canWrite={canWrite} onToast={onToast} />
+  // 反馈 #14/#15:投后数据入口 = 收集台账(点项目名进明细)。
+  if (screen.id === 'project-detail-postdata' || screen.id === 'post-data-collection') return <PostDataPage screen={screen} canWrite={canWrite} onToast={onToast} />
   if (screen.kind === 'ai') return <AiPage screen={screen} canWrite={canWrite} onToast={onToast} />
   if (screen.kind === 'board') return <BoardPage canWrite={canWrite} onToast={onToast} />
   if (screen.kind === 'form') return <FormPage screen={screen} canWrite={canWrite} onToast={onToast} />
@@ -3265,6 +3270,796 @@ function EquityLedgerPage({ screen, canWrite, onToast }: { screen: Screen; canWr
       <section className="panel full-span motion-item">
         <EquityChangeTable canWrite={canWrite} onToast={onToast} />
       </section>
+    </div>
+  )
+}
+
+// ── 投后数据收集(反馈 #14/#15):收集台账 + 明细 + 外部免登录填报 ──
+
+type PostdataCollectionRow = {
+  project_id: number
+  project_name: string
+  collection_id: number | null
+  collector_name: string | null
+  recipient_email: string | null
+  collect_status: string | null
+  send_attempts: number | null
+  last_sent_at: string | null
+  collected_on: string | null
+  notes: string | null
+  external_enabled: number | null
+  pending_reports: number
+}
+
+type PostdataReport = {
+  report_id: number
+  fill_year: string
+  fill_period: string
+  fill_status: string
+  total_assets: string | number | null
+  net_assets: string | number | null
+  revenue: string | number | null
+  net_profit: string | number | null
+  filled_at: string | null
+  filled_by: string | null
+}
+
+type PostdataDetail = {
+  project_id: number
+  project_name: string
+  collection: {
+    collector_name: string | null; recipient_email: string | null; collect_status: string | null
+    send_attempts: number | null; last_sent_at: string | null; collected_on: string | null
+    notes: string | null; external_enabled: number | null
+  }
+  external_link: string | null
+  reports: PostdataReport[]
+}
+
+const PD_PERIODS = ['年度', '半年度', '一季度', '二季度', '三季度', '四季度']
+
+function pdWan(v: unknown): string {
+  if (v == null || v === '') return '- 万'
+  const n = Number(v)
+  return Number.isNaN(n) ? '- 万' : `${n.toLocaleString('zh-CN', { maximumFractionDigits: 2 })} 万`
+}
+
+// 收集配置编辑弹窗(#14 编辑 / #15 修改 共用)。
+function PostdataCollectionModal({ row, onClose, onSaved, onToast }: {
+  row: { project_id: number; project_name: string; collector_name?: string | null; recipient_email?: string | null; collected_on?: string | null; notes?: string | null }
+  onClose: () => void
+  onSaved: () => void
+  onToast: (toast: Toast) => void
+}) {
+  const [form, setForm] = useState({
+    collector_name: row.collector_name ?? '',
+    recipient_email: row.recipient_email ?? '',
+    collected_on: row.collected_on ? String(row.collected_on).slice(0, 10) : '',
+    notes: row.notes ?? '',
+  })
+  const [saving, setSaving] = useState(false)
+  const save = async () => {
+    setSaving(true)
+    try {
+      await apiPatch(`/api/postdata/collections/${row.project_id}`, {
+        collector_name: form.collector_name,
+        recipient_email: form.recipient_email,
+        collected_on: form.collected_on || null,
+        notes: form.notes,
+      })
+      onToast({ title: '收集配置已保存', detail: `项目「${row.project_name}」`, action: 'postdata.collection.update', entity: 'cap_postdata_collections' })
+      onSaved()
+      onClose()
+    } catch (error) {
+      onToast({ title: '保存失败', detail: error instanceof Error ? error.message : 'API 调用失败' })
+    } finally {
+      setSaving(false)
+    }
+  }
+  return (
+    <div className="eq-modal-backdrop" onClick={onClose} data-testid="pd-collection-modal">
+      <div className="eq-modal" onClick={(e) => e.stopPropagation()}>
+        <div className="eq-modal-head">
+          <h3>收集配置 · {row.project_name}</h3>
+          <button type="button" className="icon-button" aria-label="关闭" onClick={onClose}><X size={18} /></button>
+        </div>
+        <div className="form-grid">
+          <label><span>企业资料收集人</span><input value={form.collector_name} onChange={(e) => setForm((f) => ({ ...f, collector_name: e.target.value }))} placeholder="对接的企业联系人" /></label>
+          <label><span>收件邮箱</span><input type="email" value={form.recipient_email} onChange={(e) => setForm((f) => ({ ...f, recipient_email: e.target.value }))} placeholder="填报邀请发往此邮箱" data-testid="pd-email" /></label>
+          <label><span>收集时间</span><input type="date" value={form.collected_on} onChange={(e) => setForm((f) => ({ ...f, collected_on: e.target.value }))} /></label>
+          <label><span>备注</span><input value={form.notes} onChange={(e) => setForm((f) => ({ ...f, notes: e.target.value }))} /></label>
+        </div>
+        <div className="button-row eq-modal-actions">
+          <button type="button" className="primary-button" disabled={saving} onClick={save} data-testid="pd-collection-save"><CheckCircle size={15} /> {saving ? '保存中…' : '保存'}</button>
+          <button type="button" className="secondary-button" onClick={onClose}>取消</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// 填报行编辑/新增弹窗(内部口径,金额单位:万)。
+function PostdataReportModal({ projectId, initial, onClose, onSaved, onToast }: {
+  projectId: number
+  initial: PostdataReport | null
+  onClose: () => void
+  onSaved: () => void
+  onToast: (toast: Toast) => void
+}) {
+  const [form, setForm] = useState({
+    fill_year: initial?.fill_year ?? String(new Date().getFullYear()),
+    fill_period: initial?.fill_period ?? '年度',
+    fill_status: initial?.fill_status ?? '待填报',
+    total_assets: initial?.total_assets != null ? String(initial.total_assets) : '',
+    net_assets: initial?.net_assets != null ? String(initial.net_assets) : '',
+    revenue: initial?.revenue != null ? String(initial.revenue) : '',
+    net_profit: initial?.net_profit != null ? String(initial.net_profit) : '',
+  })
+  const [saving, setSaving] = useState(false)
+  const periods = PD_PERIODS.includes(form.fill_period) ? PD_PERIODS : [form.fill_period, ...PD_PERIODS]
+  const save = async () => {
+    if (!form.fill_year.trim()) { onToast({ title: '请填写所填年份', detail: '如 2026' }); return }
+    const num = (s: string) => { const n = Number(s); return s.trim() === '' || Number.isNaN(n) ? null : n }
+    const payload = {
+      fill_year: form.fill_year.trim(),
+      fill_period: form.fill_period,
+      fill_status: form.fill_status,
+      total_assets: num(form.total_assets),
+      net_assets: num(form.net_assets),
+      revenue: num(form.revenue),
+      net_profit: num(form.net_profit),
+    }
+    setSaving(true)
+    try {
+      if (initial) {
+        await apiPatch(`/api/postdata/reports/${initial.report_id}`, payload)
+        onToast({ title: '填报数据已更新', detail: `${payload.fill_year} ${payload.fill_period}`, action: 'postdata.report.update', entity: 'cap_postdata_reports' })
+      } else {
+        await apiPost(`/api/projects/${projectId}/postdata/reports`, payload)
+        onToast({ title: '填报期间已新增', detail: `${payload.fill_year} ${payload.fill_period}`, action: 'postdata.report.create', entity: 'cap_postdata_reports' })
+      }
+      onSaved()
+      onClose()
+    } catch (error) {
+      onToast({ title: '保存失败', detail: error instanceof Error ? error.message : 'API 调用失败' })
+    } finally {
+      setSaving(false)
+    }
+  }
+  return (
+    <div className="eq-modal-backdrop" onClick={onClose} data-testid="pd-report-modal">
+      <div className="eq-modal" onClick={(e) => e.stopPropagation()}>
+        <div className="eq-modal-head">
+          <h3>{initial ? '编辑填报数据' : '新增填报期间'}</h3>
+          <button type="button" className="icon-button" aria-label="关闭" onClick={onClose}><X size={18} /></button>
+        </div>
+        <div className="form-grid">
+          <label><span>所填年份<i>必填</i></span><input value={form.fill_year} onChange={(e) => setForm((f) => ({ ...f, fill_year: e.target.value }))} placeholder="2026" /></label>
+          <label><span>所填季度<i>必填</i></span>
+            <select value={form.fill_period} onChange={(e) => setForm((f) => ({ ...f, fill_period: e.target.value }))}>
+              {periods.map((p) => <option key={p} value={p}>{p}</option>)}
+            </select>
+          </label>
+          <label><span>填报状态</span>
+            <select value={form.fill_status} onChange={(e) => setForm((f) => ({ ...f, fill_status: e.target.value }))}>
+              {['待填报', '已填报'].map((s) => <option key={s} value={s}>{s}</option>)}
+            </select>
+          </label>
+          <label><span>总资产(万)</span><input type="number" step="0.01" value={form.total_assets} onChange={(e) => setForm((f) => ({ ...f, total_assets: e.target.value }))} /></label>
+          <label><span>净资产(万)</span><input type="number" step="0.01" value={form.net_assets} onChange={(e) => setForm((f) => ({ ...f, net_assets: e.target.value }))} /></label>
+          <label><span>营业收入(万)</span><input type="number" step="0.01" value={form.revenue} onChange={(e) => setForm((f) => ({ ...f, revenue: e.target.value }))} /></label>
+          <label><span>净利润(万)</span><input type="number" step="0.01" value={form.net_profit} onChange={(e) => setForm((f) => ({ ...f, net_profit: e.target.value }))} /></label>
+        </div>
+        <div className="button-row eq-modal-actions">
+          <button type="button" className="primary-button" disabled={saving} onClick={save} data-testid="pd-report-save"><CheckCircle size={15} /> {saving ? '保存中…' : '保存'}</button>
+          <button type="button" className="secondary-button" onClick={onClose}>取消</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// 邮箱(SMTP)配置面板:与 AiConfigPanel 同构,密码不回显、留空不改。
+function MailConfigPanel({ onToast }: { onToast: (toast: Toast) => void }) {
+  type Cfg = { host: string; port: string; username: string; has_password: boolean; mail_from: string; security: string; public_base: string }
+  const [cfg, setCfg] = useState<Cfg | null>(null)
+  const [form, setForm] = useState({ host: '', port: '', username: '', password: '', mail_from: '', security: 'starttls', public_base: '' })
+  const [busy, setBusy] = useState(false)
+  const [testTo, setTestTo] = useState('')
+  const [testResult, setTestResult] = useState<string | null>(null)
+
+  const load = () =>
+    apiGet<Cfg>('/api/mail/config')
+      .then((c) => {
+        setCfg(c)
+        setForm((f) => ({ ...f, host: c.host, port: c.port, username: c.username, mail_from: c.mail_from, security: c.security || 'starttls', public_base: c.public_base }))
+      })
+      .catch(() => undefined)
+  useEffect(() => { void load() }, [])
+
+  const save = async () => {
+    setBusy(true)
+    try {
+      const body: Record<string, unknown> = {
+        host: form.host, port: form.port ? Number(form.port) : 0, username: form.username,
+        mail_from: form.mail_from, security: form.security, public_base: form.public_base,
+      }
+      if (form.password.trim()) body.password = form.password.trim()
+      await apiPost('/api/mail/config', body)
+      setForm((f) => ({ ...f, password: '' }))
+      onToast({ title: '邮箱配置已保存', detail: '发送填报邮件即用新配置', action: 'mail.config.update', entity: 'app_setting' })
+      void load()
+    } catch (error) {
+      onToast({ title: '保存失败', detail: error instanceof Error ? error.message : 'API 调用失败' })
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const test = async () => {
+    if (!testTo.trim()) { setTestResult('❌ 先填写测试收件地址'); return }
+    setBusy(true); setTestResult(null)
+    try {
+      await apiPost('/api/mail/test', { to: testTo.trim() })
+      setTestResult(`✅ 已发送至 ${testTo.trim()},请查收`)
+    } catch (error) {
+      setTestResult('❌ ' + (error instanceof Error ? error.message : '测试失败'))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <section className="panel full-span motion-item" data-testid="mail-config">
+      <PanelTitle icon={Send} title="填报邮箱配置(管理员)" />
+      <p className="muted-copy">发送投后数据填报邮件所用的 SMTP 服务;密码不回显、留空表示不修改。当前:{cfg?.has_password ? '已配置密码 ✓' : '未配置密码'}。</p>
+      <div className="form-grid detail-edit-grid">
+        <label><span>SMTP 服务器</span><input value={form.host} onChange={(e) => setForm((f) => ({ ...f, host: e.target.value }))} placeholder="smtp.exmail.qq.com" /></label>
+        <label><span>端口</span><input type="number" value={form.port} onChange={(e) => setForm((f) => ({ ...f, port: e.target.value }))} placeholder="465(ssl)/ 587(starttls)" /></label>
+        <label><span>加密方式</span>
+          <select value={form.security} onChange={(e) => setForm((f) => ({ ...f, security: e.target.value }))}>
+            <option value="ssl">SSL</option>
+            <option value="starttls">STARTTLS</option>
+            <option value="none">不加密</option>
+          </select>
+        </label>
+        <label><span>账号</span><input value={form.username} onChange={(e) => setForm((f) => ({ ...f, username: e.target.value }))} placeholder="noreply@yourco.com" /></label>
+        <label><span>密码 / 授权码(留空不改)</span><input type="password" value={form.password} onChange={(e) => setForm((f) => ({ ...f, password: e.target.value }))} placeholder={cfg?.has_password ? '••• 已设置' : '未设置'} /></label>
+        <label><span>发件人地址</span><input value={form.mail_from} onChange={(e) => setForm((f) => ({ ...f, mail_from: e.target.value }))} placeholder="缺省用账号" /></label>
+        <label><span>外部填报链接前缀</span><input value={form.public_base} onChange={(e) => setForm((f) => ({ ...f, public_base: e.target.value }))} placeholder="如 http://10.28.239.76:89(企业侧可访问的地址)" /></label>
+      </div>
+      <div className="button-row" style={{ marginTop: 12, alignItems: 'center', flexWrap: 'wrap' }}>
+        <button className="primary-button" type="button" disabled={busy} onClick={save}>保存配置</button>
+        <label className="table-search" style={{ minWidth: 220 }}>
+          <Send size={14} />
+          <input value={testTo} onChange={(e) => setTestTo(e.target.value)} placeholder="测试收件地址" aria-label="测试收件地址" />
+        </label>
+        <button className="secondary-button" type="button" disabled={busy} onClick={test}>发测试邮件</button>
+        {testResult && <span style={{ fontSize: 13 }}>{testResult}</span>}
+      </div>
+    </section>
+  )
+}
+
+// #15:投后数据明细(信息格 + 填报数据表 + 底部动作条)。
+function PostdataDetailView({ projectId, canWrite, onToast, onBack }: {
+  projectId: number
+  canWrite: boolean
+  onToast: (toast: Toast) => void
+  onBack: () => void
+}) {
+  const [data, setData] = useState<PostdataDetail | null>(null)
+  const [reloadKey, setReloadKey] = useState(0)
+  const reload = () => setReloadKey((k) => k + 1)
+  const [editingCollection, setEditingCollection] = useState(false)
+  const [editingReport, setEditingReport] = useState<PostdataReport | 'new' | null>(null)
+  const [showHistory, setShowHistory] = useState(false)
+  const [history, setHistory] = useState<Array<Record<string, unknown>>>([])
+  const [busy, setBusy] = useState(false)
+
+  useEffect(() => {
+    let ignore = false
+    apiGet<PostdataDetail>(`/api/projects/${projectId}/postdata`)
+      .then((d) => !ignore && setData(d))
+      .catch(() => !ignore && setData(null))
+    return () => { ignore = true }
+  }, [projectId, reloadKey])
+
+  useEffect(() => {
+    if (!showHistory) return
+    let ignore = false
+    apiGet<{ items: Array<Record<string, unknown>> }>(`/api/projects/${projectId}/history`)
+      .then((r) => { if (!ignore) setHistory((r.items ?? []).filter((h) => String(h.action_code ?? '').startsWith('postdata'))) })
+      .catch(() => !ignore && setHistory([]))
+    return () => { ignore = true }
+  }, [showHistory, projectId, reloadKey])
+
+  if (data == null) return <p className="muted-note">加载中…</p>
+  const col = data.collection
+  const externalOn = Boolean(col.external_enabled)
+
+  const toggleExternal = async () => {
+    setBusy(true)
+    try {
+      await apiPatch(`/api/postdata/collections/${projectId}`, { external_enabled: !externalOn })
+      onToast({ title: externalOn ? '已关闭外部填报' : '已开启外部填报', detail: externalOn ? '外部链接立即失效' : '外部链接恢复可用', action: 'postdata.collection.update', entity: 'cap_postdata_collections' })
+      reload()
+    } catch (error) {
+      onToast({ title: '操作失败', detail: error instanceof Error ? error.message : 'API 调用失败' })
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const copyLink = async () => {
+    if (!data.external_link) { onToast({ title: '外部填报已关闭', detail: '先点「开启外部填报」' }); return }
+    const link = data.external_link.startsWith('/') ? `${location.origin}${data.external_link}` : data.external_link
+    try {
+      await navigator.clipboard.writeText(link)
+      onToast({ title: '填报链接已复制', detail: link })
+    } catch {
+      onToast({ title: '复制失败', detail: link })
+    }
+  }
+
+  const sendMail = async () => {
+    setBusy(true)
+    try {
+      const r = await apiPost<{ results: Array<{ ok: boolean; status: string }> }>('/api/postdata/send', { project_ids: [projectId] })
+      const res = r.results[0]
+      onToast({ title: res.ok ? '填报邮件已发送' : '发送失败', detail: res.status, action: 'postdata.mail.send', entity: 'cap_postdata_collections' })
+      reload()
+    } catch (error) {
+      onToast({ title: '发送失败', detail: error instanceof Error ? error.message : 'API 调用失败' })
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const removeReport = async (r: PostdataReport) => {
+    if (!window.confirm(`确认删除 ${r.fill_year} ${r.fill_period} 填报行?`)) return
+    try {
+      await apiDelete(`/api/postdata/reports/${r.report_id}`)
+      onToast({ title: '填报行已删除', detail: `${r.fill_year} ${r.fill_period}`, action: 'postdata.report.delete', entity: 'cap_postdata_reports' })
+      reload()
+    } catch (error) {
+      onToast({ title: '删除失败', detail: error instanceof Error ? error.message : 'API 调用失败' })
+    }
+  }
+
+  const dl = (kind: 'docx' | 'pdf') =>
+    apiDownload(`/api/projects/${projectId}/postdata/export.${kind}`, `${data.project_name}-投后数据.${kind}`)
+      .catch((e) => onToast({ title: '下载失败', detail: e instanceof Error ? e.message : 'API 调用失败' }))
+
+  return (
+    <div className="page-grid" data-testid="postdata-detail">
+      <div className="full-span entity-detail-back">
+        <button type="button" className="secondary-button" onClick={onBack}><ChevronLeft size={16} /> 收集列表</button>
+      </div>
+      <section className="panel full-span motion-item">
+        <h2 className="pd-title">{data.project_name}</h2>
+        <div className="pd-info-grid" data-testid="pd-info">
+          {[
+            ['项目名称', data.project_name],
+            ['企业资料收集人', col.collector_name],
+            ['收件邮箱', col.recipient_email],
+            ['收集时间', col.collected_on ? String(col.collected_on).slice(0, 10) : null],
+            ['收集状态', col.collect_status],
+            ['备注', col.notes],
+          ].map(([k, v]) => (
+            <div className="pd-info-cell" key={String(k)}>
+              <span className="pd-info-key">{k}</span>
+              <span className="pd-info-val">{v || '—'}</span>
+            </div>
+          ))}
+        </div>
+      </section>
+      <section className="panel full-span motion-item">
+        <div className="pd-reports-head">
+          <h3>填报数据</h3>
+          <button type="button" className="primary-button" disabled={!canWrite} onClick={() => setEditingReport('new')} data-testid="pd-report-add">
+            <Plus size={15} /> 新增期间
+          </button>
+        </div>
+        {data.reports.length === 0 ? (
+          <p className="muted-note">暂无填报期间,点「新增期间」创建(如 2026 半年度)。</p>
+        ) : (
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>所填年份</th><th>所填季度</th><th>填报状态</th>
+                  <th>总资产</th><th>净资产</th><th>营业收入</th><th>净利润</th><th>操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                {data.reports.map((r) => (
+                  <tr key={r.report_id}>
+                    <td>{r.fill_year}</td>
+                    <td>{r.fill_period}</td>
+                    <td><span className={`eq-tag ${r.fill_status === '已填报' ? 'tone-teal' : 'tone-gray'}`}>{r.fill_status}</span></td>
+                    <td>{pdWan(r.total_assets)}</td>
+                    <td>{pdWan(r.net_assets)}</td>
+                    <td>{pdWan(r.revenue)}</td>
+                    <td>{pdWan(r.net_profit)}</td>
+                    <td className="eq-row-actions">
+                      <button type="button" className="link-button" disabled={!canWrite} onClick={() => setEditingReport(r)}>编辑</button>
+                      <span className="eq-action-sep">|</span>
+                      <button type="button" className="link-button eq-danger-link" disabled={!canWrite} onClick={() => void removeReport(r)}>删除</button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+        <div className="button-row pd-actions" data-testid="pd-actions">
+          <button type="button" className="primary-button" disabled={!canWrite} onClick={() => setEditingCollection(true)}>修改</button>
+          <button type="button" className="secondary-button" onClick={() => void dl('docx')}><FileText size={15} /> 下载WORD</button>
+          <button type="button" className="secondary-button" onClick={() => void dl('pdf')}><FileText size={15} /> 下载PDF</button>
+          <button type="button" className="secondary-button" onClick={() => setShowHistory((v) => !v)}><Clock size={15} /> {showHistory ? '收起历史' : '历史'}</button>
+          <button type="button" className="secondary-button" disabled={!canWrite || busy} onClick={() => void toggleExternal()} data-testid="pd-toggle-external">
+            {externalOn ? '关闭外部填报' : '开启外部填报'}
+          </button>
+          <button type="button" className="secondary-button" onClick={() => void copyLink()} title="复制外部填报链接"><Paperclip size={15} /> 复制链接</button>
+          <button type="button" className="primary-button" disabled={!canWrite || busy} onClick={() => void sendMail()} data-testid="pd-send"><Send size={15} /> 发送</button>
+        </div>
+        {showHistory && (
+          <div className="history-list">
+            {history.length === 0 ? <p className="muted-note">暂无投后数据操作历史</p> : history.map((h, i) => (
+              <div className="history-row" key={i}>
+                <span className="history-action">{String(h.action_code ?? '')}</span>
+                <span className="history-meta">{String(h.actor ?? '系统')} · {h.occurred_at ? String(h.occurred_at).replace('T', ' ').slice(0, 19) : ''}</span>
+                {h.entity_label ? <span className="history-label">{String(h.entity_label)}</span> : null}
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
+      {editingCollection && (
+        <PostdataCollectionModal
+          row={{ project_id: projectId, project_name: data.project_name, ...col }}
+          onClose={() => setEditingCollection(false)}
+          onSaved={reload}
+          onToast={onToast}
+        />
+      )}
+      {editingReport !== null && (
+        <PostdataReportModal
+          projectId={projectId}
+          initial={editingReport === 'new' ? null : editingReport}
+          onClose={() => setEditingReport(null)}
+          onSaved={reload}
+          onToast={onToast}
+        />
+      )}
+    </div>
+  )
+}
+
+// #14:投后数据收集台账(post-data-collection / project-detail-postdata 共用入口)。
+function PostDataPage({ screen, canWrite, onToast }: { screen: Screen; canWrite: boolean; onToast: (toast: Toast) => void }) {
+  const [rows, setRows] = useState<PostdataCollectionRow[]>([])
+  const [loading, setLoading] = useState(true)
+  const [reloadKey, setReloadKey] = useState(0)
+  const reload = () => setReloadKey((k) => k + 1)
+  const [detailId, setDetailId] = useState<number | null>(() => readRouteId())
+  const [kw, setKw] = useState('')
+  const [q, setQ] = useState('')
+  const [selected, setSelected] = useState<Set<number>>(new Set())
+  const [editing, setEditing] = useState<PostdataCollectionRow | null>(null)
+  const [busy, setBusy] = useState(false)
+  const isAdmin = getRoles().some((r) => r === 'system_admin' || r === 'managing_partner')
+
+  useEffect(() => { setDetailId(readRouteId()); setQ(''); setKw('') }, [screen.id])
+
+  useEffect(() => {
+    if (detailId != null) return
+    let ignore = false
+    setLoading(true)
+    apiGet<{ items: PostdataCollectionRow[] }>('/api/postdata/collections')
+      .then((r) => { if (!ignore) { setRows(r.items ?? []); setSelected(new Set()) } })
+      .catch(() => !ignore && setRows([]))
+      .finally(() => !ignore && setLoading(false))
+    return () => { ignore = true }
+  }, [reloadKey, detailId])
+
+  if (detailId != null) {
+    return <PostdataDetailView projectId={detailId} canWrite={canWrite} onToast={onToast} onBack={() => { setDetailId(null); reload() }} />
+  }
+
+  const dq = q.trim().toLowerCase()
+  const filtered = dq
+    ? rows.filter((r) => [r.project_name, r.recipient_email, r.collect_status, r.collector_name].map((v) => String(v ?? '')).join(' ').toLowerCase().includes(dq))
+    : rows
+  const pageIds = filtered.map((r) => r.project_id)
+  const allSelected = pageIds.length > 0 && pageIds.every((id) => selected.has(id))
+  const selIds = [...selected]
+
+  const sendMails = async () => {
+    if (!selIds.length) { onToast({ title: '先勾选项目', detail: '勾选要发送填报邮件的项目行' }); return }
+    setBusy(true)
+    try {
+      const r = await apiPost<{ sent: number; failed: number; results: Array<{ project_id: number; ok: boolean; status: string }> }>('/api/postdata/send', { project_ids: selIds })
+      onToast({
+        title: `发送完成:成功 ${r.sent},失败 ${r.failed}`,
+        detail: r.results.filter((x) => !x.ok).map((x) => `项目${x.project_id}:${x.status}`).slice(0, 5).join('\n') || '全部发送成功',
+        action: 'postdata.mail.send',
+        entity: 'cap_postdata_collections',
+      })
+      reload()
+    } catch (error) {
+      onToast({ title: '发送失败', detail: error instanceof Error ? error.message : 'API 调用失败' })
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const resetStatus = async () => {
+    if (!selIds.length) { onToast({ title: '先勾选项目', detail: '勾选要重置填报状态的项目行' }); return }
+    if (!window.confirm(`确认重置选中 ${selIds.length} 个项目的填报状态?(填报数值保留,状态回「待填报」)`)) return
+    setBusy(true)
+    try {
+      await apiPost('/api/postdata/reset', { project_ids: selIds })
+      onToast({ title: '填报状态已重置', detail: `${selIds.length} 个项目`, action: 'postdata.status.reset', entity: 'cap_postdata_collections' })
+      reload()
+    } catch (error) {
+      onToast({ title: '重置失败', detail: error instanceof Error ? error.message : 'API 调用失败' })
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const removeConfig = async (r: PostdataCollectionRow) => {
+    if (!window.confirm(`确认删除「${r.project_name}」的收集配置?(填报数据保留)`)) return
+    try {
+      await apiDelete(`/api/postdata/collections/${r.project_id}`)
+      onToast({ title: '收集配置已删除', detail: r.project_name, action: 'postdata.collection.delete', entity: 'cap_postdata_collections' })
+      reload()
+    } catch (error) {
+      onToast({ title: '删除失败', detail: error instanceof Error ? error.message : 'API 调用失败' })
+    }
+  }
+
+  const exportCsv = () => {
+    const header = ['项目名称', '企业资料收集人', '收件邮箱', '收集状态', '收集时间', '备注']
+    const lines = [header.map(csvCell).join(',')]
+    for (const r of filtered) lines.push([r.project_name, r.collector_name ?? '', r.recipient_email ?? '', r.collect_status ?? '', r.collected_on ? String(r.collected_on).slice(0, 10) : '', r.notes ?? ''].map(csvCell).join(','))
+    const blob = new Blob([`﻿${lines.join('\n')}`], { type: 'text/csv;charset=utf-8' })
+    const a = document.createElement('a')
+    a.href = URL.createObjectURL(blob)
+    a.download = '投后数据收集台账.csv'
+    a.click()
+    URL.revokeObjectURL(a.href)
+    onToast({ title: '已导出 CSV', detail: `${filtered.length} 个项目` })
+  }
+
+  return (
+    <div className="page-grid">
+      <section className="panel detail-hero full-span motion-item">
+        <div>
+          <span className="page-kicker">{screen.group}</span>
+          <h2>{screen.title}</h2>
+          <p>一行一个项目:配置收件邮箱,发送填报邮件,企业免登录在线填报,状态自动回流。</p>
+        </div>
+      </section>
+      <section className="panel full-span motion-item">
+        <div className="list-controls">
+          <label className="table-search">
+            <Search size={15} />
+            <input
+              value={kw}
+              onChange={(e) => setKw(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter') setQ(kw.trim()) }}
+              placeholder="输入关键字回车"
+              aria-label="检索收集台账"
+              data-testid="pd-search"
+            />
+          </label>
+          {dq && <span className="muted-note">匹配 {filtered.length} / {rows.length} 个项目</span>}
+          <button type="button" className="secondary-button" disabled={!canWrite || busy} onClick={() => void sendMails()} data-testid="pd-send-batch">
+            <Send size={15} /> 发送邮件{selected.size ? ` (${selected.size})` : ''}
+          </button>
+          <button type="button" className="secondary-button" disabled={!canWrite || busy} onClick={() => void resetStatus()} data-testid="pd-reset">
+            填报状态重置
+          </button>
+          <button type="button" className="secondary-button" onClick={exportCsv}><Download size={15} /> 导出</button>
+        </div>
+        {loading ? (
+          <p className="muted-note">加载中…</p>
+        ) : filtered.length === 0 ? (
+          <p className="muted-note">{dq ? `没有匹配「${q}」的项目。` : '暂无项目。'}</p>
+        ) : (
+          <div className="table-wrap" data-testid="pd-table">
+            <table>
+              <thead>
+                <tr>
+                  <th>
+                    <input
+                      type="checkbox"
+                      checked={allSelected}
+                      onChange={(e) => setSelected(e.target.checked ? new Set(pageIds) : new Set())}
+                      aria-label="全选"
+                    />
+                  </th>
+                  <th>序号</th><th>项目名称</th><th>收件邮箱</th><th>收集状态</th><th>操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                {filtered.map((r, i) => (
+                  <tr key={r.project_id}>
+                    <td>
+                      <input
+                        type="checkbox"
+                        checked={selected.has(r.project_id)}
+                        onChange={(e) => setSelected((prev) => {
+                          const next = new Set(prev)
+                          if (e.target.checked) next.add(r.project_id)
+                          else next.delete(r.project_id)
+                          return next
+                        })}
+                        aria-label={`选择 ${r.project_name}`}
+                      />
+                    </td>
+                    <td>{i + 1}</td>
+                    <td>
+                      <button type="button" className="link-button eq-project-link" onClick={() => setDetailId(r.project_id)} data-testid={`pd-open-${r.project_id}`}>
+                        {r.project_name}
+                      </button>
+                    </td>
+                    <td>{r.recipient_email || '—'}</td>
+                    <td>{r.collect_status || '—'}</td>
+                    <td className="eq-row-actions">
+                      <button type="button" className="link-button" disabled={!canWrite} onClick={() => setEditing(r)} data-testid={`pd-edit-${r.project_id}`}>编辑</button>
+                      <span className="eq-action-sep">|</span>
+                      <button type="button" className="link-button eq-danger-link" disabled={!canWrite || r.collection_id == null} onClick={() => void removeConfig(r)}>删除</button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
+      {isAdmin && <MailConfigPanel onToast={onToast} />}
+      {editing && (
+        <PostdataCollectionModal
+          row={editing}
+          onClose={() => setEditing(null)}
+          onSaved={reload}
+          onToast={onToast}
+        />
+      )}
+    </div>
+  )
+}
+
+// 外部免登录填报页(邮件链接落地;#/external-fill?token=…,在登录闸门之前放行)。
+function ExternalFillPage() {
+  const token = (window.location.hash.split('?')[1] ?? '').split('&').map((kv) => kv.split('=')).find(([k]) => k === 'token')?.[1] ?? ''
+  const [data, setData] = useState<{ project_name: string; collector_name: string | null; reports: PostdataReport[] } | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [values, setValues] = useState<Record<number, { total_assets: string; net_assets: string; revenue: string; net_profit: string }>>({})
+  const [submitting, setSubmitting] = useState(false)
+  const [done, setDone] = useState(false)
+
+  useEffect(() => {
+    if (!token) { setError('链接不完整:缺少 token'); return }
+    fetch(`${API_BASE}/api/external/postdata/${token}`)
+      .then(async (r) => { if (!r.ok) throw new Error((await r.json().catch(() => null))?.detail ?? `HTTP ${r.status}`); return r.json() })
+      .then((d) => setData(d))
+      .catch((e) => setError(e instanceof Error ? e.message : '加载失败'))
+  }, [token])
+
+  const pending = (data?.reports ?? []).filter((r) => r.fill_status === '待填报')
+  const filledRows = (data?.reports ?? []).filter((r) => r.fill_status !== '待填报')
+
+  const submit = async () => {
+    const entries = pending
+      .map((r) => {
+        const v = values[r.report_id]
+        if (!v || ![v.total_assets, v.net_assets, v.revenue, v.net_profit].some((s) => s.trim() !== '')) return null
+        const num = (s: string) => { const n = Number(s); return s.trim() === '' || Number.isNaN(n) ? null : n }
+        return { report_id: r.report_id, total_assets: num(v.total_assets), net_assets: num(v.net_assets), revenue: num(v.revenue), net_profit: num(v.net_profit) }
+      })
+      .filter(Boolean)
+    if (!entries.length) { setError('请至少填写一期数据'); return }
+    setSubmitting(true); setError(null)
+    try {
+      const r = await fetch(`${API_BASE}/api/external/postdata/${token}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ entries }),
+      })
+      if (!r.ok) throw new Error((await r.json().catch(() => null))?.detail ?? `HTTP ${r.status}`)
+      setDone(true)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '提交失败')
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  const setV = (id: number, key: string, val: string) =>
+    setValues((prev) => {
+      const cur = prev[id] ?? { total_assets: '', net_assets: '', revenue: '', net_profit: '' }
+      return { ...prev, [id]: { ...cur, [key]: val } }
+    })
+
+  return (
+    <div className="external-fill-shell" data-testid="external-fill">
+      <div className="external-fill-card">
+        <h2>投后数据填报</h2>
+        {error && <p className="external-fill-error">{error}</p>}
+        {done ? (
+          <p className="external-fill-done">✅ 提交成功,感谢配合。可以关闭本页面了。</p>
+        ) : data == null ? (
+          !error && <p className="muted-note">加载中…</p>
+        ) : (
+          <>
+            <p className="muted-copy">
+              {data.collector_name ? `${data.collector_name},您好:` : '您好:'}请填写「{data.project_name}」以下期间的经营数据,金额单位为「万元」。
+            </p>
+            {pending.length === 0 ? (
+              <p className="muted-note">当前没有待填报的期间。</p>
+            ) : (
+              <div className="table-wrap">
+                <table>
+                  <thead>
+                    <tr><th>所填年份</th><th>所填季度</th><th>总资产(万)</th><th>净资产(万)</th><th>营业收入(万)</th><th>净利润(万)</th></tr>
+                  </thead>
+                  <tbody>
+                    {pending.map((r) => (
+                      <tr key={r.report_id}>
+                        <td>{r.fill_year}</td>
+                        <td>{r.fill_period}</td>
+                        {(['total_assets', 'net_assets', 'revenue', 'net_profit'] as const).map((k) => (
+                          <td key={k}>
+                            <input
+                              type="number"
+                              step="0.01"
+                              className="external-fill-input"
+                              value={values[r.report_id]?.[k] ?? ''}
+                              onChange={(e) => setV(r.report_id, k, e.target.value)}
+                              aria-label={`${r.fill_year} ${r.fill_period} ${k}`}
+                            />
+                          </td>
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+            {filledRows.length > 0 && (
+              <>
+                <h3 className="external-fill-subtitle">已填报期间</h3>
+                <div className="table-wrap">
+                  <table>
+                    <thead>
+                      <tr><th>所填年份</th><th>所填季度</th><th>总资产</th><th>净资产</th><th>营业收入</th><th>净利润</th></tr>
+                    </thead>
+                    <tbody>
+                      {filledRows.map((r) => (
+                        <tr key={r.report_id}>
+                          <td>{r.fill_year}</td><td>{r.fill_period}</td>
+                          <td>{pdWan(r.total_assets)}</td><td>{pdWan(r.net_assets)}</td><td>{pdWan(r.revenue)}</td><td>{pdWan(r.net_profit)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </>
+            )}
+            {pending.length > 0 && (
+              <button type="button" className="primary-button large-button" disabled={submitting} onClick={() => void submit()} data-testid="external-submit">
+                {submitting ? '提交中…' : '提交填报'}
+              </button>
+            )}
+          </>
+        )}
+        <p className="external-fill-footer">CapitalOS 投后管理 · 本页面无需登录,请勿转发链接</p>
+      </div>
     </div>
   )
 }

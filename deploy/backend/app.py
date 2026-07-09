@@ -221,6 +221,58 @@ class FeedbackStatusPayload(BaseModel):
     status: str  # new | pushed | resolved | dismissed
 
 
+class PostdataCollectionPayload(BaseModel):
+    """投后数据收集配置(反馈 #14/#15)。"""
+    collector_name: str | None = Field(default=None, max_length=120)
+    recipient_email: str | None = Field(default=None, max_length=200)
+    collected_on: str | None = None  # YYYY-MM-DD
+    notes: str | None = Field(default=None, max_length=500)
+    external_enabled: bool | None = None
+
+
+class PostdataReportPayload(BaseModel):
+    """填报数据行:金额单位为「万」,按参照系统直接存输入值。"""
+    fill_year: str | None = Field(default=None, max_length=10)
+    fill_period: str | None = Field(default=None, max_length=20)  # 年度/半年度/一季度/…
+    fill_status: str | None = Field(default=None, max_length=20)  # 待填报/已填报
+    total_assets: float | None = None
+    net_assets: float | None = None
+    revenue: float | None = None
+    net_profit: float | None = None
+
+
+class PostdataBatchPayload(BaseModel):
+    project_ids: list[int] = Field(min_length=1)
+
+
+class ExternalFillEntry(BaseModel):
+    report_id: int
+    total_assets: float | None = None
+    net_assets: float | None = None
+    revenue: float | None = None
+    net_profit: float | None = None
+
+
+class ExternalFillPayload(BaseModel):
+    entries: list[ExternalFillEntry] = Field(min_length=1)
+    filled_by: str | None = Field(default=None, max_length=200)
+
+
+class MailConfigPayload(BaseModel):
+    """SMTP 配置(存 cap_app_settings,密码留空=不改)。"""
+    host: str | None = None
+    port: int | None = None
+    username: str | None = None
+    password: str | None = None
+    mail_from: str | None = None
+    security: str | None = None      # none | starttls | ssl
+    public_base: str | None = None   # 外部填报链接的站点前缀,如 http://10.28.239.76:89
+
+
+class MailTestPayload(BaseModel):
+    to: str = Field(min_length=3, max_length=200)
+
+
 class EquityChangePayload(BaseModel):
     """权益变动台账新增/编辑(反馈 #12/#13)。股比按小数存(0.078=7.8%),前端负责 % 换算。"""
     project_id: int | None = None   # 新增必填;编辑不允许改
@@ -544,6 +596,7 @@ _RATE_BUCKETS: dict[str, "_deque[float]"] = _defaultdict(_deque)
 _RATE_RULES = [
     ("/api/auth/login", 60.0, 10),   # 每 IP 每分钟最多 10 次登录尝试
     ("/api/ai/", 60.0, 30),          # 每 IP 每分钟最多 30 次 AI 调用
+    ("/api/external/", 60.0, 30),    # 外部免登录填报:防 token 爆破/刷写
 ]
 
 
@@ -590,7 +643,8 @@ async def enforce_auth(request: Request, call_next):
     """兜底鉴权闸门:任何 /api 业务路径无有效 token 直接 401 —— 保证没有端点被漏掉。
     身份归属仍由各写端点的 Depends(current_user) 从同一 token 派生。"""
     path = request.url.path
-    if request.method == "OPTIONS" or path in _PUBLIC_PATHS or not path.startswith("/api"):
+    # /api/external/*:外部免登录填报(凭 URL token 鉴权,见 postdata 外部端点)。
+    if request.method == "OPTIONS" or path in _PUBLIC_PATHS or path.startswith("/api/external/") or not path.startswith("/api"):
         return await call_next(request)
     authz = request.headers.get("authorization", "")
     origin = request.headers.get("origin", "*")
@@ -775,6 +829,50 @@ def ensure_feature_tables(cursor: Any) -> None:
     _ensure_column(cursor, "cap_equity_changes", "investment_method_label", "investment_method_label VARCHAR(160) NULL")
     _ensure_nullable(cursor, "cap_equity_changes", "investment_position_id", "investment_position_id BIGINT UNSIGNED NULL")
     _ensure_nullable(cursor, "cap_equity_changes", "fund_id", "fund_id BIGINT UNSIGNED NULL")
+    # 反馈 #14/#15:投后数据收集(一项目一行的收集配置)+ 填报数据(年份/季度一行)。金额单位:万。
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS cap_postdata_collections (
+          collection_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+          tenant_id BIGINT UNSIGNED NOT NULL,
+          project_id BIGINT UNSIGNED NOT NULL,
+          collector_name VARCHAR(120) NULL,
+          recipient_email VARCHAR(200) NULL,
+          collect_status VARCHAR(120) NOT NULL DEFAULT '未发送',
+          send_attempts INT NOT NULL DEFAULT 0,
+          last_sent_at DATETIME NULL,
+          collected_on DATE NULL,
+          notes VARCHAR(500) NULL,
+          external_enabled TINYINT(1) NOT NULL DEFAULT 1,
+          external_token VARCHAR(64) NULL,
+          updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+          PRIMARY KEY (collection_id),
+          UNIQUE KEY uq_postdata_project (tenant_id, project_id),
+          UNIQUE KEY uq_postdata_token (external_token)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """
+    )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS cap_postdata_reports (
+          report_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+          tenant_id BIGINT UNSIGNED NOT NULL,
+          project_id BIGINT UNSIGNED NOT NULL,
+          fill_year VARCHAR(10) NOT NULL,
+          fill_period VARCHAR(20) NOT NULL,
+          fill_status VARCHAR(20) NOT NULL DEFAULT '待填报',
+          total_assets DECIMAL(18,2) NULL,
+          net_assets DECIMAL(18,2) NULL,
+          revenue DECIMAL(18,2) NULL,
+          net_profit DECIMAL(18,2) NULL,
+          filled_at DATETIME NULL,
+          filled_by VARCHAR(200) NULL,
+          created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          PRIMARY KEY (report_id),
+          KEY idx_postdata_report_project (tenant_id, project_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """
+    )
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS cap_card_drafts (
@@ -2867,6 +2965,611 @@ def export_project_pdf(project_id: int, user: AuthedUser = Depends(current_user)
     )
 
 
+# ── 投后数据收集(反馈 #14/#15):收集台账 + 填报数据 + 邮件发送 + 外部免登录填报 ──
+
+_MAIL_KEYS = ("mail_host", "mail_port", "mail_username", "mail_password", "mail_from", "mail_security", "mail_public_base")
+
+
+def _mail_settings(cursor: Any) -> dict[str, str]:
+    cursor.execute("SELECT setting_key, setting_value FROM cap_app_settings WHERE setting_key IN %s", (_MAIL_KEYS,))
+    return {r["setting_key"]: str(r["setting_value"] or "") for r in cursor.fetchall()}
+
+
+def _send_mail(settings: dict[str, str], to: str, subject: str, body: str) -> None:
+    """真实 SMTP 发送;抛异常给上层记「第 n 次发送失败」。"""
+    import smtplib
+    from email.message import EmailMessage
+    from email.utils import formataddr
+
+    host = settings.get("mail_host", "")
+    if not host:
+        raise RuntimeError("SMTP 未配置:请在 管理-系统配置 填写邮箱服务器")
+    port = int(settings.get("mail_port") or 0) or (465 if settings.get("mail_security") == "ssl" else 587)
+    security = settings.get("mail_security") or ("ssl" if port == 465 else "starttls")
+    sender = settings.get("mail_from") or settings.get("mail_username") or ""
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = formataddr(("CapitalOS 投后管理", sender)) if sender else "CapitalOS"
+    msg["To"] = to
+    msg.set_content(body)
+
+    if security == "ssl":
+        server: smtplib.SMTP = smtplib.SMTP_SSL(host, port, timeout=20)
+    else:
+        server = smtplib.SMTP(host, port, timeout=20)
+    try:
+        if security == "starttls":
+            server.starttls()
+        if settings.get("mail_username"):
+            server.login(settings["mail_username"], settings.get("mail_password", ""))
+        server.send_message(msg)
+    finally:
+        try:
+            server.quit()
+        except Exception:  # noqa: BLE001 连接收尾失败不影响结果
+            pass
+
+
+def _postdata_link(settings: dict[str, str], token: str, fallback_origin: str = "") -> str:
+    base = (settings.get("mail_public_base") or fallback_origin or "").rstrip("/")
+    return f"{base}/#/external-fill?token={token}"
+
+
+def _ensure_collection_row(cursor: Any, project_id: int, tid: int) -> dict[str, Any]:
+    """取(或建)项目的收集配置行,顺带保证 external_token 存在。"""
+    cursor.execute(
+        "SELECT * FROM cap_postdata_collections WHERE project_id=%s AND tenant_id=%s",
+        (project_id, tid),
+    )
+    row = cursor.fetchone()
+    if row is None:
+        token = uuid.uuid4().hex
+        cursor.execute(
+            "INSERT INTO cap_postdata_collections (tenant_id, project_id, external_token) VALUES (%s, %s, %s)",
+            (tid, project_id, token),
+        )
+        cursor.execute("SELECT * FROM cap_postdata_collections WHERE project_id=%s AND tenant_id=%s", (project_id, tid))
+        row = cursor.fetchone()
+    elif not row.get("external_token"):
+        token = uuid.uuid4().hex
+        cursor.execute("UPDATE cap_postdata_collections SET external_token=%s WHERE collection_id=%s", (token, row["collection_id"]))
+        row["external_token"] = token
+    return row
+
+
+def _send_collection_mail(cursor: Any, project_id: int, tid: int, origin: str = "") -> tuple[bool, str]:
+    """给单个项目发填报邀请;返回 (成功?, 状态文本)。状态与重试计数一并落库。"""
+    cursor.execute("SELECT short_name FROM cap_projects WHERE project_id=%s AND tenant_id=%s AND deleted_at IS NULL", (project_id, tid))
+    proj = cursor.fetchone()
+    if proj is None:
+        return False, "项目不存在"
+    col = _ensure_collection_row(cursor, project_id, tid)
+    email = str(col.get("recipient_email") or "").strip()
+    if not email:
+        cursor.execute(
+            "UPDATE cap_postdata_collections SET collect_status='未配置收件邮箱' WHERE collection_id=%s",
+            (col["collection_id"],),
+        )
+        return False, "未配置收件邮箱"
+    settings = _mail_settings(cursor)
+    name = str(proj["short_name"])
+    link = _postdata_link(settings, str(col["external_token"]), origin)
+    body = (
+        f"{col.get('collector_name') or '相关负责人'},您好:\n\n"
+        f"请协助填报「{name}」的经营/财务数据(总资产、净资产、营业收入、净利润,单位:万元)。\n\n"
+        f"在线填报链接(无需登录,请勿外传):\n{link}\n\n"
+        f"如链接失效请联系投资经理。\n\n—— CapitalOS 投后管理(系统邮件,请勿直接回复)"
+    )
+    try:
+        _send_mail(settings, email, f"【投后数据填报】{name} 经营数据填报邀请", body)
+        cursor.execute(
+            "UPDATE cap_postdata_collections SET collect_status='邮件发送成功', send_attempts=0, last_sent_at=NOW() WHERE collection_id=%s",
+            (col["collection_id"],),
+        )
+        return True, "邮件发送成功"
+    except Exception as exc:  # noqa: BLE001 发送失败进入重试状态,原因写进状态文本
+        attempts = int(col.get("send_attempts") or 0) + 1
+        status = f"第{attempts}次发送失败,将重试" if attempts < 3 else f"第{attempts}次发送失败,已停止重试"
+        cursor.execute(
+            "UPDATE cap_postdata_collections SET collect_status=%s, send_attempts=%s, notes=COALESCE(notes,'') WHERE collection_id=%s",
+            (status, attempts, col["collection_id"]),
+        )
+        return False, f"{status}:{exc}"
+
+
+_postdata_retry_started = False
+
+
+def _start_postdata_retry_thread() -> None:
+    """后台每 10 分钟重试发送失败(<3 次)的收集邮件——对应状态文本「将重试」。"""
+    global _postdata_retry_started
+    if _postdata_retry_started:
+        return
+    _postdata_retry_started = True
+    import threading
+
+    def loop() -> None:
+        while True:
+            _time.sleep(600)
+            try:
+                connection = connect_db()
+                try:
+                    with connection.cursor() as cursor:
+                        cursor.execute(
+                            "SELECT project_id, tenant_id FROM cap_postdata_collections "
+                            "WHERE collect_status LIKE '%%发送失败,将重试%%' AND send_attempts < 3"
+                        )
+                        for row in cursor.fetchall():
+                            _send_collection_mail(cursor, int(row["project_id"]), int(row["tenant_id"]))
+                    connection.commit()
+                finally:
+                    connection.close()
+            except Exception:  # noqa: BLE001 重试线程绝不因单次失败退出
+                pass
+
+    threading.Thread(target=loop, daemon=True, name="postdata-mail-retry").start()
+
+
+@app.get("/api/postdata/collections")
+def list_postdata_collections(user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
+    """收集台账(反馈 #14):一行一项目,LEFT JOIN 收集配置(未配置的也要出现在列表)。"""
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """SELECT p.project_id, p.short_name AS project_name,
+                          c.collection_id, c.collector_name, c.recipient_email, c.collect_status,
+                          c.send_attempts, c.last_sent_at, c.collected_on, c.notes,
+                          c.external_enabled, c.external_token,
+                          (SELECT COUNT(*) FROM cap_postdata_reports r WHERE r.project_id=p.project_id AND r.tenant_id=%s AND r.fill_status='待填报') AS pending_reports
+                   FROM cap_projects p
+                   LEFT JOIN cap_postdata_collections c ON c.project_id=p.project_id AND c.tenant_id=%s
+                   WHERE p.tenant_id=%s AND p.deleted_at IS NULL
+                   ORDER BY p.project_id""",
+                (tid, tid, tid),
+            )
+            rows = cursor.fetchall()
+    finally:
+        connection.close()
+    return {"count": len(rows), "items": rows}
+
+
+@app.patch("/api/postdata/collections/{project_id}")
+def upsert_postdata_collection(project_id: int, payload: PostdataCollectionPayload, user: AuthedUser = Depends(require_permission("project.edit"))) -> dict[str, Any]:
+    """编辑收集配置(收集人/收件邮箱/收集时间/备注/外部填报开关),不存在则建行。"""
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            _assert_project(cursor, project_id, tid)
+            col = _ensure_collection_row(cursor, project_id, tid)
+            fields = payload.model_dump(exclude_unset=True)
+            updates: dict[str, Any] = {}
+            for k in ("collector_name", "recipient_email", "collected_on", "notes"):
+                if k in fields:
+                    updates[k] = (fields[k] or "").strip() or None
+            if "external_enabled" in fields and fields["external_enabled"] is not None:
+                updates["external_enabled"] = 1 if fields["external_enabled"] else 0
+            if updates:
+                assignments = ", ".join(f"{k}=%s" for k in updates)
+                cursor.execute(
+                    f"UPDATE cap_postdata_collections SET {assignments} WHERE collection_id=%s",
+                    (*updates.values(), col["collection_id"]),
+                )
+            audit_id = write_audit(cursor, user.user_id, "postdata.collection.update", "postdata", project_id,
+                                   f"项目 {project_id} 收集配置", after=updates)
+        connection.commit()
+    finally:
+        connection.close()
+    return {"ok": True, "audit_id": audit_id}
+
+
+@app.delete("/api/postdata/collections/{project_id}")
+def delete_postdata_collection(project_id: int, user: AuthedUser = Depends(require_permission("project.edit"))) -> dict[str, Any]:
+    """删除收集配置行(填报数据保留)。"""
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("DELETE FROM cap_postdata_collections WHERE project_id=%s AND tenant_id=%s", (project_id, tid))
+            removed = cursor.rowcount
+            audit_id = write_audit(cursor, user.user_id, "postdata.collection.delete", "postdata", project_id, f"项目 {project_id} 收集配置")
+        connection.commit()
+    finally:
+        connection.close()
+    return {"ok": True, "removed": removed, "audit_id": audit_id}
+
+
+@app.post("/api/postdata/send")
+def send_postdata_mails(payload: PostdataBatchPayload, request: Request, user: AuthedUser = Depends(require_permission("project.edit"))) -> dict[str, Any]:
+    """发送填报邮件(可多选)。逐项目发送并逐条落状态,失败不影响其余。"""
+    tid = tenant_of(user)
+    origin = request.headers.get("origin", "")
+    results = []
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            for pid in payload.project_ids:
+                ok, status = _send_collection_mail(cursor, pid, tid, origin)
+                connection.commit()  # 每项目独立提交,失败状态也要立刻可见
+                results.append({"project_id": pid, "ok": ok, "status": status})
+            write_audit(cursor, user.user_id, "postdata.mail.send", "postdata", 0,
+                        f"发送填报邮件 {len(payload.project_ids)} 个项目",
+                        after={"results": [{k: v for k, v in r.items() if k != 'status'} | {'status': r['status'][:120]} for r in results]})
+        connection.commit()
+    finally:
+        connection.close()
+    sent = sum(1 for r in results if r["ok"])
+    return {"ok": True, "sent": sent, "failed": len(results) - sent, "results": results}
+
+
+@app.post("/api/postdata/reset")
+def reset_postdata_status(payload: PostdataBatchPayload, user: AuthedUser = Depends(require_permission("project.edit"))) -> dict[str, Any]:
+    """填报状态重置:收集状态回「未发送」、重试计数清零、该项目填报行全部回「待填报」(数值保留)。"""
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            for pid in payload.project_ids:
+                cursor.execute(
+                    "UPDATE cap_postdata_collections SET collect_status='未发送', send_attempts=0, collected_on=NULL WHERE project_id=%s AND tenant_id=%s",
+                    (pid, tid),
+                )
+                cursor.execute(
+                    "UPDATE cap_postdata_reports SET fill_status='待填报', filled_at=NULL, filled_by=NULL WHERE project_id=%s AND tenant_id=%s",
+                    (pid, tid),
+                )
+            audit_id = write_audit(cursor, user.user_id, "postdata.status.reset", "postdata", 0,
+                                   f"重置 {len(payload.project_ids)} 个项目填报状态", after={"project_ids": payload.project_ids})
+        connection.commit()
+    finally:
+        connection.close()
+    return {"ok": True, "audit_id": audit_id}
+
+
+@app.get("/api/projects/{project_id}/postdata")
+def get_project_postdata(project_id: int, user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
+    """投后数据明细(反馈 #15):收集配置信息格 + 填报数据行。"""
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            _assert_project(cursor, project_id, tid)
+            cursor.execute("SELECT short_name FROM cap_projects WHERE project_id=%s AND tenant_id=%s", (project_id, tid))
+            name = str(cursor.fetchone()["short_name"])
+            col = _ensure_collection_row(cursor, project_id, tid)
+            settings = _mail_settings(cursor)
+            cursor.execute(
+                """SELECT report_id, fill_year, fill_period, fill_status, total_assets, net_assets,
+                          revenue, net_profit, filled_at, filled_by
+                   FROM cap_postdata_reports WHERE project_id=%s AND tenant_id=%s
+                   ORDER BY fill_year DESC, report_id DESC""",
+                (project_id, tid),
+            )
+            reports = cursor.fetchall()
+        connection.commit()  # _ensure_collection_row 可能建行/补 token
+    finally:
+        connection.close()
+    return {
+        "project_id": project_id,
+        "project_name": name,
+        "collection": {k: col.get(k) for k in ("collector_name", "recipient_email", "collect_status", "send_attempts", "last_sent_at", "collected_on", "notes", "external_enabled")},
+        "external_link": _postdata_link(settings, str(col["external_token"])) if col.get("external_enabled") else None,
+        "reports": reports,
+    }
+
+
+@app.post("/api/projects/{project_id}/postdata/reports")
+def create_postdata_report(project_id: int, payload: PostdataReportPayload, user: AuthedUser = Depends(require_permission("project.edit"))) -> dict[str, Any]:
+    """新增填报期间(如 2026 半年度),缺省状态「待填报」。"""
+    if not (payload.fill_year or "").strip() or not (payload.fill_period or "").strip():
+        raise HTTPException(status_code=400, detail="fill_year 与 fill_period 必填")
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            _assert_project(cursor, project_id, tid)
+            cursor.execute(
+                """INSERT INTO cap_postdata_reports
+                     (tenant_id, project_id, fill_year, fill_period, fill_status, total_assets, net_assets, revenue, net_profit)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                (tid, project_id, payload.fill_year.strip(), payload.fill_period.strip(),
+                 (payload.fill_status or "待填报").strip(), payload.total_assets, payload.net_assets,
+                 payload.revenue, payload.net_profit),
+            )
+            report_id = int(cursor.lastrowid)
+            audit_id = write_audit(cursor, user.user_id, "postdata.report.create", "postdata", project_id,
+                                   f"{payload.fill_year} {payload.fill_period}", after=payload.model_dump(exclude_none=True))
+        connection.commit()
+    finally:
+        connection.close()
+    return {"ok": True, "report_id": report_id, "audit_id": audit_id}
+
+
+@app.patch("/api/postdata/reports/{report_id}")
+def update_postdata_report(report_id: int, payload: PostdataReportPayload, user: AuthedUser = Depends(require_permission("project.edit"))) -> dict[str, Any]:
+    """内部修改填报行(数值/期间/状态)。"""
+    tid = tenant_of(user)
+    fields = payload.model_dump(exclude_unset=True)
+    allowed = {"fill_year", "fill_period", "fill_status", "total_assets", "net_assets", "revenue", "net_profit"}
+    updates = {k: v for k, v in fields.items() if k in allowed}
+    if not updates:
+        raise HTTPException(status_code=400, detail="No editable fields provided")
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT project_id FROM cap_postdata_reports WHERE report_id=%s AND tenant_id=%s", (report_id, tid))
+            row = cursor.fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail="Report not found")
+            assignments = ", ".join(f"{k}=%s" for k in updates)
+            cursor.execute(f"UPDATE cap_postdata_reports SET {assignments} WHERE report_id=%s AND tenant_id=%s",
+                           (*updates.values(), report_id, tid))
+            audit_id = write_audit(cursor, user.user_id, "postdata.report.update", "postdata", int(row["project_id"]),
+                                   f"填报行 {report_id}", after=updates)
+        connection.commit()
+    finally:
+        connection.close()
+    return {"ok": True, "audit_id": audit_id}
+
+
+@app.delete("/api/postdata/reports/{report_id}")
+def delete_postdata_report(report_id: int, user: AuthedUser = Depends(require_permission("project.edit"))) -> dict[str, Any]:
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT project_id FROM cap_postdata_reports WHERE report_id=%s AND tenant_id=%s", (report_id, tid))
+            row = cursor.fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail="Report not found")
+            cursor.execute("DELETE FROM cap_postdata_reports WHERE report_id=%s AND tenant_id=%s", (report_id, tid))
+            audit_id = write_audit(cursor, user.user_id, "postdata.report.delete", "postdata", int(row["project_id"]), f"填报行 {report_id}")
+        connection.commit()
+    finally:
+        connection.close()
+    return {"ok": True, "audit_id": audit_id}
+
+
+def _wan_cell(v: Any) -> str:
+    return "—" if v is None else f"{float(v):,.2f} 万"
+
+
+@app.get("/api/projects/{project_id}/postdata/export.docx")
+def export_postdata_docx(project_id: int, user: AuthedUser = Depends(current_user)) -> Response:
+    """投后数据明细导出 WORD(信息格 + 填报数据表)。"""
+    data = get_project_postdata(project_id, user)
+    from docx import Document
+
+    doc = Document()
+    doc.add_heading(f"投后数据 · {data['project_name']}", level=0)
+    col = data["collection"]
+    t = doc.add_table(rows=0, cols=2)
+    t.style = "Light Grid Accent 1"
+    for k, v in [("项目名称", data["project_name"]), ("企业资料收集人", col["collector_name"]),
+                 ("收件邮箱", col["recipient_email"]), ("收集时间", col["collected_on"]),
+                 ("收集状态", col["collect_status"]), ("备注", col["notes"])]:
+        cells = t.add_row().cells
+        cells[0].text, cells[1].text = k, str(v or "—")
+    doc.add_heading("填报数据", level=1)
+    rt = doc.add_table(rows=1, cols=7)
+    rt.style = "Light Grid Accent 1"
+    for i, h in enumerate(["所填年份", "所填季度", "填报状态", "总资产", "净资产", "营业收入", "净利润"]):
+        rt.rows[0].cells[i].text = h
+    for r in data["reports"]:
+        c = rt.add_row().cells
+        c[0].text = str(r["fill_year"]); c[1].text = str(r["fill_period"]); c[2].text = str(r["fill_status"])
+        c[3].text = _wan_cell(r["total_assets"]); c[4].text = _wan_cell(r["net_assets"])
+        c[5].text = _wan_cell(r["revenue"]); c[6].text = _wan_cell(r["net_profit"])
+    buf = io.BytesIO()
+    doc.save(buf)
+    return Response(
+        content=buf.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f'attachment; filename="project-{project_id}-postdata.docx"'},
+    )
+
+
+@app.get("/api/projects/{project_id}/postdata/export.pdf")
+def export_postdata_pdf(project_id: int, user: AuthedUser = Depends(current_user)) -> Response:
+    """投后数据明细导出 PDF(fpdf2 + Noto CJK)。"""
+    data = get_project_postdata(project_id, user)
+    from fpdf import FPDF
+    from fpdf.enums import XPos, YPos
+
+    pdf = FPDF()
+    pdf.add_font("noto", "", _NOTO_TTC)
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+
+    def h(text: str, size: int = 14) -> None:
+        pdf.set_font("noto", "", size)
+        pdf.set_x(pdf.l_margin)
+        pdf.multi_cell(0, 8, text, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.ln(1)
+
+    def kv(k: str, v: Any) -> None:
+        pdf.set_font("noto", "", 11)
+        pdf.set_x(pdf.l_margin)
+        pdf.multi_cell(0, 6, f"{k}:{'—' if v in (None, '') else v}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+    col = data["collection"]
+    h(f"投后数据 · {data['project_name']}", 18)
+    for k, v in [("企业资料收集人", col["collector_name"]), ("收件邮箱", col["recipient_email"]),
+                 ("收集时间", col["collected_on"]), ("收集状态", col["collect_status"]), ("备注", col["notes"])]:
+        kv(k, v)
+    pdf.ln(2)
+    h("填报数据", 14)
+    for r in data["reports"]:
+        kv(f"{r['fill_year']} {r['fill_period']}({r['fill_status']})",
+           f"总资产 {_wan_cell(r['total_assets'])} / 净资产 {_wan_cell(r['net_assets'])} / 营收 {_wan_cell(r['revenue'])} / 净利 {_wan_cell(r['net_profit'])}")
+    out = pdf.output()
+    return Response(
+        content=bytes(out),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="project-{project_id}-postdata.pdf"'},
+    )
+
+
+# ── 外部免登录填报(邮件链接落地页;凭 token 鉴权,enforce_auth 中间件放行 /api/external/*)──
+
+
+@app.get("/api/external/postdata/{token}")
+def external_get_postdata(token: str) -> dict[str, Any]:
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """SELECT c.*, p.short_name AS project_name FROM cap_postdata_collections c
+                   JOIN cap_projects p ON p.project_id=c.project_id
+                   WHERE c.external_token=%s""",
+                (token,),
+            )
+            col = cursor.fetchone()
+            if col is None or not col["external_enabled"]:
+                raise HTTPException(status_code=404, detail="链接无效或外部填报已关闭")
+            cursor.execute(
+                """SELECT report_id, fill_year, fill_period, fill_status, total_assets, net_assets, revenue, net_profit
+                   FROM cap_postdata_reports WHERE project_id=%s AND tenant_id=%s
+                   ORDER BY fill_year DESC, report_id DESC""",
+                (col["project_id"], col["tenant_id"]),
+            )
+            reports = cursor.fetchall()
+    finally:
+        connection.close()
+    return {
+        "project_name": col["project_name"],
+        "collector_name": col["collector_name"],
+        "reports": reports,
+    }
+
+
+@app.post("/api/external/postdata/{token}")
+def external_fill_postdata(token: str, payload: ExternalFillPayload) -> dict[str, Any]:
+    """外部填报提交:只允许写「待填报」行;全部提交后收集状态置「已填报」。"""
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT * FROM cap_postdata_collections WHERE external_token=%s", (token,))
+            col = cursor.fetchone()
+            if col is None or not col["external_enabled"]:
+                raise HTTPException(status_code=404, detail="链接无效或外部填报已关闭")
+            pid, tid = int(col["project_id"]), int(col["tenant_id"])
+            filled = 0
+            for e in payload.entries:
+                cursor.execute(
+                    "SELECT fill_status FROM cap_postdata_reports WHERE report_id=%s AND project_id=%s AND tenant_id=%s",
+                    (e.report_id, pid, tid),
+                )
+                row = cursor.fetchone()
+                if row is None or row["fill_status"] != "待填报":
+                    continue
+                cursor.execute(
+                    """UPDATE cap_postdata_reports
+                       SET total_assets=%s, net_assets=%s, revenue=%s, net_profit=%s,
+                           fill_status='已填报', filled_at=NOW(), filled_by=%s
+                       WHERE report_id=%s""",
+                    (e.total_assets, e.net_assets, e.revenue, e.net_profit,
+                     (payload.filled_by or col.get("recipient_email") or "external")[:200], e.report_id),
+                )
+                filled += 1
+            if filled:
+                cursor.execute(
+                    "SELECT COUNT(*) AS n FROM cap_postdata_reports WHERE project_id=%s AND tenant_id=%s AND fill_status='待填报'",
+                    (pid, tid),
+                )
+                pending = int(cursor.fetchone()["n"])
+                status = "已填报" if pending == 0 else f"部分填报(剩 {pending} 期)"
+                cursor.execute(
+                    "UPDATE cap_postdata_collections SET collect_status=%s, collected_on=CURDATE() WHERE collection_id=%s",
+                    (status, col["collection_id"]),
+                )
+                write_audit(cursor, None, "postdata.external.fill", "postdata", pid, f"外部填报 {filled} 期")
+        connection.commit()
+    finally:
+        connection.close()
+    return {"ok": True, "filled": filled}
+
+
+# ── 邮箱(SMTP)配置:与 AI 配置同存 cap_app_settings,密码绝不回显 ──
+
+
+@app.get("/api/mail/config")
+def get_mail_config(user: AuthedUser = Depends(require_roles("system_admin", "managing_partner"))) -> dict[str, Any]:
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            s = _mail_settings(cursor)
+    finally:
+        connection.close()
+    return {
+        "host": s.get("mail_host", ""),
+        "port": s.get("mail_port", ""),
+        "username": s.get("mail_username", ""),
+        "has_password": bool(s.get("mail_password")),
+        "mail_from": s.get("mail_from", ""),
+        "security": s.get("mail_security", "starttls"),
+        "public_base": s.get("mail_public_base", ""),
+    }
+
+
+@app.post("/api/mail/config")
+def set_mail_config(payload: MailConfigPayload, user: AuthedUser = Depends(require_roles("system_admin", "managing_partner"))) -> dict[str, Any]:
+    updates: dict[str, str] = {}
+    if payload.host is not None:
+        updates["mail_host"] = payload.host.strip()
+    if payload.port is not None:
+        updates["mail_port"] = str(payload.port)
+    if payload.username is not None:
+        updates["mail_username"] = payload.username.strip()
+    if payload.password:  # 留空 = 不改
+        updates["mail_password"] = payload.password
+    if payload.mail_from is not None:
+        updates["mail_from"] = payload.mail_from.strip()
+    if payload.security is not None:
+        if payload.security not in {"none", "starttls", "ssl"}:
+            raise HTTPException(status_code=400, detail="security 只能是 none / starttls / ssl")
+        updates["mail_security"] = payload.security
+    if payload.public_base is not None:
+        updates["mail_public_base"] = payload.public_base.strip().rstrip("/")
+    if not updates:
+        raise HTTPException(status_code=400, detail="没有要更新的字段")
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            for key, val in updates.items():
+                cursor.execute(
+                    """INSERT INTO cap_app_settings (setting_key, setting_value, updated_by)
+                       VALUES (%s, %s, %s)
+                       ON DUPLICATE KEY UPDATE setting_value=VALUES(setting_value), updated_by=VALUES(updated_by)""",
+                    (key, val, user.user_id),
+                )
+            write_audit(cursor, user.user_id, "mail.config.update", "app_setting", None, "SMTP config",
+                        after={"keys": [k for k in updates if k != "mail_password"]})
+        connection.commit()
+    finally:
+        connection.close()
+    return {"ok": True}
+
+
+@app.post("/api/mail/test")
+def test_mail_config(payload: MailTestPayload, user: AuthedUser = Depends(require_roles("system_admin", "managing_partner"))) -> dict[str, Any]:
+    """发一封测试邮件验证 SMTP 配置。"""
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            s = _mail_settings(cursor)
+    finally:
+        connection.close()
+    try:
+        _send_mail(s, payload.to.strip(), "【CapitalOS】SMTP 配置测试", "这是一封测试邮件:收到即说明邮箱配置可用。\n\n—— CapitalOS")
+    except Exception as exc:  # noqa: BLE001 把 SMTP 原始报错透出给管理员排查
+        raise HTTPException(status_code=502, detail=f"发送失败:{exc}")
+    return {"ok": True, "to": payload.to.strip()}
+
+
 @app.post("/api/projects/{project_id}/ai-memo")
 def create_project_memo(project_id: int, user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
     """亮点功能:基于项目全量真实数据(卡片/投资汇总/财务/决策/委派),用大模型一键生成
@@ -4573,6 +5276,7 @@ def _startup_load_ai_settings() -> None:
             connection.close()
     except Exception:  # noqa: BLE001 建表失败不该阻断启动;端点首次用到会再报清楚
         pass
+    _start_postdata_retry_thread()
 
 
 @app.get("/api/ai/config")
