@@ -72,6 +72,7 @@ import { marked } from 'marked'
 import DOMPurify from 'dompurify'
 import html2canvas from 'html2canvas'
 import { API_BASE, apiDelete, apiDownload, apiGet, apiPatch, apiPost, apiPut, auditDetail, getPerms, getRoles, getToken, getUserName, setPerms, setRoles, setUserName, streamPost, setToken } from './api'
+import { FLOW_TYPES, type FlowTypeDef } from './flowCenter'
 
 marked.setOptions({ breaks: true, gfm: true })
 
@@ -1223,7 +1224,9 @@ function PageHeader({
         {/* 「高级筛选」原为只发审计不过滤的占位钮 → 移除(台账已有服务端搜索 q + 表内搜索)。 */}
         {/* 「显示列」已下沉到台账表格工具条(可勾选列 + localStorage 持久化),此处不再放解耦占位钮。 */}
         {/* 文档/AI 屏的顶部通用主操作只会建占位记录,易与面板里真实入口混淆 → 隐藏。 */}
-        {current.kind !== 'documents' && current.kind !== 'ai' && (
+        {/* issue #19:项目列表/项目池/基金列表的台账工具条已有真实「新增」入口,顶部占位钮撤掉,只留一个有效按钮。 */}
+        {current.kind !== 'documents' && current.kind !== 'ai' &&
+          !['project-list', 'project-board', 'fund-list'].includes(current.id) && (
           <button
             type="button"
             className="primary-button"
@@ -1844,6 +1847,7 @@ function BoardPage({
       .then((result) => {
         setBoardProjects(
           result.items.map((item) => ({
+            id: Number(item.id) || undefined,
             name: String(item.name ?? ''),
             company: String(item.name ?? ''),
             stage: mapBackendStage(String(item.stage ?? 'Sourced')),
@@ -1942,18 +1946,22 @@ function BoardPage({
 }
 
 function ProjectCard({ project, onToast }: { project: Project; onToast: (toast: Toast) => void }) {
+  // issue #20:点击项目池卡片直达「该项目」的项目卡片(带 ?id=),而不是落在通用概况页再选一次。
+  const open = async () => {
+    await runBackendAction(onToast, `已打开项目「${project.name}」`, {
+      action: 'project.card.open',
+      entity_type: 'project',
+      entity_label: project.name,
+      after: { target: 'project-detail-overview', project_id: project.id ?? null, stage: project.stage },
+    })
+    if (project.id != null) goToEntity('project-detail-overview', project.id)
+    else goTo('project-detail-overview')
+  }
   return (
     <button
       type="button"
       className="project-card"
-      onClick={() =>
-        auditThenNavigate(onToast, '项目详情已打开', 'project-detail-overview', {
-          action: 'project.card.open',
-          entity_type: 'project',
-          entity_label: project.name,
-          after: { target: 'project-detail-overview', stage: project.stage },
-        })
-      }
+      onClick={open}
     >
       <div>
         <strong>{project.name}</strong>
@@ -3260,16 +3268,10 @@ function EquityChangeTable({ projectId, canWrite, onToast }: {
 }
 
 // #12:投资关系入口 = 跨项目权益变动记录台账(参照系统同构)。
-function EquityLedgerPage({ screen, canWrite, onToast }: { screen: Screen; canWrite: boolean; onToast: (toast: Toast) => void }) {
+// issue #18:去掉与页头重复的说明卡(白框),台账直接顶到页头下方。
+function EquityLedgerPage({ canWrite, onToast }: { screen: Screen; canWrite: boolean; onToast: (toast: Toast) => void }) {
   return (
     <div className="page-grid">
-      <section className="panel detail-hero full-span motion-item">
-        <div>
-          <span className="page-kicker">{screen.group}</span>
-          <h2>{screen.title}</h2>
-          <p>跨项目的投资/权益变动记录台账,点项目名称进入该项目卡片。</p>
-        </div>
-      </section>
       <section className="panel full-span motion-item">
         <EquityChangeTable canWrite={canWrite} onToast={onToast} />
       </section>
@@ -5014,9 +5016,163 @@ function DelegationPanel({ canWrite, onToast, defaultFamily }: { canWrite: boole
   )
 }
 
-type WfTemplate = { id: number; workflow_family: string; template_name: string; steps: Array<{ step_key: string; step_name: string; step_type: string; sort_order: number }> }
 type WfTask = { id: number; task_name: string; task_status: string; due_at: string | null; instance_title: string; instance_status: string; assignee: string | null }
 const WF_STATUS_CN: Record<string, string> = { running: '进行中', approved: '已通过', rejected: '已驳回', pending: '待办', transferred: '已转办', archived: '已归档', cancelled: '已取消', draft: '草稿' }
+
+/** 流程发起弹窗:表单由 flowCenter.ts 配置驱动(字段规格抄录自参考 demo)。 */
+function FlowApplyModal({ def, onClose, onToast, onStarted }: {
+  def: FlowTypeDef
+  onClose: () => void
+  onToast: (toast: Toast) => void
+  onStarted: () => void
+}) {
+  const today = new Date().toISOString().slice(0, 10)
+  const [form, setForm] = useState<Record<string, string>>(() => {
+    const init: Record<string, string> = {}
+    for (const f of def.fields) {
+      if (f.auto && f.label === '申请人') init[f.label] = getUserName()
+      else if (f.auto && /时间|日期/.test(f.label)) init[f.label] = today
+    }
+    return init
+  })
+  // 每个子表(如报销明细)一组行
+  const [tables, setTables] = useState<Array<Array<Record<string, string>>>>(() => def.subTables.map(() => []))
+  const [saving, setSaving] = useState(false)
+  const set = (k: string, v: string) => setForm((f) => ({ ...f, [k]: v }))
+
+  const submit = async () => {
+    const title = (form['标题'] || '').trim() || `${def.name}·${today}`
+    setSaving(true)
+    try {
+      const result = await apiPost('/api/workflow/instances', {
+        title,
+        workflow_family: def.family,
+        payload: { flow_type: def.key, flow_name: def.name, form, tables },
+      })
+      onToast({ title: `${def.name}已发起`, detail: auditDetail(result), action: 'workflow.start', entity: 'cap_workflow_instances', result })
+      onStarted()
+      onClose()
+    } catch (error) {
+      onToast({ title: '流程发起失败', detail: error instanceof Error ? error.message : 'API 调用失败' })
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <div className="eq-modal-backdrop" onClick={onClose} data-testid="flow-apply-modal">
+      <div className="eq-modal flow-modal" onClick={(e) => e.stopPropagation()}>
+        <div className="eq-modal-head">
+          <h3>发起流程 · {def.name}</h3>
+          <button type="button" className="icon-button" aria-label="关闭" onClick={onClose}><X size={18} /></button>
+        </div>
+        <div className="form-grid">
+          {def.fields.map((f) => (
+            <label key={f.label} className={f.kind === 'textarea' ? 'span-2' : undefined}>
+              <span>{f.label}</span>
+              {f.kind === 'select' ? (
+                <select value={form[f.label] ?? ''} onChange={(e) => set(f.label, e.target.value)}>
+                  <option value="">请选择</option>
+                  {(f.options && f.options.length ? f.options : []).map((o) => <option key={o} value={o}>{o}</option>)}
+                  {(!f.options || !f.options.length) && form[f.label] && <option value={form[f.label]}>{form[f.label]}</option>}
+                </select>
+              ) : f.kind === 'textarea' ? (
+                <textarea rows={3} value={form[f.label] ?? ''} onChange={(e) => set(f.label, e.target.value)} />
+              ) : f.kind === 'upload' ? (
+                <input type="file" onChange={(e) => set(f.label, e.target.files?.[0]?.name ?? '')} />
+              ) : (
+                <input
+                  type={f.kind === 'date' ? 'date' : 'text'}
+                  value={form[f.label] ?? ''}
+                  readOnly={f.auto}
+                  onChange={(e) => set(f.label, e.target.value)}
+                />
+              )}
+            </label>
+          ))}
+        </div>
+        {def.subTables.map((st, ti) => (
+          <div key={ti} className="flow-subtable">
+            <div className="flow-subtable-head">
+              <strong>明细 {def.subTables.length > 1 ? ti + 1 : ''}</strong>
+              <button type="button" className="link-button" onClick={() => setTables((ts) => ts.map((rows, i) => (i === ti ? [...rows, {}] : rows)))}>+ 新增行</button>
+            </div>
+            <div className="table-wrap">
+              <table>
+                <thead><tr>{st.cols.map((c) => <th key={c}>{c}</th>)}<th>操作</th></tr></thead>
+                <tbody>
+                  {tables[ti].length === 0 && <tr><td colSpan={st.cols.length + 1} className="muted-note">未找到结果</td></tr>}
+                  {tables[ti].map((row, ri) => (
+                    <tr key={ri}>
+                      {st.cols.map((c) => (
+                        <td key={c}>
+                          <input value={row[c] ?? ''} onChange={(e) => setTables((ts) => ts.map((rows, i) => (i === ti ? rows.map((r, j) => (j === ri ? { ...r, [c]: e.target.value } : r)) : rows)))} />
+                        </td>
+                      ))}
+                      <td><button type="button" className="link-button danger" onClick={() => setTables((ts) => ts.map((rows, i) => (i === ti ? rows.filter((_, j) => j !== ri) : rows)))}>删除</button></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        ))}
+        <div className="button-row eq-modal-actions">
+          <button type="button" className="secondary-button" onClick={onClose}>取消</button>
+          <button type="button" className="primary-button" disabled={saving} onClick={submit} data-testid="flow-apply-submit">提交</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+type WfInstanceRow = { id: number; title: string; instance_status: string; started_at: string | null; updated_at: string | null; initiator: string | null; current_approver: string | null }
+
+/** 流程发起记录弹窗(「查看」):列格式对齐参考 demo。 */
+function FlowHistoryModal({ def, onClose }: { def: FlowTypeDef; onClose: () => void }) {
+  const [rows, setRows] = useState<WfInstanceRow[]>([])
+  const [keyword, setKeyword] = useState('')
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => {
+    setLoading(true)
+    apiGet<{ items: WfInstanceRow[] }>(`/api/workflow/instances?flow_type=${encodeURIComponent(def.key)}&keyword=${encodeURIComponent(keyword)}`)
+      .then((r) => setRows(r.items ?? []))
+      .catch(() => setRows([]))
+      .finally(() => setLoading(false))
+  }, [def.key, keyword])
+
+  return (
+    <div className="eq-modal-backdrop" onClick={onClose} data-testid="flow-history-modal">
+      <div className="eq-modal flow-modal" onClick={(e) => e.stopPropagation()}>
+        <div className="eq-modal-head">
+          <h3>{def.name} · 发起记录</h3>
+          <button type="button" className="icon-button" aria-label="关闭" onClick={onClose}><X size={18} /></button>
+        </div>
+        <input placeholder="按标题搜索,回车确认" style={{ marginBottom: 10 }} onKeyDown={(e) => { if (e.key === 'Enter') setKeyword((e.target as HTMLInputElement).value) }} />
+        <div className="table-wrap">
+          <table>
+            <thead><tr><th>标题</th><th>申请时间</th><th>更新时间</th><th>申请人</th><th>当前审批人</th><th>状态</th></tr></thead>
+            <tbody>
+              {loading && <tr><td colSpan={6} className="muted-note">加载中…</td></tr>}
+              {!loading && rows.length === 0 && <tr><td colSpan={6} className="muted-note">暂无发起记录,点击卡片上的「申请」发起第一条</td></tr>}
+              {rows.map((r) => (
+                <tr key={r.id}>
+                  <td>{r.title}</td>
+                  <td>{r.started_at ? String(r.started_at).slice(0, 16).replace('T', ' ') : '—'}</td>
+                  <td>{r.updated_at ? String(r.updated_at).slice(0, 16).replace('T', ' ') : '—'}</td>
+                  <td>{r.initiator ?? '—'}</td>
+                  <td>{r.current_approver ?? '—'}</td>
+                  <td><StatusBadge value={WF_STATUS_CN[r.instance_status] ?? r.instance_status} /></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  )
+}
 
 function FlowPage({
   screen,
@@ -5029,30 +5185,18 @@ function FlowPage({
 }) {
   // flow-center 展示全部家族;子屏只展示对应家族。
   const familyFilter = screen.id === 'flow-fund' ? 'fund' : screen.id === 'flow-oa' ? 'office' : screen.id === 'flow-project' ? 'project' : null
-  const [templates, setTemplates] = useState<WfTemplate[]>([])
   const [tasks, setTasks] = useState<WfTask[]>([])
   const [reloadKey, setReloadKey] = useState(0)
   const [busyTask, setBusyTask] = useState<number | null>(null)
+  const [applyDef, setApplyDef] = useState<FlowTypeDef | null>(null)
+  const [viewDef, setViewDef] = useState<FlowTypeDef | null>(null)
 
-  useEffect(() => { apiGet<{ items: WfTemplate[] }>('/api/workflow/templates').then((r) => setTemplates(r.items ?? [])).catch(() => setTemplates([])) }, [])
   useEffect(() => { apiGet<{ items: WfTask[] }>('/api/workflow/tasks').then((r) => setTasks(r.items ?? [])).catch(() => setTasks([])) }, [reloadKey])
 
-  const shownTemplates = familyFilter ? templates.filter((t) => t.workflow_family === familyFilter) : templates
+  // 41 种流程类别由 flowCenter.ts 配置驱动(规格抄录自参考 demo,issue #21/#22/#23)
+  const defs = FLOW_TYPES.filter((t) => !familyFilter || t.family === familyFilter)
+  const groupNames = [...new Set(defs.map((d) => d.group))]
   const shownTasks = tasks // 后端已按租户过滤;此处展示全部,含流转历史
-
-  const startFlow = async (t: WfTemplate) => {
-    try {
-      const result = await apiPost('/api/workflow/instances', {
-        title: `${t.template_name}·${new Date().toLocaleDateString('zh-CN')}`,
-        workflow_family: t.workflow_family,
-        payload: { template_id: t.id, screen: screen.id },
-      })
-      onToast({ title: `${t.template_name}已发起`, detail: auditDetail(result), action: 'workflow.start', entity: 'cap_workflow_instances', result })
-      setReloadKey((k) => k + 1)
-    } catch (error) {
-      onToast({ title: '流程发起失败', detail: error instanceof Error ? error.message : 'API 调用失败' })
-    }
-  }
 
   const actOn = async (task: WfTask, action: 'approve' | 'reject' | 'transfer') => {
     const verb = action === 'approve' ? '通过' : action === 'reject' ? '驳回' : '转办'
@@ -5076,23 +5220,26 @@ function FlowPage({
   return (
     <div className="page-grid">
       <section className="panel full-span motion-item">
-        <PanelTitle icon={GitBranch} title="流程模板与发起入口" />
-        <div className="flow-lanes">
-          {shownTemplates.length === 0 && <p className="muted-note">暂无流程模板</p>}
-          {shownTemplates.map((t) => (
-            <article className="flow-card" key={t.id} data-testid={`flow-template-${t.workflow_family}`}>
-              <span>{{ project: '项目类', fund: '基金类', office: '日常办公' }[t.workflow_family] ?? t.workflow_family}</span>
-              <strong>{t.template_name}</strong>
-              {/* 真实步骤链,替代写死的「N 个模板」 */}
-              <ol className="flow-steps">
-                {t.steps.map((s) => (<li key={s.step_key}>{s.step_name}</li>))}
-              </ol>
-              <button className="secondary-button" type="button" disabled={!canWrite} data-testid={`flow-start-${t.workflow_family}`} onClick={() => startFlow(t)}>
-                发起
-              </button>
-            </article>
-          ))}
-        </div>
+        <PanelTitle icon={GitBranch} title="流程发起 · 每类支持新建与查看历史记录" />
+        {groupNames.map((g) => (
+          <div key={g} className="flow-group">
+            {groupNames.length > 1 && <h4 className="flow-group-title">{g}</h4>}
+            <div className="flow-type-grid">
+              {defs.filter((d) => d.group === g).map((d) => (
+                <article className="flow-type-card" key={d.key} data-testid={`flow-type-${d.key}`}>
+                  <div className="flow-type-head">
+                    <span className="flow-type-index">{defs.indexOf(d) + 1}</span>
+                    <strong>{d.name}</strong>
+                  </div>
+                  <div className="flow-type-actions">
+                    <button type="button" className="link-button" disabled={!canWrite} onClick={() => setApplyDef(d)}> 申请</button>
+                    <button type="button" className="link-button" onClick={() => setViewDef(d)}> 查看</button>
+                  </div>
+                </article>
+              ))}
+            </div>
+          </div>
+        ))}
       </section>
       <section className="panel two-thirds motion-item">
         <PanelTitle icon={Clock} title="审批任务" />
@@ -5130,6 +5277,15 @@ function FlowPage({
         onToast={onToast}
         defaultFamily={screen.id === 'flow-project' ? 'project' : screen.id === 'flow-fund' ? 'fund' : screen.id === 'flow-oa' ? 'office' : 'all'}
       />
+      {applyDef && (
+        <FlowApplyModal
+          def={applyDef}
+          onClose={() => setApplyDef(null)}
+          onToast={onToast}
+          onStarted={() => setReloadKey((k) => k + 1)}
+        />
+      )}
+      {viewDef && <FlowHistoryModal def={viewDef} onClose={() => setViewDef(null)} />}
     </div>
   )
 }

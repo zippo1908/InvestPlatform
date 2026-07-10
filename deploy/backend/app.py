@@ -4059,6 +4059,48 @@ def workflow_templates(user: AuthedUser = Depends(current_user)) -> dict[str, An
     return {"count": len(templates), "items": templates}
 
 
+@app.get("/api/workflow/instances")
+def list_workflow_instances(
+    flow_type: str = "",
+    keyword: str = "",
+    limit: int = 100,
+    user: AuthedUser = Depends(current_user),
+) -> dict[str, Any]:
+    """流程发起记录(流程中心「查看」):按 payload_json.flow_type 过滤,列格式对齐参考 demo:
+    申请时间/更新时间/申请人/当前审批人/状态。"""
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            sql = """
+                SELECT i.workflow_instance_id AS id, i.title, i.instance_status,
+                       i.started_at, i.updated_at, i.payload_json,
+                       u.display_name AS initiator,
+                       (SELECT au.display_name FROM cap_workflow_tasks t
+                        LEFT JOIN cap_users au ON au.user_id=t.assigned_user_id
+                        WHERE t.workflow_instance_id=i.workflow_instance_id AND t.task_status='pending'
+                        ORDER BY t.workflow_task_id DESC LIMIT 1) AS current_approver
+                FROM cap_workflow_instances i
+                LEFT JOIN cap_users u ON u.user_id=i.initiator_user_id
+                WHERE i.tenant_id=%s
+            """
+            params: list[Any] = [tenant_of(user)]
+            if flow_type:
+                sql += " AND JSON_UNQUOTE(JSON_EXTRACT(i.payload_json, '$.flow_type'))=%s"
+                params.append(flow_type)
+            if keyword:
+                sql += " AND i.title LIKE %s"
+                params.append(f"%{keyword}%")
+            sql += " ORDER BY i.workflow_instance_id DESC LIMIT %s"
+            params.append(max(1, min(int(limit), 500)))
+            cursor.execute(sql, params)
+            rows = cursor.fetchall()
+    finally:
+        connection.close()
+    for r in rows:
+        r.pop("payload_json", None)
+    return {"count": len(rows), "items": rows}
+
+
 @app.post("/api/workflow/instances")
 def start_workflow(payload: StartWorkflowPayload, user: AuthedUser = Depends(require_roles("system_admin", "managing_partner", "fund_operator", "risk_legal", "investment_manager"))) -> dict[str, Any]:
     connection = connect_db()

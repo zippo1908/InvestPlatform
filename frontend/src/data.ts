@@ -29,6 +29,7 @@ export type Screen = {
 export type DataRow = Record<string, string | number>
 
 export type Project = {
+  id?: number // 后端项目 id;看板卡片点击直达该项目卡片(issue #20)
   name: string
   company: string
   stage: string
