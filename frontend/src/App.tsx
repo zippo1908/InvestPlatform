@@ -73,6 +73,7 @@ import DOMPurify from 'dompurify'
 import html2canvas from 'html2canvas'
 import { API_BASE, apiDelete, apiDownload, apiGet, apiPatch, apiPost, apiPut, auditDetail, getPerms, getRoles, getToken, getUserName, setPerms, setRoles, setUserName, streamPost, setToken } from './api'
 import { FLOW_TYPES, type FlowTypeDef } from './flowCenter'
+import LoginScene from './LoginScene'
 
 marked.setOptions({ breaks: true, gfm: true })
 
@@ -1127,6 +1128,7 @@ function LoginScreen({ onLogin }: { onLogin: (account: string, password: string)
 
   return (
     <main className="login-page" data-screen-id="login">
+      <LoginScene />
       <section className="login-copy motion-item">
         <span className="product-kicker">CapitalOS Full Scope</span>
         <h1 data-testid="screen-title">投资运营中台</h1>

@@ -2367,3 +2367,29 @@ tbody tr:hover {
 .flow-subtable { margin-top: 14px; }
 .flow-subtable-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
 .flow-subtable table input { width: 100%; min-width: 84px; }
+
+/* ==== 登录页 three.js 场景:资本网络球体 + 飞线 + 数据波浪 ==== */
+.login-scene {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+}
+
+.login-page {
+  position: relative;
+}
+
+.login-page > .login-copy,
+.login-page > .login-card {
+  position: relative;
+  z-index: 1;
+}
+
+/* 登录卡玻璃化,让 3D 场景透出来 */
+.login-page .login-card {
+  background: rgba(255, 255, 255, 0.82);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  box-shadow: 0 20px 50px rgba(13, 78, 68, 0.12);
+}
