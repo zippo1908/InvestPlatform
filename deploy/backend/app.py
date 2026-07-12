@@ -10,7 +10,7 @@ import urllib.request
 import urllib.error
 import urllib.parse
 import uuid
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from json import dumps, loads
 from typing import Any
 
@@ -374,46 +374,46 @@ SCREENS: list[dict[str, str]] = [
 PROJECTS: list[dict[str, Any]] = [
     {
         "id": 1,
-        "name": "Matrix Medical",
-        "stage": "Project Approval",
-        "sector": "Medical Devices",
-        "city": "Shanghai",
-        "owner": "Nina Lin",
+        "name": "矩阵医疗",
+        "stage": "立项",
+        "sector": "医疗器械",
+        "city": "上海",
+        "owner": "林蔚",
         "risk": "medium",
-        "next_step": "Prepare IC material",
+        "next_step": "准备投决会材料",
     },
     {
         "id": 2,
-        "name": "Northstar Storage",
+        "name": "北辰储能",
         "stage": "TS",
-        "sector": "Energy Storage",
-        "city": "Changzhou",
-        "owner": "Nina Lin",
+        "sector": "新能源储能",
+        "city": "常州",
+        "owner": "林蔚",
         "risk": "medium",
-        "next_step": "Update TS clauses",
+        "next_step": "更新 TS 条款",
     },
     {
         "id": 3,
-        "name": "Lanzhou Robotics",
-        "stage": "Diligence",
-        "sector": "Robotics",
-        "city": "Shenzhen",
-        "owner": "Nina Lin",
+        "name": "澜舟机器人",
+        "stage": "尽调",
+        "sector": "机器人",
+        "city": "深圳",
+        "owner": "林蔚",
         "risk": "low",
-        "next_step": "Finish legal checklist",
+        "next_step": "完成法务核查清单",
     },
 ]
 
 FUNDS: list[dict[str, Any]] = [
-    {"id": 1, "name": "Growth Fund I", "status": "investing", "committed_size": 1860000000, "tvpi": 1.31},
-    {"id": 2, "name": "Carbon Fund I", "status": "investing", "committed_size": 2000000000, "tvpi": 1.12},
-    {"id": 3, "name": "Healthcare Special Fund", "status": "investing", "committed_size": 1200000000, "tvpi": 1.10},
+    {"id": 1, "name": "成长一期基金", "status": "investing", "committed_size": 1860000000, "tvpi": 1.31},
+    {"id": 2, "name": "双碳一期基金", "status": "investing", "committed_size": 2000000000, "tvpi": 1.12},
+    {"id": 3, "name": "医疗专项基金", "status": "investing", "committed_size": 1200000000, "tvpi": 1.10},
 ]
 
 RISKS: list[dict[str, Any]] = [
-    {"id": 1, "title": "Cash balance below safety line", "project": "Starfield Agri", "severity": "high"},
-    {"id": 2, "title": "Related-party disclosure incomplete", "project": "Qingqiong Chip", "severity": "high"},
-    {"id": 3, "title": "Clinical milestone delay", "project": "Matrix Medical", "severity": "medium"},
+    {"id": 1, "title": "现金余额低于安全线", "project": "星禾农业", "severity": "high"},
+    {"id": 2, "title": "关联交易披露不完整", "project": "青穹芯片", "severity": "high"},
+    {"id": 3, "title": "临床里程碑延期", "project": "矩阵医疗", "severity": "medium"},
 ]
 
 # 租户作用域的 ledger:每条查询内含一个 tenant_id=%s 占位,由 screen_ledger 注入。
@@ -562,6 +562,51 @@ LEDGER_QUERIES: dict[str, str] = {
         ORDER BY recycle_item_id DESC
         """,
 }
+
+# ledger 展示层枚举 → 中文(存储保持枚举代码,只在出参时翻译;issue #12-#15 复盘发现
+# 「状态」列直接透出 term_sheet/portfolio 之类代码,业务用户不可读)。
+OPP_STATUS_CN: dict[str, str] = {
+    "sourced": "已入库", "screening": "初筛中", "nda": "NDA", "term_sheet": "TS签署",
+    "diligence": "尽调中", "committee": "投决中", "approved": "立项通过",
+    "agreement": "协议签署", "funded": "已打款", "invested": "已投资",
+    "portfolio": "投后管理", "partial_exit": "部分退出", "exited": "已退出",
+}
+STAGE_LABEL_CN: dict[str, str] = {
+    "Sourced": "入库", "Screening": "初筛", "Project Approval": "立项", "TS": "TS",
+    "Diligence": "尽调", "IC": "投决", "Agreement": "投资协议", "Funded": "打款",
+    "Post Investment": "投后",
+}
+FUND_STATUS_CN: dict[str, str] = {
+    "planning": "筹备", "raising": "募集", "investing": "投资",
+    "harvesting": "收获", "extended": "延长", "closed": "清算",
+}
+POSITION_STATUS_CN: dict[str, str] = {
+    "funded": "已出资", "committed": "已认缴", "exited": "已退出", "writeoff": "已减记",
+}
+# 屏 → 需要翻译的列及其枚举表
+LEDGER_ENUM_COLS: dict[str, dict[str, dict[str, str]]] = {
+    "project-list": {"状态": OPP_STATUS_CN, "阶段": STAGE_LABEL_CN},
+    "fund-list": {"状态": FUND_STATUS_CN},
+    "investment-info": {"状态": POSITION_STATUS_CN},
+}
+
+
+def ledger_display_rows(screen_id: str, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """ledger 出参统一整形:datetime → 'YYYY-MM-DD HH:MM'(裸 ISO 串不给用户看),
+    枚举代码列 → 中文。就地修改并返回。"""
+    enum_cols = LEDGER_ENUM_COLS.get(screen_id, {})
+    for row in rows:
+        for key, value in list(row.items()):
+            if isinstance(value, datetime):
+                row[key] = value.strftime("%Y-%m-%d %H:%M")
+            elif isinstance(value, date):
+                row[key] = value.isoformat()
+        for col, mapping in enum_cols.items():
+            v = row.get(col)
+            if isinstance(v, str) and v in mapping:
+                row[col] = mapping[v]
+    return rows
+
 
 # 需注入 tenant_id=%s 的 ledger 屏(其余为全局配置屏:角色/字段/用户列表)。
 LEDGER_TENANT_SCOPED: set[str] = {
@@ -1342,9 +1387,9 @@ def create_project(payload: CreateProjectPayload, user: AuthedUser = Depends(req
                   (project_code, short_name, legal_name, opportunity_status, stage_label, industry_group,
                    city, registered_location, owner_user_id, source_channel, summary, thesis, product_note,
                    highlight_note, created_by, tenant_id)
-                VALUES (%s, %s, %s, 'sourced', 'Sourced', %s, %s, %s, %s, 'API Create',
-                        %s, 'API-created investment thesis pending review.', 'Product note pending.',
-                        'Created from deploy backend.', %s, %s)
+                VALUES (%s, %s, %s, 'sourced', '入库', %s, %s, %s, %s, '手工新建',
+                        %s, '投资逻辑待补充。', '主要产品待补充。',
+                        '通过新建项目页创建。', %s, %s)
                 """,
                 (
                     f"PRJ-API-{uuid.uuid4().hex[:8].upper()}",
@@ -1354,7 +1399,7 @@ def create_project(payload: CreateProjectPayload, user: AuthedUser = Depends(req
                     payload.city,
                     payload.city,
                     user.user_id,
-                    payload.summary or "Created through real backend API.",
+                    payload.summary or "通过后端 API 创建。",
                     user.user_id,
                     tenant_of(user),
                 ),
@@ -1364,7 +1409,7 @@ def create_project(payload: CreateProjectPayload, user: AuthedUser = Depends(req
                 """
                 INSERT INTO cap_project_stage_events
                   (project_id, from_stage, to_stage, event_reason, event_at, actor_user_id, notes, tenant_id)
-                VALUES (%s, NULL, 'Sourced', 'Created through API', %s, %s, 'Initial API create', %s)
+                VALUES (%s, NULL, '入库', '新建入库', %s, %s, '新建项目自动写入', %s)
                 """,
                 (project_id, datetime.now(), user.user_id, tenant_of(user)),
             )
@@ -1385,15 +1430,16 @@ def create_project(payload: CreateProjectPayload, user: AuthedUser = Depends(req
 
 @app.post("/api/projects/{project_id}/advance")
 def advance_project(project_id: int, user: AuthedUser = Depends(require_permission("project.edit"))) -> dict[str, Any]:
+    # stage_label 用中文业务词(与前端阶段条 STAGE_INDEX 对齐);opportunity_status 保持枚举代码。
     status_flow = [
-        ("sourced", "screening", "Screening"),
-        ("screening", "approved", "Project Approval"),
+        ("sourced", "screening", "初筛"),
+        ("screening", "approved", "立项"),
         ("approved", "term_sheet", "TS"),
-        ("term_sheet", "diligence", "Diligence"),
-        ("diligence", "committee", "IC"),
-        ("committee", "agreement", "Agreement"),
-        ("agreement", "funded", "Funded"),
-        ("funded", "portfolio", "Post Investment"),
+        ("term_sheet", "diligence", "尽调"),
+        ("diligence", "committee", "投决"),
+        ("committee", "agreement", "投资协议"),
+        ("agreement", "funded", "打款"),
+        ("funded", "portfolio", "投后"),
     ]
     connection = connect_db()
     try:
@@ -1425,7 +1471,7 @@ def advance_project(project_id: int, user: AuthedUser = Depends(require_permissi
                 """
                 INSERT INTO cap_project_stage_events
                   (project_id, from_stage, to_stage, event_reason, event_at, actor_user_id, notes, tenant_id)
-                VALUES (%s, %s, %s, 'Advanced through API', %s, %s, 'Stage advanced from frontend action', %s)
+                VALUES (%s, %s, %s, '阶段推进', %s, %s, '由前端「推进阶段」操作写入', %s)
                 """,
                 (project_id, row["stage_label"], next_stage, datetime.now(), user.user_id, tenant_of(user)),
             )
@@ -2685,6 +2731,56 @@ def project_schedule(project_id: int, user: AuthedUser = Depends(current_user)) 
                    FROM cap_calendar_events
                    WHERE linked_entity_type='project' AND linked_entity_id=%s AND tenant_id=%s AND deleted_at IS NULL
                    ORDER BY starts_at""",
+                (project_id, tid),
+            )
+            rows = cursor.fetchall()
+    finally:
+        connection.close()
+    return {"count": len(rows), "items": rows}
+
+
+@app.get("/api/projects/{project_id}/workflows")
+def project_workflows(project_id: int, user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
+    """流程文件 section:与本项目关联的流程实例(对齐老导航项目卡片「流程文件」页签)。"""
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            _assert_project(cursor, project_id, tid)
+            cursor.execute(
+                """SELECT i.title, i.instance_status,
+                          COALESCE(s.step_name, i.current_step_key) AS current_step,
+                          u.display_name AS initiator, i.started_at, i.updated_at
+                   FROM cap_workflow_instances i
+                   LEFT JOIN cap_users u ON u.user_id=i.initiator_user_id
+                   LEFT JOIN cap_workflow_steps s
+                     ON s.workflow_template_id=i.workflow_template_id AND s.step_key=i.current_step_key
+                   WHERE i.related_project_id=%s AND i.tenant_id=%s
+                   ORDER BY i.workflow_instance_id DESC LIMIT 100""",
+                (project_id, tid),
+            )
+            rows = cursor.fetchall()
+    finally:
+        connection.close()
+    return {"count": len(rows), "items": rows}
+
+
+@app.get("/api/projects/{project_id}/documents")
+def project_documents(project_id: int, user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
+    """文档 section:经 cap_document_links 关联到本项目的文档(对齐老导航「文档」页签)。"""
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            _assert_project(cursor, project_id, tid)
+            cursor.execute(
+                """SELECT d.title, d.document_kind, d.file_name, d.current_version_no,
+                          d.access_level, l.link_purpose, d.created_at
+                   FROM cap_document_links l
+                   JOIN cap_documents d ON d.document_id=l.document_id
+                   WHERE l.linked_entity_type='project' AND l.linked_entity_id=%s
+                     AND d.tenant_id=%s AND d.deleted_at IS NULL
+                   ORDER BY d.document_id DESC LIMIT 100""",
                 (project_id, tid),
             )
             rows = cursor.fetchall()
@@ -4459,9 +4555,10 @@ def screen_ledger(
         with connection.cursor() as cursor:
             if keyword:
                 # 高级筛选:服务端跨全部数据(非仅当前页)按关键词过滤。取上限 5000 行,
-                # 在服务端逐值匹配(隐藏 __ 列不参与),再分页。
+                # 先做展示整形(枚举翻中文)再逐值匹配(隐藏 __ 列不参与),这样用户
+                # 按看到的中文值(如「尽调中」)也能搜到,再分页。
                 cursor.execute(f"{query}\n            LIMIT 5000", tenant_params)
-                all_rows = cursor.fetchall()
+                all_rows = ledger_display_rows(screen_id, cursor.fetchall())
                 matched = [
                     r for r in all_rows
                     if any(keyword in str(v).lower() for k, v in r.items() if not str(k).startswith("__") and v is not None)
@@ -4473,7 +4570,7 @@ def screen_ledger(
                 cursor.execute(f"SELECT COUNT(*) AS n FROM ({base_no_order}) AS _c", tenant_params)
                 total = int(cursor.fetchone()["n"])
                 cursor.execute(f"{query}\n            LIMIT %s OFFSET %s", (*tenant_params, page_size, offset))
-                rows = cursor.fetchall()
+                rows = ledger_display_rows(screen_id, cursor.fetchall())
     finally:
         connection.close()
     return {
@@ -4504,11 +4601,11 @@ def run_screen_primary_action(
 
             if screen_id in {"project-list", "project-board"}:
                 payload = CreateProjectPayload(
-                    short_name=f"Frontend Project {uuid.uuid4().hex[:4].upper()}",
-                    legal_name="Frontend Project Co",
-                    industry_group="Enterprise Software",
-                    city="Shanghai",
-                    summary="Created by screen primary action.",
+                    short_name=f"演示项目 {uuid.uuid4().hex[:4].upper()}",
+                    legal_name="演示项目有限公司",
+                    industry_group="企业软件",
+                    city="上海",
+                    summary="由页面主操作创建。",
                 )
                 cursor.execute(
                     """
@@ -4516,9 +4613,9 @@ def run_screen_primary_action(
                       (project_code, short_name, legal_name, opportunity_status, stage_label,
                        industry_group, city, registered_location, owner_user_id, source_channel,
                        summary, thesis, product_note, highlight_note, created_by, tenant_id)
-                    VALUES (%s, %s, %s, 'sourced', 'Sourced', %s, %s, %s, %s,
-                            'Screen Primary Action', %s, 'Pending thesis.', 'Pending product note.',
-                            'Created from page header.', %s, %s)
+                    VALUES (%s, %s, %s, 'sourced', '入库', %s, %s, %s, %s,
+                            '页面主操作', %s, '投资逻辑待补充。', '主要产品待补充。',
+                            '由页头按钮创建。', %s, %s)
                     """,
                     (
                         f"PRJ-HDR-{uuid.uuid4().hex[:8].upper()}",
@@ -4539,14 +4636,14 @@ def run_screen_primary_action(
                 result = {"ok": True, "project_id": entity_id, "affected_table": "cap_projects"}
 
             elif screen_id in {"fund-list", "fund-add"}:
-                payload = CreateFundPayload(fund_name=f"Frontend Fund {uuid.uuid4().hex[:4].upper()}", target_size=100000000)
+                payload = CreateFundPayload(fund_name=f"演示基金 {uuid.uuid4().hex[:4].upper()}", target_size=100000000)
                 result = create_fund_record(cursor, payload, user.user_id)
                 entity_type = "fund"
                 entity_id = int(result["fund_id"])
                 entity_label = payload.fund_name
 
             elif screen_id == "announcements":
-                entity_label = f"Frontend Announcement {uuid.uuid4().hex[:4].upper()}"
+                entity_label = f"演示公告 {uuid.uuid4().hex[:4].upper()}"
                 cursor.execute(
                     """
                     INSERT INTO cap_announcements
@@ -4567,7 +4664,7 @@ def run_screen_primary_action(
                 result = {"ok": True, "announcement_id": entity_id, "affected_table": "cap_announcements"}
 
             elif screen_id == "calendar":
-                entity_label = f"Frontend Calendar {uuid.uuid4().hex[:4].upper()}"
+                entity_label = f"演示日程 {uuid.uuid4().hex[:4].upper()}"
                 starts_at = datetime.now()
                 cursor.execute(
                     """
@@ -4604,7 +4701,7 @@ def run_screen_primary_action(
                 result = {"ok": True, "affected_rows": affected, "affected_table": "cap_messages"}
 
             elif screen_id == "investor-list":
-                entity_label = f"Frontend LP {uuid.uuid4().hex[:4].upper()}"
+                entity_label = f"演示投资人 {uuid.uuid4().hex[:4].upper()}"
                 cursor.execute(
                     """
                     INSERT INTO cap_investors
@@ -4620,7 +4717,7 @@ def run_screen_primary_action(
 
             elif screen_id in {"flow-center", "flow-project", "flow-fund", "flow-oa"}:
                 family = "fund" if screen_id == "flow-fund" else "office" if screen_id == "flow-oa" else "project"
-                payload = StartWorkflowPayload(title=f"Frontend Workflow {uuid.uuid4().hex[:4].upper()}", workflow_family=family)
+                payload = StartWorkflowPayload(title=f"演示流程 {uuid.uuid4().hex[:4].upper()}", workflow_family=family)
                 result = start_workflow_record(cursor, payload, user.user_id)
                 entity_type = "workflow_instance"
                 entity_id = int(result["workflow_instance_id"])
@@ -4628,7 +4725,7 @@ def run_screen_primary_action(
 
             elif screen_id in {"document-center", "process-files"}:
                 kind = "workflow" if screen_id == "process-files" else "shared"
-                payload = CreateDocumentPayload(title=f"Frontend Document {uuid.uuid4().hex[:4].upper()}", document_kind=kind)
+                payload = CreateDocumentPayload(title=f"演示文档 {uuid.uuid4().hex[:4].upper()}", document_kind=kind)
                 result = create_document_record(cursor, payload, user.user_id)
                 entity_type = "document"
                 entity_id = int(result["document_id"])
@@ -4636,7 +4733,7 @@ def run_screen_primary_action(
 
             elif screen_id in {"ai-workspace", "meeting-ai"}:
                 parse_kind = "meeting_minutes" if screen_id == "meeting-ai" else "business_plan"
-                entity_label = f"Frontend AI Job {uuid.uuid4().hex[:4].upper()}"
+                entity_label = f"演示AI任务 {uuid.uuid4().hex[:4].upper()}"
                 cursor.execute(
                     """
                     INSERT INTO cap_ai_parse_jobs
@@ -4651,7 +4748,7 @@ def run_screen_primary_action(
 
             elif screen_id == "system-users":
                 suffix = uuid.uuid4().hex[:6]
-                entity_label = f"Frontend User {suffix}"
+                entity_label = f"演示用户 {suffix}"
                 cursor.execute(
                     """
                     INSERT INTO cap_users
@@ -4666,7 +4763,7 @@ def run_screen_primary_action(
 
             elif screen_id == "roles-permissions":
                 suffix = uuid.uuid4().hex[:6]
-                entity_label = f"Frontend Role {suffix}"
+                entity_label = f"演示角色 {suffix}"
                 cursor.execute(
                     """
                     INSERT INTO cap_roles (role_code, role_name, description, data_scope, is_system_role, is_active)
@@ -4680,7 +4777,7 @@ def run_screen_primary_action(
 
             elif screen_id == "field-config":
                 suffix = uuid.uuid4().hex[:6]
-                entity_label = f"Frontend Field {suffix}"
+                entity_label = f"演示字段 {suffix}"
                 cursor.execute(
                     """
                     INSERT INTO cap_custom_field_definitions
@@ -4711,7 +4808,7 @@ def run_screen_primary_action(
             elif screen_id in {"research-library", "internal-research"}:
                 suffix = uuid.uuid4().hex[:6]
                 kind = "internal_report" if screen_id == "internal-research" else "market_clip"
-                entity_label = f"Frontend Research {suffix}"
+                entity_label = f"演示研究笔记 {suffix}"
                 cursor.execute(
                     """
                     INSERT INTO cap_research_notes
@@ -4726,7 +4823,7 @@ def run_screen_primary_action(
 
             elif screen_id == "manager-orgs":
                 suffix = uuid.uuid4().hex[:6]
-                entity_label = f"Frontend Manager {suffix}"
+                entity_label = f"演示管理机构 {suffix}"
                 cursor.execute(
                     """
                     INSERT INTO cap_management_orgs
@@ -4741,7 +4838,7 @@ def run_screen_primary_action(
 
             elif screen_id == "burst-risk":
                 suffix = uuid.uuid4().hex[:6]
-                entity_label = f"Frontend Risk {suffix}"
+                entity_label = f"演示风险事件 {suffix}"
                 cursor.execute(
                     """
                     INSERT INTO cap_risk_incidents
@@ -4756,7 +4853,7 @@ def run_screen_primary_action(
 
             elif screen_id == "post-data-collection":
                 suffix = uuid.uuid4().hex[:6]
-                entity_label = f"Frontend Campaign {suffix}"
+                entity_label = f"演示收集任务 {suffix}"
                 cursor.execute(
                     """
                     INSERT INTO cap_data_collection_campaigns
@@ -4976,7 +5073,7 @@ def export_ledger(screen_id: str, user: AuthedUser = Depends(current_user)) -> R
     try:
         with connection.cursor() as cursor:
             cursor.execute(f"{query}\n            LIMIT 5000", tenant_params)
-            rows = cursor.fetchall()
+            rows = ledger_display_rows(screen_id, cursor.fetchall())
             write_audit(cursor, user.user_id, "export.csv", "screen", None, screen_id, after={"rows": len(rows)})
         connection.commit()
     finally:

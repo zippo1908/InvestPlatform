@@ -332,6 +332,14 @@ function mapBackendStage(stage: string) {
   return stageMap[stage] ?? stage
 }
 
+// opportunity_status 枚举代码 → 中文(看板卡片等直接透出 status 的位置用;与后端 OPP_STATUS_CN 一致)。
+const OPP_STATUS_CN: Record<string, string> = {
+  sourced: '已入库', screening: '初筛中', nda: 'NDA', term_sheet: 'TS签署',
+  diligence: '尽调中', committee: '投决中', approved: '立项通过',
+  agreement: '协议签署', funded: '已打款', invested: '已投资',
+  portfolio: '投后管理', partial_exit: '部分退出', exited: '已退出',
+}
+
 const PAGE_SIZE = 20
 
 function useBackendRows(screenId: string, fallbackRows: DataRow[], page = 1, reloadKey = 0, q = '') {
@@ -1856,7 +1864,7 @@ function BoardPage({
             sector: String(item.sector ?? ''),
             city: String(item.city ?? ''),
             owner: String(item.owner ?? '-'),
-            status: String(item.status ?? 'sourced'),
+            status: OPP_STATUS_CN[String(item.status ?? '')] ?? String(item.status ?? '已入库'),
             fund: '后端项目池',
             amount: 0,
             // 真实风险:由项目未结风险事件的最高严重度派生(无未结事件=低)。
@@ -2307,9 +2315,10 @@ const DETAIL_FIELDS: Record<'project' | 'fund', DetailField[]> = {
 const STAGE_STEPS = ['入库', 'NDA', 'TS', '立项', '投决', '领投', '投后', '部分退出', '完全退出']
 // 后端 stage_label / opportunity_status → 阶段条下标(尽量匹配,匹配不到落到「入库」)。
 const STAGE_INDEX: Record<string, number> = {
-  sourced: 0, 入库: 0, screening: 1, nda: 1, ts: 2, term_sheet: 2,
-  diligence: 3, 立项: 3, approved: 4, ic: 4, 投决: 4, invested: 5, 领投: 5, lead: 5,
-  portfolio: 6, 投后: 6, post_investment: 6, partial_exit: 7, 部分退出: 7,
+  sourced: 0, 入库: 0, screening: 1, nda: 1, 初筛: 1, ts: 2, term_sheet: 2,
+  diligence: 3, 立项: 3, 尽调: 3, approved: 4, ic: 4, 投决: 4, 内审: 4,
+  invested: 5, 领投: 5, lead: 5, 投资协议: 5, 打款: 5,
+  portfolio: 6, 投后: 6, 投后服务: 6, post_investment: 6, partial_exit: 7, 部分退出: 7,
   exited: 8, 完全退出: 8, full_exit: 8,
 }
 function stageIndexOf(project: Record<string, string>): number {
@@ -2329,8 +2338,9 @@ const PROJECT_SUBTABS = ['基本情况', '投资汇总', '财务数据', '委派
 type ProjectSubtab = (typeof PROJECT_SUBTABS)[number]
 // 顶部 section 导航(对照反馈截图那一行)。概况=卡片主视图;其余为各专题 section。
 // 「投资关系」= 原 基金投资情况 + 权益变动 两个页签合并(对应老导航「项目详情-投资关系」);
-// 「投后数据」= 收集配置 + 填报数据明细(对应老导航「项目详情-投后数据」,原财务表在二级 tab「财务数据」)。
-const PROJECT_SECTIONS = ['概况', '日程', '投资关系', '三会', '现金流', '估值', '投后数据', '协议条款(AI)'] as const
+// 「投后数据」= 收集配置 + 填报数据明细(对应老导航「项目详情-投后数据」,原财务表在二级 tab「财务数据」);
+// 「流程文件」「文档」对齐老系统项目抽屉的最后两个页签(issue #13 参考图)。
+const PROJECT_SECTIONS = ['概况', '日程', '投资关系', '三会', '现金流', '估值', '投后数据', '协议条款(AI)', '流程文件', '文档'] as const
 const _n = (v: unknown): number | null => (v == null || v === '' ? null : Number(v))
 const CF_KIND_CN: Record<string, string> = { project_return: '项目回款', capital_call: '出资', investment: '投资打款', management_fee: '管理费', distribution: '分配', expense: '费用' }
 const CF_DIR_CN: Record<string, string> = { inflow: '流入', outflow: '流出' }
@@ -2374,7 +2384,18 @@ const SECTION_DATA: Record<string, { path: string; map: (r: Record<string, unkno
     path: 'schedule',
     map: (r) => ({ 事项: String(r.event_title ?? '—'), 类型: EVENT_KIND_CN[String(r.event_kind)] ?? String(r.event_kind ?? '—'), 开始: dtmin(r.starts_at), 结束: dtmin(r.ends_at), 地点: String(r.location_text ?? '—') }),
   },
+  流程文件: {
+    path: 'workflows',
+    map: (r) => ({ 流程标题: String(r.title ?? '—'), 状态: WF_STATUS_CN[String(r.instance_status)] ?? String(r.instance_status ?? '—'), 当前节点: String(r.current_step ?? '—'), 申请人: String(r.initiator ?? '—'), 申请时间: dtmin(r.started_at), 更新时间: dtmin(r.updated_at) }),
+  },
+  文档: {
+    path: 'documents',
+    map: (r) => ({ 文档标题: String(r.title ?? '—'), 类型: DOC_KIND_CN[String(r.document_kind)] ?? String(r.document_kind ?? '—'), 文件名: String(r.file_name ?? '—'), 版本: r.current_version_no == null ? '—' : `v${r.current_version_no}`, 密级: DOC_ACCESS_CN[String(r.access_level)] ?? String(r.access_level ?? '—'), 关联用途: DOC_PURPOSE_CN[String(r.link_purpose)] ?? String(r.link_purpose ?? '—'), 上传时间: dtmin(r.created_at) }),
+  },
 }
+const DOC_KIND_CN: Record<string, string> = { project: '项目文件', fund: '基金文件', workflow: '流程文件', meeting: '会议文件', contract: '合同', report: '报告', other: '其他' }
+const DOC_ACCESS_CN: Record<string, string> = { public: '公开', team: '团队', restricted: '受限', private: '私密' }
+const DOC_PURPOSE_CN: Record<string, string> = { source: '来源材料', attachment: '附件', archive: '归档', disclosure: '披露', evidence: '证据', output: '产出' }
 
 // ── 基金详情:阶段/section/基本情况 与项目同构 ──
 const FUND_STAGES = ['筹备', '募集', '投资', '收获', '延长', '清算']
@@ -3758,6 +3779,11 @@ function PostDataPage({ screen, canWrite, onToast }: { screen: Screen; canWrite:
   const [selected, setSelected] = useState<Set<number>>(new Set())
   const [editing, setEditing] = useState<PostdataCollectionRow | null>(null)
   const [busy, setBusy] = useState(false)
+  // 显示列 + 分页(对齐老系统台账;默认列保持原三列,可按需勾出收集人/收集时间/备注)
+  const [colMenu, setColMenu] = useState(false)
+  const [hidden, setHidden] = useState<Set<string>>(new Set(['企业资料收集人', '收集时间', '备注']))
+  const [page, setPage] = useState(1)
+  const [pageSize, setPageSize] = useState(20)
   const isAdmin = getRoles().some((r) => r === 'system_admin' || r === 'managing_partner')
 
   useEffect(() => { setDetailId(readRouteId()); setQ(''); setKw('') }, [screen.id])
@@ -3781,7 +3807,22 @@ function PostDataPage({ screen, canWrite, onToast }: { screen: Screen; canWrite:
   const filtered = dq
     ? rows.filter((r) => [r.project_name, r.recipient_email, r.collect_status, r.collector_name].map((v) => String(v ?? '')).join(' ').toLowerCase().includes(dq))
     : rows
-  const pageIds = filtered.map((r) => r.project_id)
+  const PD_COLUMNS = ['项目名称', '企业资料收集人', '收件邮箱', '收集状态', '收集时间', '备注']
+  const columns = PD_COLUMNS.filter((c) => !hidden.has(c))
+  const pdCell = (r: PostdataCollectionRow, col: string): string => {
+    switch (col) {
+      case '企业资料收集人': return r.collector_name ? String(r.collector_name) : '—'
+      case '收件邮箱': return r.recipient_email || '—'
+      case '收集状态': return r.collect_status || '—'
+      case '收集时间': return r.collected_on ? String(r.collected_on).slice(0, 10) : '—'
+      case '备注': return r.notes ? String(r.notes) : '—'
+      default: return '—'
+    }
+  }
+  const totalPages = Math.max(1, Math.ceil(filtered.length / pageSize))
+  const curPage = Math.min(page, totalPages)
+  const pageRows = filtered.slice((curPage - 1) * pageSize, curPage * pageSize)
+  const pageIds = pageRows.map((r) => r.project_id)
   const allSelected = pageIds.length > 0 && pageIds.every((id) => selected.has(id))
   const selIds = [...selected]
 
@@ -3859,13 +3900,38 @@ function PostDataPage({ screen, canWrite, onToast }: { screen: Screen; canWrite:
             <input
               value={kw}
               onChange={(e) => setKw(e.target.value)}
-              onKeyDown={(e) => { if (e.key === 'Enter') setQ(kw.trim()) }}
+              onKeyDown={(e) => { if (e.key === 'Enter') { setQ(kw.trim()); setPage(1) } }}
               placeholder="输入关键字回车"
               aria-label="检索收集台账"
               data-testid="pd-search"
             />
           </label>
           {dq && <span className="muted-note">匹配 {filtered.length} / {rows.length} 个项目</span>}
+          <div className="col-config">
+            <button type="button" className="secondary-button" onClick={() => setColMenu((v) => !v)} data-testid="pd-cols">
+              <Columns size={14} /> 显示列 ({columns.length}/{PD_COLUMNS.length})
+            </button>
+            {colMenu && (
+              <div className="col-config-menu">
+                {PD_COLUMNS.map((col) => (
+                  <label key={col}>
+                    <input
+                      type="checkbox"
+                      checked={!hidden.has(col)}
+                      onChange={() => setHidden((prev) => {
+                        const next = new Set(prev)
+                        if (next.has(col)) next.delete(col)
+                        else if (PD_COLUMNS.length - next.size > 1) next.add(col)
+                        return next
+                      })}
+                    />
+                    <span>{col}</span>
+                  </label>
+                ))}
+                <button type="button" className="link-button" onClick={() => setHidden(new Set())}>重置为全部显示</button>
+              </div>
+            )}
+          </div>
           <button type="button" className="secondary-button" disabled={!canWrite || busy} onClick={() => void sendMails()} data-testid="pd-send-batch">
             <Send size={15} /> 发送邮件{selected.size ? ` (${selected.size})` : ''}
           </button>
@@ -3891,11 +3957,13 @@ function PostDataPage({ screen, canWrite, onToast }: { screen: Screen; canWrite:
                       aria-label="全选"
                     />
                   </th>
-                  <th>序号</th><th>项目名称</th><th>收件邮箱</th><th>收集状态</th><th>操作</th>
+                  <th>序号</th>
+                  {columns.map((col) => <th key={col}>{col}</th>)}
+                  <th>操作</th>
                 </tr>
               </thead>
               <tbody>
-                {filtered.map((r, i) => (
+                {pageRows.map((r, i) => (
                   <tr key={r.project_id}>
                     <td>
                       <input
@@ -3910,14 +3978,16 @@ function PostDataPage({ screen, canWrite, onToast }: { screen: Screen; canWrite:
                         aria-label={`选择 ${r.project_name}`}
                       />
                     </td>
-                    <td>{i + 1}</td>
-                    <td>
-                      <button type="button" className="link-button eq-project-link" onClick={() => setDetailId(r.project_id)} data-testid={`pd-open-${r.project_id}`}>
-                        {r.project_name}
-                      </button>
-                    </td>
-                    <td>{r.recipient_email || '—'}</td>
-                    <td>{r.collect_status || '—'}</td>
+                    <td>{(curPage - 1) * pageSize + i + 1}</td>
+                    {columns.map((col) => col === '项目名称' ? (
+                      <td key={col}>
+                        <button type="button" className="link-button eq-project-link" onClick={() => setDetailId(r.project_id)} data-testid={`pd-open-${r.project_id}`}>
+                          {r.project_name}
+                        </button>
+                      </td>
+                    ) : (
+                      <td key={col}>{pdCell(r, col)}</td>
+                    ))}
                     <td className="eq-row-actions">
                       <button type="button" className="link-button" disabled={!canWrite} onClick={() => setEditing(r)} data-testid={`pd-edit-${r.project_id}`}>编辑</button>
                       <span className="eq-action-sep">|</span>
@@ -3927,6 +3997,26 @@ function PostDataPage({ screen, canWrite, onToast }: { screen: Screen; canWrite:
                 ))}
               </tbody>
             </table>
+          </div>
+        )}
+        {!loading && filtered.length > 0 && (
+          <div className="eq-pagination">
+            <button type="button" className="secondary-button" disabled={curPage <= 1} onClick={() => setPage(curPage - 1)} aria-label="上一页">
+              <ChevronLeft size={15} />
+            </button>
+            {Array.from({ length: totalPages }, (_, n) => n + 1).slice(Math.max(0, curPage - 3), curPage + 2).map((n) => (
+              <button key={n} type="button" className={classNames('secondary-button eq-page-btn', n === curPage && 'is-active')} onClick={() => setPage(n)}>{n}</button>
+            ))}
+            <button type="button" className="secondary-button" disabled={curPage >= totalPages} onClick={() => setPage(curPage + 1)} aria-label="下一页">
+              <ChevronRight size={15} />
+            </button>
+            <span className="muted-note">
+              共 {filtered.length} 条,每页显示
+              <select value={String(pageSize)} onChange={(e) => { setPageSize(Number(e.target.value)); setPage(1) }} aria-label="每页条数">
+                {[10, 20, 50].map((n) => <option key={n} value={String(n)}>{n}</option>)}
+              </select>
+              条
+            </span>
           </div>
         )}
       </section>

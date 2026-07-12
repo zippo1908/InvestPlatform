@@ -79,8 +79,8 @@ test('list pages support search, selection, and async action controls', async ({
   await expect(page.getByTestId('records-table')).toBeVisible()
   await page.getByTestId('search-input').fill('__no_match__')
   await expect(page.getByTestId('records-table')).toContainText('暂无匹配记录')
-  await page.getByTestId('search-input').fill('Matrix')
-  await expect(page.getByTestId('records-table')).toContainText('Matrix Medical')
+  await page.getByTestId('search-input').fill('矩阵')
+  await expect(page.getByTestId('records-table')).toContainText('矩阵医疗')
 })
 
 test('detail tabs switch without losing the object context', async ({ page }) => {
