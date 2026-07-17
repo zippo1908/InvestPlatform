@@ -72,7 +72,7 @@ import { marked } from 'marked'
 import DOMPurify from 'dompurify'
 import html2canvas from 'html2canvas'
 import { API_BASE, apiDelete, apiDownload, apiGet, apiPatch, apiPost, apiPut, auditDetail, getPerms, getRoles, getToken, getUserName, setPerms, setRoles, setUserName, streamPost, setToken } from './api'
-import { FLOW_TYPES, type FlowTypeDef } from './flowCenter'
+import { FLOW_TYPES, type FlowField, type FlowTypeDef } from './flowCenter'
 import LoginScene from './LoginScene'
 
 marked.setOptions({ breaks: true, gfm: true })
@@ -269,10 +269,18 @@ function readRouteId(): number | null {
   return m ? Number(m) : null
 }
 
+// 从当前 hash 读任意 query 参数(如看板阶段点击带过来的 ?q=尽调)
+function readRouteQuery(key: string): string {
+  const q = window.location.hash.split('?')[1]
+  if (!q) return ''
+  return new URLSearchParams(q).get(key) ?? ''
+}
+
 // 列表屏 → 对应详情屏(用于行点击打开)
 const LIST_DETAIL_TARGET: Record<string, string> = {
   'project-list': 'project-detail-overview',
   'fund-list': 'fund-detail-overview',
+  'investor-list': 'investor-detail', // issue #30:点投资人名称弹出详情
 }
 
 function classNames(...parts: Array<string | false | undefined>) {
@@ -1235,8 +1243,9 @@ function PageHeader({
         {/* 「显示列」已下沉到台账表格工具条(可勾选列 + localStorage 持久化),此处不再放解耦占位钮。 */}
         {/* 文档/AI 屏的顶部通用主操作只会建占位记录,易与面板里真实入口混淆 → 隐藏。 */}
         {/* issue #19:项目列表/项目池/基金列表的台账工具条已有真实「新增」入口,顶部占位钮撤掉,只留一个有效按钮。 */}
+        {/* issue #31:投资人列表同理 —— 台账工具条有真实「新增投资人」弹框,顶部占位钮撤掉。 */}
         {current.kind !== 'documents' && current.kind !== 'ai' &&
-          !['project-list', 'project-board', 'fund-list'].includes(current.id) && (
+          !['project-list', 'project-board', 'fund-list', 'investor-list', 'post-alerts'].includes(current.id) && (
           <button
             type="button"
             className="primary-button"
@@ -1279,6 +1288,7 @@ function PageRenderer({
   if (screen.id === 'project-detail-investment' || screen.id === 'equity-change') return <EquityLedgerPage screen={screen} canWrite={canWrite} onToast={onToast} />
   // 反馈 #14/#15:投后数据入口 = 收集台账(点项目名进明细)。
   if (screen.id === 'project-detail-postdata' || screen.id === 'post-data-collection') return <PostDataPage screen={screen} canWrite={canWrite} onToast={onToast} />
+  if (screen.id === 'post-alerts') return <PostAlertsPage onToast={onToast} /> // issue #25:投后预警
   if (screen.kind === 'ai') return <AiPage screen={screen} canWrite={canWrite} onToast={onToast} />
   if (screen.kind === 'board') return <BoardPage canWrite={canWrite} onToast={onToast} />
   if (screen.kind === 'form') return <FormPage screen={screen} canWrite={canWrite} onToast={onToast} />
@@ -1940,7 +1950,15 @@ function BoardPage({
           return (
             <section className="kanban-column" key={stage} data-testid={`project-stage-${stage}`}>
               <header>
-                <strong>{stage}</strong>
+                {/* issue #27:点阶段标题直达项目列表并按该阶段过滤(经 ?q= 传给列表搜索) */}
+                <button
+                  type="button"
+                  className="kanban-stage-link"
+                  title={`查看「${stage}」阶段项目列表`}
+                  onClick={() => { window.location.hash = `/project-list?q=${encodeURIComponent(stage)}` }}
+                >
+                  <strong>{stage}</strong>
+                </button>
                 <span>{rows.length}</span>
               </header>
               {rows.map((project, index) => (
@@ -2416,7 +2434,7 @@ const FUND_BASIC_GROUPS: Array<[string, string[]]> = [
   ['规模期限', ['target_size', 'committed_size', 'paid_in_size', 'net_asset_value']],
 ]
 const COMMIT_STATUS_CN: Record<string, string> = { active: '在册', exited: '已退出', defaulted: '违约', transferred: '已转让' }
-const DISCLOSURE_CN: Record<string, string> = { confirmed: '已确认', sent: '已发送', pending: '待披露', none: '未披露' }
+const DISCLOSURE_CN: Record<string, string> = { confirmed: '已确认', sent: '已发送', pending: '待披露', none: '未披露', not_started: '未开始', scheduled: '已排期', viewed: '已查看', not_due: '未到期' }
 const REPORT_KIND_CN: Record<string, string> = { quarterly: '季报', annual: '年报', monthly: '月报', interim: '中期', semiannual: '半年报' }
 const REPORT_STATUS_CN: Record<string, string> = { approved: '已审批', draft: '草稿', submitted: '已提交', published: '已发布' }
 const FUND_SECTION_DATA: Record<string, { path: string; map: (r: Record<string, unknown>) => DataRow }> = {
@@ -2437,15 +2455,17 @@ const FUND_SECTION_DATA: Record<string, { path: string; map: (r: Record<string, 
 }
 
 // ── 投资人详情:同构页 ──
-const INVESTOR_SECTIONS = ['概况', '出资承诺', '联系人', '触点记录'] as const
+// issue #30:结构对齐参考系统「投资人详情」—— 概况(基本信息+投资汇总)/ 签约基金 / 现金流 / 联系人 / 触点记录
+const INVESTOR_SECTIONS = ['概况', '签约基金', '现金流', '联系人', '触点记录'] as const
 const INVESTOR_KIND_CN: Record<string, string> = { government_guidance: '政府引导基金', corporate: '产业/企业', family_office: '家族办公室', financial: '金融机构', insurance: '保险资金', individual: '个人', other: '其他' }
 const QUAL_CN: Record<string, string> = { qualified: '合格投资者', pending: '待认定', rejected: '不合格', expired: '已过期' }
 const RISK_RATING_CN: Record<string, string> = { low: '低', medium: '中', high: '高', conservative: '保守', balanced: '平衡', aggressive: '进取', professional: '专业投资者', retail: '普通投资者', qualified: '合格' }
 const TOUCHPOINT_CN: Record<string, string> = { meeting: '会议', call: '电话', email: '邮件', roadshow: '路演', site_visit: '实地走访', other: '其他' }
+const CASHFLOW_KIND_CN: Record<string, string> = { investor_call: '缴款', investor_distribution: '分配', project_investment: '项目投资', project_return: '项目回款', management_fee: '管理费', operating_expense: '运营支出', other: '其他' }
 const INVESTOR_SECTION_DATA: Record<string, { path: string; map: (r: Record<string, unknown>) => DataRow }> = {
-  出资承诺: {
-    path: 'commitments',
-    map: (r) => ({ 基金: String(r.fund_name ?? '—'), 认缴: wan(_n(r.committed_amount)), 实缴: wan(_n(r.paid_in_amount)), 入伙日期: r.admission_date ? String(r.admission_date) : '—', 状态: COMMIT_STATUS_CN[String(r.status)] ?? String(r.status ?? '—'), 披露: DISCLOSURE_CN[String(r.disclosure_status)] ?? String(r.disclosure_status ?? '—') }),
+  现金流: {
+    path: 'cashflows',
+    map: (r) => ({ 基金名称: String(r.fund_name ?? '—'), 现金流类型: CASHFLOW_KIND_CN[String(r.cashflow_kind)] ?? String(r.cashflow_kind ?? '—'), 金额: wan(_n(r.amount)), 币种: String(r.currency ?? 'CNY'), 时间: r.occurred_on ? String(r.occurred_on) : '—' }),
   },
   联系人: {
     path: 'contacts',
@@ -2751,6 +2771,12 @@ type EquityRow = {
   post_money_ratio: string | number | null
   co_investors: string | null
   notes: string | null
+  // issue #32:估值/历史投资方/草稿
+  valuation_original?: string | number | null
+  valuation_currency?: string | null
+  valuation_cny?: string | number | null
+  historical_investors?: string | null
+  is_draft?: number
 }
 
 // 股比:库里存小数(0.078),展示为「7.8 %」;空值一律「—」。
@@ -2776,7 +2802,7 @@ function EquityChangeModal({ initial, projectId, projOpts, fundOpts, onClose, on
   onSaved: () => void
   onToast: (toast: Toast) => void
 }) {
-  const [form, setForm] = useState(() => ({
+  const initialForm = () => ({
     project_id: initial ? String(initial.project_id) : projectId != null ? String(projectId) : '',
     fund_id: initial?.fund_id ? String(initial.fund_id) : '',
     change_reason: initial?.change_reason ?? '首次投资',
@@ -2789,15 +2815,44 @@ function EquityChangeModal({ initial, projectId, projOpts, fundOpts, onClose, on
     post_pct: initial?.post_money_ratio != null ? String(+(Number(initial.post_money_ratio) * 100).toFixed(4)) : '',
     co_investors: initial?.co_investors ?? '',
     notes: initial?.notes ?? '',
-  }))
+    // issue #32:估值(原币/币种/人民币)+ 历史投资方
+    valuation_original: initial?.valuation_original != null ? String(+Number(initial.valuation_original).toFixed(2)) : '',
+    valuation_currency: initial?.valuation_currency || '万人民币',
+    valuation_cny: initial?.valuation_cny != null ? String(+Number(initial.valuation_cny).toFixed(2)) : '',
+    historical_investors: initial?.historical_investors ?? '',
+  })
+  const [form, setForm] = useState(initialForm)
   const [saving, setSaving] = useState(false)
   const set = (k: string, v: string | boolean) => setForm((f) => ({ ...f, [k]: v }))
   const reasonOptions = EQUITY_REASONS.includes(form.change_reason) || !form.change_reason ? EQUITY_REASONS : [form.change_reason, ...EQUITY_REASONS]
 
-  const save = async () => {
-    if (!initial && !form.project_id) { onToast({ title: '请选择项目', detail: '新增权益变动需先选定所属项目' }); return }
+  // issue #32 自动计算(供参考):
+  // - 估值折算:万美元/万港币按演示汇率折人民币(反向同理);
+  // - 交易后占比参考 = 基金持有项目估值(人民币)÷ 项目最新估值(cap_project_valuations)。
+  const FX: Record<string, number> = { 万人民币: 1, 万美元: 7.2, 万港币: 0.92 }
+  const [projectValuation, setProjectValuation] = useState<number | null>(null) // 项目最新估值(元)
+  const effectiveProjectId = initial ? initial.project_id : form.project_id ? Number(form.project_id) : null
+  useEffect(() => {
+    if (effectiveProjectId == null) { setProjectValuation(null); return }
+    let ignore = false
+    apiGet<{ latest_valuation?: number | null }>(`/api/projects/${effectiveProjectId}/summary`)
+      .then((s) => { if (!ignore) setProjectValuation(s.latest_valuation != null ? Number(s.latest_valuation) : null) })
+      .catch(() => { if (!ignore) setProjectValuation(null) })
+    return () => { ignore = true }
+  }, [effectiveProjectId])
+  const fx = FX[form.valuation_currency] ?? 1
+  const calcCnyFromOriginal = form.valuation_original.trim() !== '' && !Number.isNaN(Number(form.valuation_original))
+    ? +(Number(form.valuation_original) * fx).toFixed(2) : null // 万人民币
+  const calcOriginalFromCny = form.valuation_cny.trim() !== '' && !Number.isNaN(Number(form.valuation_cny))
+    ? +(Number(form.valuation_cny) / fx).toFixed(2) : null // 原币(万)
+  const calcPostPct = projectValuation && projectValuation > 0 && form.valuation_cny.trim() !== '' && !Number.isNaN(Number(form.valuation_cny))
+    ? +(Number(form.valuation_cny) * 1e4 / projectValuation * 100).toFixed(2) : null
+
+  const save = async (asDraft: boolean) => {
+    if (!initial && !form.project_id) { onToast({ title: '请选择项目', detail: '新增投资记录需先选定所属项目' }); return }
     if (!form.change_reason.trim()) { onToast({ title: '请选择股权变更原因', detail: '该字段必填' }); return }
     const num = (s: string) => { const n = Number(s); return s.trim() === '' || Number.isNaN(n) ? null : +(n / 100).toFixed(6) }
+    const raw = (s: string) => { const n = Number(s); return s.trim() === '' || Number.isNaN(n) ? null : n }
     const payload: Record<string, unknown> = {
       fund_id: form.fund_id ? Number(form.fund_id) : null,
       change_reason: form.change_reason.trim(),
@@ -2810,15 +2865,20 @@ function EquityChangeModal({ initial, projectId, projOpts, fundOpts, onClose, on
       post_money_ratio: num(form.post_pct),
       co_investors: form.co_investors.trim() || null,
       notes: form.notes.trim() || null,
+      valuation_original: raw(form.valuation_original),
+      valuation_currency: form.valuation_currency,
+      valuation_cny: raw(form.valuation_cny),
+      historical_investors: form.historical_investors.trim() || null,
+      is_draft: asDraft,
     }
     setSaving(true)
     try {
       if (initial) {
         await apiPatch(`/api/equity-changes/${initial.equity_change_id}`, payload)
-        onToast({ title: '权益变动已更新', detail: '修改已写入台账', action: 'equity_change.update', entity: 'cap_equity_changes' })
+        onToast({ title: asDraft ? '已暂存(草稿)' : '投资记录已更新', detail: '修改已写入台账', action: 'equity_change.update', entity: 'cap_equity_changes' })
       } else {
         await apiPost('/api/equity-changes', { ...payload, project_id: Number(form.project_id) })
-        onToast({ title: '权益变动已新增', detail: '记录已写入台账', action: 'equity_change.create', entity: 'cap_equity_changes' })
+        onToast({ title: asDraft ? '已暂存(草稿)' : '投资记录已新增', detail: '记录已写入台账', action: 'equity_change.create', entity: 'cap_equity_changes' })
       }
       onSaved()
       onClose()
@@ -2833,7 +2893,7 @@ function EquityChangeModal({ initial, projectId, projOpts, fundOpts, onClose, on
     <div className="eq-modal-backdrop" onClick={onClose} data-testid="equity-modal">
       <div className="eq-modal" onClick={(e) => e.stopPropagation()}>
         <div className="eq-modal-head">
-          <h3>{initial ? '编辑权益变动' : '新增权益变动'}</h3>
+          <h3>{initial ? '编辑投资记录' : '新增投资记录'}</h3>
           <button type="button" className="icon-button" aria-label="关闭" onClick={onClose}><X size={18} /></button>
         </div>
         <div className="form-grid">
@@ -2895,18 +2955,49 @@ function EquityChangeModal({ initial, projectId, projOpts, fundOpts, onClose, on
             <input type="number" step="0.01" min="0" value={form.post_pct} onChange={(e) => set('post_pct', e.target.value)} placeholder="如 7.79" />
           </label>
           <label>
+            <span>交易后占比(系统自动计算,供参考)</span>
+            <input value={calcPostPct != null ? `${calcPostPct} %` : ''} readOnly placeholder="系统自动计算" title="= 基金持有项目估值(人民币)÷ 项目最新估值" />
+          </label>
+          <label>
+            <span>基金持有项目估值(原币)</span>
+            <div className="eq-currency-row">
+              <input type="number" step="0.01" min="0" value={form.valuation_original} onChange={(e) => set('valuation_original', e.target.value)} placeholder="金额" />
+              <select value={form.valuation_currency} onChange={(e) => set('valuation_currency', e.target.value)} aria-label="币种">
+                {['万人民币', '万美元', '万港币'].map((c) => <option key={c} value={c}>{c}</option>)}
+              </select>
+            </div>
+          </label>
+          <label>
+            <span>基金持有项目估值(人民币,万)</span>
+            <input type="number" step="0.01" min="0" value={form.valuation_cny} onChange={(e) => set('valuation_cny', e.target.value)} placeholder="金额(万人民币)" />
+          </label>
+          <label>
+            <span>估值人民币(系统自动计算,供参考)</span>
+            <input value={calcCnyFromOriginal != null ? `${calcCnyFromOriginal.toLocaleString('zh-CN')} 万` : ''} readOnly placeholder="系统自动计算" title="按演示汇率由原币折算" />
+          </label>
+          <label>
+            <span>估值原币(系统自动计算,供参考)</span>
+            <input value={calcOriginalFromCny != null ? `${calcOriginalFromCny.toLocaleString('zh-CN')} ${form.valuation_currency.replace('万人民币', '万')}` : ''} readOnly placeholder="系统自动计算" title="按演示汇率由人民币反算" />
+          </label>
+          <label className="span-2">
             <span>本轮其他投资机构</span>
-            <input value={form.co_investors} onChange={(e) => set('co_investors', e.target.value)} placeholder="多家用顿号分隔" />
+            <textarea rows={2} value={form.co_investors} onChange={(e) => set('co_investors', e.target.value)} placeholder="多家用顿号分隔" />
+          </label>
+          <label className="span-2">
+            <span>历史投资方</span>
+            <textarea rows={2} value={form.historical_investors} onChange={(e) => set('historical_investors', e.target.value)} placeholder="历史轮次投资方,多家用顿号分隔" />
           </label>
           <label className="span-2">
             <span>备注</span>
-            <input value={form.notes} onChange={(e) => set('notes', e.target.value)} />
+            <textarea rows={2} value={form.notes} onChange={(e) => set('notes', e.target.value)} />
           </label>
         </div>
         <div className="button-row eq-modal-actions">
-          <button type="button" className="primary-button" disabled={saving} onClick={save} data-testid="eq-save">
-            <CheckCircle size={15} /> {saving ? '保存中…' : '保存'}
+          <button type="button" className="primary-button" disabled={saving} onClick={() => save(false)} data-testid="eq-save">
+            <CheckCircle size={15} /> {saving ? '保存中…' : '提交'}
           </button>
+          <button type="button" className="secondary-button" disabled={saving} onClick={() => save(true)} data-testid="eq-save-draft">暂存</button>
+          <button type="button" className="secondary-button" disabled={saving} onClick={() => setForm(initialForm())}>重置</button>
           <button type="button" className="secondary-button" onClick={onClose}>取消</button>
         </div>
       </div>
@@ -3003,7 +3094,7 @@ function EquityChangeTable({ projectId, canWrite, onToast }: {
     switch (col) {
       case '项目名称': return String(r.project_name ?? r.project_id)
       case '投资主体': return r.fund_name === '-' ? '—' : String(r.fund_name ?? '—')
-      case '股权变更原因': return String(r.change_reason ?? '—')
+      case '股权变更原因': return `${r.change_reason ?? '—'}${r.is_draft ? '(草稿)' : ''}`
       case '协议时间': return r.agreement_date ? String(r.agreement_date) : '—'
       case '投决会通过时间': return r.approval_date ? String(r.approval_date) : '—'
       case '轮次': return r.round_label && r.round_label !== '-' ? String(r.round_label) : '—'
@@ -3135,7 +3226,7 @@ function EquityChangeTable({ projectId, canWrite, onToast }: {
           </>
         )}
         <button type="button" className="primary-button" disabled={!canWrite} onClick={() => setEditing('new')} data-testid="equity-add">
-          <Plus size={15} /> 新增
+          <Plus size={15} /> 新增投资记录
         </button>
         {!ledger && (
           <button type="button" className="secondary-button" onClick={() => { setShowFilter((v) => !v); if (showFilter) { setKw(''); setQ('') } }}>
@@ -3334,12 +3425,22 @@ type PostdataReport = {
   fill_period: string
   fill_status: string
   total_assets: string | number | null
+  total_liabilities: string | number | null
   net_assets: string | number | null
   revenue: string | number | null
+  operating_cost: string | number | null
+  expense_three: string | number | null
   net_profit: string | number | null
+  operating_cash_flow: string | number | null
   filled_at: string | null
   filled_by: string | null
 }
+
+// issue #24/#26:投后扩展块
+type PostdataOperation = { op_id: number; period_label: string; content: string; recorded_on: string | null; created_by: string | null; created_at: string }
+type PostdataMeeting = { meeting_id: number; meeting_kind: string; held_on: string | null; topic: string | null; document_id: number | null; document_name: string | null; created_at: string }
+type PostdataDocument = { document_id: number; doc_kind: string; filename: string; content_type: string | null; size_bytes: number | null; uploaded_by: string | null; created_at: string }
+type PostdataInvestment = { agreement_total: string | number | null; paid_total: string | number | null; latest_valuation: string | number | null; ownership_total: string | number | null; first_payment_on: string | null; position_count: number }
 
 type PostdataDetail = {
   project_id: number
@@ -3351,6 +3452,10 @@ type PostdataDetail = {
   }
   external_link: string | null
   reports: PostdataReport[]
+  investment?: PostdataInvestment
+  operations?: PostdataOperation[]
+  meetings?: PostdataMeeting[]
+  documents?: PostdataDocument[]
 }
 
 const PD_PERIODS = ['年度', '半年度', '一季度', '二季度', '三季度', '四季度']
@@ -3428,9 +3533,13 @@ function PostdataReportModal({ projectId, initial, onClose, onSaved, onToast }: 
     fill_period: initial?.fill_period ?? '年度',
     fill_status: initial?.fill_status ?? '待填报',
     total_assets: initial?.total_assets != null ? String(initial.total_assets) : '',
+    total_liabilities: initial?.total_liabilities != null ? String(initial.total_liabilities) : '',
     net_assets: initial?.net_assets != null ? String(initial.net_assets) : '',
     revenue: initial?.revenue != null ? String(initial.revenue) : '',
+    operating_cost: initial?.operating_cost != null ? String(initial.operating_cost) : '',
+    expense_three: initial?.expense_three != null ? String(initial.expense_three) : '',
     net_profit: initial?.net_profit != null ? String(initial.net_profit) : '',
+    operating_cash_flow: initial?.operating_cash_flow != null ? String(initial.operating_cash_flow) : '',
   })
   const [saving, setSaving] = useState(false)
   const periods = PD_PERIODS.includes(form.fill_period) ? PD_PERIODS : [form.fill_period, ...PD_PERIODS]
@@ -3442,9 +3551,13 @@ function PostdataReportModal({ projectId, initial, onClose, onSaved, onToast }: 
       fill_period: form.fill_period,
       fill_status: form.fill_status,
       total_assets: num(form.total_assets),
+      total_liabilities: num(form.total_liabilities),
       net_assets: num(form.net_assets),
       revenue: num(form.revenue),
+      operating_cost: num(form.operating_cost),
+      expense_three: num(form.expense_three),
       net_profit: num(form.net_profit),
+      operating_cash_flow: num(form.operating_cash_flow),
     }
     setSaving(true)
     try {
@@ -3482,10 +3595,14 @@ function PostdataReportModal({ projectId, initial, onClose, onSaved, onToast }: 
               {['待填报', '已填报'].map((s) => <option key={s} value={s}>{s}</option>)}
             </select>
           </label>
-          <label><span>总资产(万)</span><input type="number" step="0.01" value={form.total_assets} onChange={(e) => setForm((f) => ({ ...f, total_assets: e.target.value }))} /></label>
-          <label><span>净资产(万)</span><input type="number" step="0.01" value={form.net_assets} onChange={(e) => setForm((f) => ({ ...f, net_assets: e.target.value }))} /></label>
           <label><span>营业收入(万)</span><input type="number" step="0.01" value={form.revenue} onChange={(e) => setForm((f) => ({ ...f, revenue: e.target.value }))} /></label>
+          <label><span>营业成本(万)</span><input type="number" step="0.01" value={form.operating_cost} onChange={(e) => setForm((f) => ({ ...f, operating_cost: e.target.value }))} /></label>
+          <label><span>三费(万)</span><input type="number" step="0.01" value={form.expense_three} onChange={(e) => setForm((f) => ({ ...f, expense_three: e.target.value }))} /></label>
           <label><span>净利润(万)</span><input type="number" step="0.01" value={form.net_profit} onChange={(e) => setForm((f) => ({ ...f, net_profit: e.target.value }))} /></label>
+          <label><span>经营性现金流净额(万)</span><input type="number" step="0.01" value={form.operating_cash_flow} onChange={(e) => setForm((f) => ({ ...f, operating_cash_flow: e.target.value }))} /></label>
+          <label><span>总资产(万)</span><input type="number" step="0.01" value={form.total_assets} onChange={(e) => setForm((f) => ({ ...f, total_assets: e.target.value }))} /></label>
+          <label><span>总负债(万)</span><input type="number" step="0.01" value={form.total_liabilities} onChange={(e) => setForm((f) => ({ ...f, total_liabilities: e.target.value }))} /></label>
+          <label><span>净资产(万)</span><input type="number" step="0.01" value={form.net_assets} onChange={(e) => setForm((f) => ({ ...f, net_assets: e.target.value }))} /></label>
         </div>
         <div className="button-row eq-modal-actions">
           <button type="button" className="primary-button" disabled={saving} onClick={save} data-testid="pd-report-save"><CheckCircle size={15} /> {saving ? '保存中…' : '保存'}</button>
@@ -3708,7 +3825,8 @@ function PostdataDetailView({ projectId, canWrite, onToast, onBack }: {
               <thead>
                 <tr>
                   <th>所填年份</th><th>所填季度</th><th>填报状态</th>
-                  <th>总资产</th><th>净资产</th><th>营业收入</th><th>净利润</th><th>操作</th>
+                  <th>营业收入</th><th>营业成本</th><th>三费</th><th>净利润</th><th>经营性现金流净额</th>
+                  <th>总资产</th><th>总负债</th><th>净资产</th><th>操作</th>
                 </tr>
               </thead>
               <tbody>
@@ -3717,10 +3835,14 @@ function PostdataDetailView({ projectId, canWrite, onToast, onBack }: {
                     <td>{r.fill_year}</td>
                     <td>{r.fill_period}</td>
                     <td><span className={`eq-tag ${r.fill_status === '已填报' ? 'tone-teal' : 'tone-gray'}`}>{r.fill_status}</span></td>
-                    <td>{pdWan(r.total_assets)}</td>
-                    <td>{pdWan(r.net_assets)}</td>
                     <td>{pdWan(r.revenue)}</td>
+                    <td>{pdWan(r.operating_cost)}</td>
+                    <td>{pdWan(r.expense_three)}</td>
                     <td>{pdWan(r.net_profit)}</td>
+                    <td>{pdWan(r.operating_cash_flow)}</td>
+                    <td>{pdWan(r.total_assets)}</td>
+                    <td>{pdWan(r.total_liabilities)}</td>
+                    <td>{pdWan(r.net_assets)}</td>
                     <td className="eq-row-actions">
                       <button type="button" className="link-button" disabled={!canWrite} onClick={() => setEditingReport(r)}>编辑</button>
                       <span className="eq-action-sep">|</span>
@@ -3755,6 +3877,7 @@ function PostdataDetailView({ projectId, canWrite, onToast, onBack }: {
           </div>
         )}
       </section>
+      <PostdataExtendedSections projectId={projectId} data={data} canWrite={canWrite} onToast={onToast} reload={reload} />
       {editingCollection && (
         <PostdataCollectionModal
           row={{ project_id: projectId, project_name: data.project_name, ...col }}
@@ -3772,6 +3895,322 @@ function PostdataDetailView({ projectId, canWrite, onToast, onBack }: {
           onToast={onToast}
         />
       )}
+    </div>
+  )
+}
+
+// issue #24/#26(用户反馈 #19/#21):投后扩展块 —— 投资信息 / 运营信息(历史检索)/ 三会情况 / 文档存档。
+function PostdataExtendedSections({ projectId, data, canWrite, onToast, reload }: {
+  projectId: number
+  data: PostdataDetail
+  canWrite: boolean
+  onToast: (toast: Toast) => void
+  reload: () => void
+}) {
+  const inv = data.investment
+  const documents = data.documents ?? []
+  const meetings = data.meetings ?? []
+
+  // 运营信息:支持关键词检索(走服务端,历史可查);无关键词时直接用 data.operations
+  const [opQ, setOpQ] = useState('')
+  const [opRows, setOpRows] = useState<PostdataOperation[] | null>(null)
+  useEffect(() => {
+    if (!opQ.trim()) { setOpRows(null); return }
+    let ignore = false
+    const timer = window.setTimeout(() => {
+      apiGet<{ items: PostdataOperation[] }>(`/api/projects/${projectId}/postdata/operations?q=${encodeURIComponent(opQ.trim())}`)
+        .then((r) => { if (!ignore) setOpRows(r.items ?? []) })
+        .catch(() => { if (!ignore) setOpRows([]) })
+    }, 300)
+    return () => { ignore = true; window.clearTimeout(timer) }
+  }, [opQ, projectId])
+  const operations = opRows ?? data.operations ?? []
+  const [opForm, setOpForm] = useState({ period_label: '', content: '', recorded_on: '' })
+  const [opSaving, setOpSaving] = useState(false)
+  const addOperation = async () => {
+    if (!opForm.period_label.trim() || !opForm.content.trim()) { onToast({ title: '期间与运营信息内容必填', detail: '如 2026H1 + 本期运营要点' }); return }
+    setOpSaving(true)
+    try {
+      await apiPost(`/api/projects/${projectId}/postdata/operations`, {
+        period_label: opForm.period_label.trim(), content: opForm.content.trim(), recorded_on: opForm.recorded_on || null,
+      })
+      onToast({ title: '运营信息已记录', detail: opForm.period_label.trim(), action: 'postdata.operation.create', entity: 'cap_postdata_operations' })
+      setOpForm({ period_label: '', content: '', recorded_on: '' })
+      reload()
+    } catch (error) {
+      onToast({ title: '保存失败', detail: error instanceof Error ? error.message : 'API 调用失败' })
+    } finally { setOpSaving(false) }
+  }
+  const removeOperation = async (r: PostdataOperation) => {
+    if (!window.confirm(`删除「${r.period_label}」运营信息?`)) return
+    try { await apiDelete(`/api/postdata/operations/${r.op_id}`); reload() } catch (error) { onToast({ title: '删除失败', detail: error instanceof Error ? error.message : '' }) }
+  }
+
+  // 三会情况
+  const [meetForm, setMeetForm] = useState({ meeting_kind: '股东会', held_on: '', topic: '', document_id: '' })
+  const [meetSaving, setMeetSaving] = useState(false)
+  const addMeeting = async () => {
+    setMeetSaving(true)
+    try {
+      await apiPost(`/api/projects/${projectId}/postdata/meetings`, {
+        meeting_kind: meetForm.meeting_kind, held_on: meetForm.held_on || null,
+        topic: meetForm.topic.trim() || null, document_id: meetForm.document_id ? Number(meetForm.document_id) : null,
+      })
+      onToast({ title: '三会记录已新增', detail: `${meetForm.meeting_kind} ${meetForm.held_on}`, action: 'postdata.meeting.create', entity: 'cap_postdata_meetings' })
+      setMeetForm({ meeting_kind: '股东会', held_on: '', topic: '', document_id: '' })
+      reload()
+    } catch (error) {
+      onToast({ title: '保存失败', detail: error instanceof Error ? error.message : 'API 调用失败' })
+    } finally { setMeetSaving(false) }
+  }
+  const removeMeeting = async (m: PostdataMeeting) => {
+    if (!window.confirm(`删除该${m.meeting_kind}记录?`)) return
+    try { await apiDelete(`/api/postdata/meetings/${m.meeting_id}`); reload() } catch (error) { onToast({ title: '删除失败', detail: error instanceof Error ? error.message : '' }) }
+  }
+
+  // 文档存档(#26)
+  const DOC_KINDS = ['财务报表', '经营情况分析', '三会决议议案', '其他']
+  const [docKind, setDocKind] = useState('财务报表')
+  const [uploading, setUploading] = useState(false)
+  const docFileRef = useRef<HTMLInputElement>(null)
+  const uploadDoc = async (f: File) => {
+    if (f.size > 20 * 1024 * 1024) { onToast({ title: '文件过大', detail: '上限 20MB' }); return }
+    setUploading(true)
+    try {
+      const fd = new FormData()
+      fd.append('file', f)
+      const token = getToken()
+      const res = await fetch(`${API_BASE}/api/projects/${projectId}/postdata/documents?doc_kind=${encodeURIComponent(docKind)}`, {
+        method: 'POST', headers: token ? { Authorization: `Bearer ${token}` } : {}, body: fd,
+      })
+      if (!res.ok) throw new Error((await res.text()) || `HTTP ${res.status}`)
+      onToast({ title: '文档已归档', detail: `${docKind} · ${f.name}`, action: 'postdata.document.upload', entity: 'cap_postdata_documents' })
+      reload()
+    } catch (error) {
+      onToast({ title: '上传失败', detail: error instanceof Error ? error.message : 'API 调用失败' })
+    } finally { setUploading(false) }
+  }
+  const downloadDoc = (d: PostdataDocument) =>
+    apiDownload(`/api/postdata/documents/${d.document_id}/download`, d.filename)
+      .catch((e) => onToast({ title: '下载失败', detail: e instanceof Error ? e.message : '' }))
+  const removeDoc = async (d: PostdataDocument) => {
+    if (!window.confirm(`删除文档「${d.filename}」?`)) return
+    try { await apiDelete(`/api/postdata/documents/${d.document_id}`); reload() } catch (error) { onToast({ title: '删除失败', detail: error instanceof Error ? error.message : '' }) }
+  }
+  const fmtSize = (n: number | null) => n == null ? '—' : n > 1048576 ? `${(n / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`
+
+  return (
+    <>
+      <section className="panel full-span motion-item" data-testid="pd-investment">
+        <PanelTitle icon={Database} title="投资信息" />
+        {inv == null || !inv.position_count ? <p className="muted-note">该项目暂无投资持仓记录。</p> : (
+          <div className="pd-info-grid">
+            {[
+              ['协议投资额', pdWan(inv.agreement_total)],
+              ['累计已投', pdWan(inv.paid_total)],
+              ['最新投资估值', pdWan(inv.latest_valuation)],
+              ['合计持股比例', inv.ownership_total != null ? `${+(Number(inv.ownership_total) * 100).toFixed(2)} %` : '—'],
+              ['首次打款', inv.first_payment_on ? String(inv.first_payment_on).slice(0, 10) : '—'],
+              ['持仓笔数', String(inv.position_count)],
+            ].map(([k, v]) => (
+              <div className="pd-info-cell" key={String(k)}>
+                <span className="pd-info-key">{k}</span>
+                <span className="pd-info-val">{v}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
+
+      <section className="panel full-span motion-item" data-testid="pd-operations">
+        <div className="pd-reports-head">
+          <h3>运营信息(历史留存,可检索)</h3>
+          <label className="table-search" style={{ minWidth: 220 }}>
+            <Search size={14} />
+            <input value={opQ} onChange={(e) => setOpQ(e.target.value)} placeholder="检索期间/内容关键词" aria-label="检索运营信息" />
+          </label>
+        </div>
+        {canWrite && (
+          <div className="pd-inline-form">
+            <input value={opForm.period_label} onChange={(e) => setOpForm((f) => ({ ...f, period_label: e.target.value }))} placeholder="期间(如 2026H1)" style={{ width: 140 }} />
+            <input type="date" value={opForm.recorded_on} onChange={(e) => setOpForm((f) => ({ ...f, recorded_on: e.target.value }))} style={{ width: 150 }} />
+            <input value={opForm.content} onChange={(e) => setOpForm((f) => ({ ...f, content: e.target.value }))} placeholder="最新运营信息(产能/客户/订单/团队等)" style={{ flex: 1 }} />
+            <button type="button" className="primary-button" disabled={opSaving} onClick={() => void addOperation()}><Plus size={14} /> 记录</button>
+          </div>
+        )}
+        {operations.length === 0 ? <p className="muted-note">{opQ ? '无匹配记录' : '暂无运营信息,填写上方表单沉淀第一条。'}</p> : (
+          <div className="table-wrap">
+            <table>
+              <thead><tr><th>期间</th><th>记录日期</th><th>运营信息</th><th>记录人</th><th>操作</th></tr></thead>
+              <tbody>
+                {operations.map((r) => (
+                  <tr key={r.op_id}>
+                    <td>{r.period_label}</td>
+                    <td>{r.recorded_on ? String(r.recorded_on).slice(0, 10) : '—'}</td>
+                    <td style={{ whiteSpace: 'pre-wrap' }}>{r.content}</td>
+                    <td>{r.created_by ?? '—'}</td>
+                    <td><button type="button" className="link-button eq-danger-link" disabled={!canWrite} onClick={() => void removeOperation(r)}>删除</button></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
+
+      <section className="panel full-span motion-item" data-testid="pd-meetings">
+        <div className="pd-reports-head"><h3>三会情况(股东会/董事会/监事会)</h3></div>
+        {canWrite && (
+          <div className="pd-inline-form">
+            <select value={meetForm.meeting_kind} onChange={(e) => setMeetForm((f) => ({ ...f, meeting_kind: e.target.value }))} style={{ width: 110 }}>
+              {['股东会', '董事会', '监事会'].map((k) => <option key={k} value={k}>{k}</option>)}
+            </select>
+            <input type="date" value={meetForm.held_on} onChange={(e) => setMeetForm((f) => ({ ...f, held_on: e.target.value }))} style={{ width: 150 }} />
+            <input value={meetForm.topic} onChange={(e) => setMeetForm((f) => ({ ...f, topic: e.target.value }))} placeholder="会议议案 / 决议主题" style={{ flex: 1 }} />
+            <select value={meetForm.document_id} onChange={(e) => setMeetForm((f) => ({ ...f, document_id: e.target.value }))} style={{ width: 220 }} aria-label="关联决议文件">
+              <option value="">关联决议文件(选填)</option>
+              {documents.map((d) => <option key={d.document_id} value={String(d.document_id)}>{d.doc_kind} · {d.filename}</option>)}
+            </select>
+            <button type="button" className="primary-button" disabled={meetSaving} onClick={() => void addMeeting()}><Plus size={14} /> 新增</button>
+          </div>
+        )}
+        {meetings.length === 0 ? <p className="muted-note">暂无三会记录;决议文件请先在下方「文档存档」上传后关联。</p> : (
+          <div className="table-wrap">
+            <table>
+              <thead><tr><th>类型</th><th>召开时间</th><th>议案/主题</th><th>决议文件</th><th>操作</th></tr></thead>
+              <tbody>
+                {meetings.map((m) => (
+                  <tr key={m.meeting_id}>
+                    <td><span className="eq-tag tone-teal">{m.meeting_kind}</span></td>
+                    <td>{m.held_on ? String(m.held_on).slice(0, 10) : '—'}</td>
+                    <td>{m.topic ?? '—'}</td>
+                    <td>
+                      {m.document_id && m.document_name ? (
+                        <button type="button" className="link-button" onClick={() => void apiDownload(`/api/postdata/documents/${m.document_id}/download`, m.document_name ?? 'file')}>
+                          <Paperclip size={13} /> {m.document_name}
+                        </button>
+                      ) : '—'}
+                    </td>
+                    <td><button type="button" className="link-button eq-danger-link" disabled={!canWrite} onClick={() => void removeMeeting(m)}>删除</button></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
+
+      <section className="panel full-span motion-item" data-testid="pd-documents">
+        <div className="pd-reports-head">
+          <h3>文档存档(财务报表 / 经营情况分析 / 三会决议议案)</h3>
+          {canWrite && (
+            <div className="pd-inline-form" style={{ margin: 0 }}>
+              <select value={docKind} onChange={(e) => setDocKind(e.target.value)} style={{ width: 150 }} aria-label="文档类型">
+                {DOC_KINDS.map((k) => <option key={k} value={k}>{k}</option>)}
+              </select>
+              <button type="button" className="primary-button" disabled={uploading} onClick={() => docFileRef.current?.click()}>
+                <Paperclip size={14} /> {uploading ? '上传中…' : '上传文档'}
+              </button>
+              <input ref={docFileRef} type="file" hidden onChange={(e) => { const f = e.target.files?.[0]; if (f) void uploadDoc(f); e.target.value = '' }} />
+            </div>
+          )}
+        </div>
+        {documents.length === 0 ? <p className="muted-note">暂无归档文档。</p> : (
+          <div className="table-wrap">
+            <table>
+              <thead><tr><th>类型</th><th>文件名</th><th>大小</th><th>上传人</th><th>上传时间</th><th>操作</th></tr></thead>
+              <tbody>
+                {documents.map((d) => (
+                  <tr key={d.document_id}>
+                    <td><span className="eq-tag tone-gray">{d.doc_kind}</span></td>
+                    <td>{d.filename}</td>
+                    <td>{fmtSize(d.size_bytes)}</td>
+                    <td>{d.uploaded_by ?? '—'}</td>
+                    <td>{d.created_at ? String(d.created_at).replace('T', ' ').slice(0, 16) : '—'}</td>
+                    <td className="eq-row-actions">
+                      <button type="button" className="link-button" onClick={() => void downloadDoc(d)}>下载</button>
+                      <span className="eq-action-sep">|</span>
+                      <button type="button" className="link-button eq-danger-link" disabled={!canWrite} onClick={() => void removeDoc(d)}>删除</button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
+    </>
+  )
+}
+
+// issue #25(用户反馈 #20):投后预警 v1 —— 规则由后端实时计算:
+// 填报逾期 / 财务恶化(净利润为负、营收环比大跌)/ 三会逾期 / 决议文件缺失。
+function PostAlertsPage({ onToast }: { onToast: (toast: Toast) => void }) {
+  type Alert = { project_id: number; project_name: string; alert_kind: string; level: string; message: string }
+  const [alerts, setAlerts] = useState<Alert[] | null>(null)
+  const [kindFilter, setKindFilter] = useState('全部')
+  const [reloadKey, setReloadKey] = useState(0)
+  useEffect(() => {
+    let ignore = false
+    apiGet<{ items: Alert[] }>('/api/postdata/alerts')
+      .then((r) => { if (!ignore) setAlerts(r.items ?? []) })
+      .catch(() => { if (!ignore) { setAlerts([]); onToast({ title: '预警加载失败', detail: '请稍后重试' }) } })
+    return () => { ignore = true }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reloadKey])
+
+  const KINDS = ['全部', '填报逾期', '财务恶化', '三会逾期', '决议文件缺失']
+  const rows = (alerts ?? []).filter((a) => kindFilter === '全部' || a.alert_kind === kindFilter)
+  const countBy = (lv: string) => (alerts ?? []).filter((a) => a.level === lv).length
+  const levelTone: Record<string, string> = { 高: 'tone-red', 中: 'tone-orange', 低: 'tone-gray' }
+
+  return (
+    <div className="page-grid">
+      <section className="panel full-span motion-item" data-testid="post-alerts">
+        <PanelTitle icon={Bell} title="投后预警" />
+        <div className="alert-stat-row">
+          {(['高', '中', '低'] as const).map((lv) => (
+            <div key={lv} className={`alert-stat ${levelTone[lv]}`}>
+              <strong>{alerts == null ? '…' : countBy(lv)}</strong>
+              <span>{lv}级预警</span>
+            </div>
+          ))}
+          <button type="button" className="secondary-button" onClick={() => setReloadKey((k) => k + 1)}>刷新</button>
+        </div>
+        <div className="segmented" style={{ marginBottom: 12 }}>
+          {KINDS.map((k) => (
+            <button key={k} type="button" className={classNames(kindFilter === k && 'is-selected')} onClick={() => setKindFilter(k)}>{k}</button>
+          ))}
+        </div>
+        {alerts == null ? <p className="muted-note">规则计算中…</p> : rows.length === 0 ? (
+          <p className="muted-note">当前无{kindFilter === '全部' ? '' : `「${kindFilter}」`}预警,投后运行平稳。</p>
+        ) : (
+          <div className="table-wrap">
+            <table>
+              <thead><tr><th>级别</th><th>类型</th><th>项目</th><th>预警内容</th><th>操作</th></tr></thead>
+              <tbody>
+                {rows.map((a, i) => (
+                  <tr key={i}>
+                    <td><span className={`eq-tag ${levelTone[a.level] ?? 'tone-gray'}`}>{a.level}</span></td>
+                    <td>{a.alert_kind}</td>
+                    <td>{a.project_name}</td>
+                    <td>{a.message}</td>
+                    <td>
+                      <button type="button" className="link-button" onClick={() => goToEntity('post-data-collection', a.project_id)}>
+                        去处理
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+        <p className="muted-note" style={{ marginTop: 10 }}>
+          规则 v1:① 存在待填报期间(邮件发出超 14 天升「高」);② 最新已填报期净利润为负 /
+          营收环比下滑超 30%;③ 最近一次三会超 180 天或无记录;④ 三会记录未关联决议文件。规则口径欢迎在共创反馈里提。
+        </p>
+      </section>
     </div>
   )
 }
@@ -4047,7 +4486,12 @@ function ExternalFillPage() {
   const token = (window.location.hash.split('?')[1] ?? '').split('&').map((kv) => kv.split('=')).find(([k]) => k === 'token')?.[1] ?? ''
   const [data, setData] = useState<{ project_name: string; collector_name: string | null; reports: PostdataReport[] } | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const [values, setValues] = useState<Record<number, { total_assets: string; net_assets: string; revenue: string; net_profit: string }>>({})
+  // issue #24:外部填报同步补齐八项关键财务指标
+  const EXT_FIELDS = [
+    ['revenue', '营业收入'], ['operating_cost', '营业成本'], ['expense_three', '三费'], ['net_profit', '净利润'],
+    ['operating_cash_flow', '经营性现金流净额'], ['total_assets', '总资产'], ['total_liabilities', '总负债'], ['net_assets', '净资产'],
+  ] as const
+  const [values, setValues] = useState<Record<number, Record<string, string>>>({})
   const [submitting, setSubmitting] = useState(false)
   const [done, setDone] = useState(false)
 
@@ -4066,9 +4510,9 @@ function ExternalFillPage() {
     const entries = pending
       .map((r) => {
         const v = values[r.report_id]
-        if (!v || ![v.total_assets, v.net_assets, v.revenue, v.net_profit].some((s) => s.trim() !== '')) return null
-        const num = (s: string) => { const n = Number(s); return s.trim() === '' || Number.isNaN(n) ? null : n }
-        return { report_id: r.report_id, total_assets: num(v.total_assets), net_assets: num(v.net_assets), revenue: num(v.revenue), net_profit: num(v.net_profit) }
+        if (!v || !EXT_FIELDS.some(([k]) => (v[k] ?? '').trim() !== '')) return null
+        const num = (s: string | undefined) => { const n = Number(s); return !s || s.trim() === '' || Number.isNaN(n) ? null : n }
+        return { report_id: r.report_id, ...Object.fromEntries(EXT_FIELDS.map(([k]) => [k, num(v[k])])) }
       })
       .filter(Boolean)
     if (!entries.length) { setError('请至少填写一期数据'); return }
@@ -4089,10 +4533,7 @@ function ExternalFillPage() {
   }
 
   const setV = (id: number, key: string, val: string) =>
-    setValues((prev) => {
-      const cur = prev[id] ?? { total_assets: '', net_assets: '', revenue: '', net_profit: '' }
-      return { ...prev, [id]: { ...cur, [key]: val } }
-    })
+    setValues((prev) => ({ ...prev, [id]: { ...(prev[id] ?? {}), [key]: val } }))
 
   return (
     <div className="external-fill-shell" data-testid="external-fill">
@@ -4114,14 +4555,14 @@ function ExternalFillPage() {
               <div className="table-wrap">
                 <table>
                   <thead>
-                    <tr><th>所填年份</th><th>所填季度</th><th>总资产(万)</th><th>净资产(万)</th><th>营业收入(万)</th><th>净利润(万)</th></tr>
+                    <tr><th>所填年份</th><th>所填季度</th>{EXT_FIELDS.map(([, label]) => <th key={label}>{label}(万)</th>)}</tr>
                   </thead>
                   <tbody>
                     {pending.map((r) => (
                       <tr key={r.report_id}>
                         <td>{r.fill_year}</td>
                         <td>{r.fill_period}</td>
-                        {(['total_assets', 'net_assets', 'revenue', 'net_profit'] as const).map((k) => (
+                        {EXT_FIELDS.map(([k, label]) => (
                           <td key={k}>
                             <input
                               type="number"
@@ -4129,7 +4570,7 @@ function ExternalFillPage() {
                               className="external-fill-input"
                               value={values[r.report_id]?.[k] ?? ''}
                               onChange={(e) => setV(r.report_id, k, e.target.value)}
-                              aria-label={`${r.fill_year} ${r.fill_period} ${k}`}
+                              aria-label={`${r.fill_year} ${r.fill_period} ${label}`}
                             />
                           </td>
                         ))}
@@ -4145,13 +4586,13 @@ function ExternalFillPage() {
                 <div className="table-wrap">
                   <table>
                     <thead>
-                      <tr><th>所填年份</th><th>所填季度</th><th>总资产</th><th>净资产</th><th>营业收入</th><th>净利润</th></tr>
+                      <tr><th>所填年份</th><th>所填季度</th>{EXT_FIELDS.map(([, label]) => <th key={label}>{label}</th>)}</tr>
                     </thead>
                     <tbody>
                       {filledRows.map((r) => (
                         <tr key={r.report_id}>
                           <td>{r.fill_year}</td><td>{r.fill_period}</td>
-                          <td>{pdWan(r.total_assets)}</td><td>{pdWan(r.net_assets)}</td><td>{pdWan(r.revenue)}</td><td>{pdWan(r.net_profit)}</td>
+                          {EXT_FIELDS.map(([k]) => <td key={k}>{pdWan((r as unknown as Record<string, unknown>)[k])}</td>)}
                         </tr>
                       ))}
                     </tbody>
@@ -4886,11 +5327,12 @@ function DetailPage({
   )
 }
 
-// 投资人详情:同构页(选择器 + 卡片 + section:出资承诺/联系人/触点记录,全真数据)。
-function InvestorDetailPage({ canWrite, onToast }: { canWrite: boolean; onToast: (t: Toast) => void }) {
+// 投资人详情:同构页(选择器 + 卡片 + 投资汇总 + section:签约基金/现金流/联系人/触点记录,全真数据)。
+// fixedId:从投资人列表行点击以抽屉打开时锁定实体(issue #30)。
+function InvestorDetailPage({ canWrite, onToast, fixedId }: { canWrite: boolean; onToast: (t: Toast) => void; fixedId?: number }) {
   void canWrite; void onToast
   const [entities, setEntities] = useState<Array<Record<string, unknown>>>([])
-  const [selectedId, setSelectedId] = useState<number | null>(() => readRouteId())
+  const [selectedId, setSelectedId] = useState<number | null>(() => fixedId ?? readRouteId())
   const [detail, setDetail] = useState<Record<string, unknown>>({})
   const [section, setSection] = useState<string>('概况')
   const [rows, setRows] = useState<DataRow[]>([])
@@ -4905,6 +5347,19 @@ function InvestorDetailPage({ canWrite, onToast }: { canWrite: boolean; onToast:
     if (selectedId == null) return
     let ignore = false
     apiGet<Record<string, unknown>>(`/api/investors/${selectedId}`).then((d) => { if (!ignore) setDetail(d) }).catch(() => undefined)
+    return () => { ignore = true }
+  }, [selectedId])
+  // 投资汇总 + 签约基金(issue #30,对齐参考系统「投资人详情」)
+  interface InvestorProfile {
+    summary: Record<string, number>
+    funds: Array<Record<string, unknown>>
+  }
+  const [profile, setProfile] = useState<InvestorProfile | null>(null)
+  useEffect(() => {
+    if (selectedId == null) return
+    let ignore = false
+    setProfile(null)
+    apiGet<InvestorProfile>(`/api/investors/${selectedId}/profile`).then((p) => { if (!ignore) setProfile(p) }).catch(() => undefined)
     return () => { ignore = true }
   }, [selectedId])
   useEffect(() => {
@@ -4929,14 +5384,16 @@ function InvestorDetailPage({ canWrite, onToast }: { canWrite: boolean; onToast:
           <h2>{name}</h2>
           <p>真实主档:选择投资人后加载出资承诺、联系人、触点记录(租户内)。</p>
         </div>
-        <div className="detail-actions">
-          <label className="detail-picker">
-            <span>选择投资人</span>
-            <select value={selectedId ?? ''} onChange={(e) => setSelectedId(Number(e.target.value))} data-testid="investor-picker">
-              {entities.map((e) => <option key={String(e.id)} value={String(e.id)}>{String(e.name)}</option>)}
-            </select>
-          </label>
-        </div>
+        {fixedId == null && (
+          <div className="detail-actions">
+            <label className="detail-picker">
+              <span>选择投资人</span>
+              <select value={selectedId ?? ''} onChange={(e) => setSelectedId(Number(e.target.value))} data-testid="investor-picker">
+                {entities.map((e) => <option key={String(e.id)} value={String(e.id)}>{String(e.name)}</option>)}
+              </select>
+            </label>
+          </div>
+        )}
       </section>
 
       <section className="panel full-span motion-item section-tabbar">
@@ -4948,19 +5405,60 @@ function InvestorDetailPage({ canWrite, onToast }: { canWrite: boolean; onToast:
       </section>
 
       {section === '概况' ? (
-        <section className="panel full-span motion-item">
-          <PanelTitle icon={User} title="投资人卡片" />
-          <div className="project-card-grid" data-testid="investor-card">
-            <div><span>名称</span><strong>{name}</strong></div>
-            <div><span>类型</span><strong>{INVESTOR_KIND_CN[String(detail.investor_kind)] ?? String(detail.investor_kind ?? '—')}</strong></div>
-            <div><span>合格状态</span><strong><StatusBadge value={QUAL_CN[String(detail.qualification_status)] ?? String(detail.qualification_status ?? '—')} /></strong></div>
-            <div><span>风险等级</span><strong>{RISK_RATING_CN[String(detail.risk_rating)] ?? String(detail.risk_rating ?? '—')}</strong></div>
-            <div><span>城市</span><strong>{String(detail.city ?? '—')}</strong></div>
-            <div><span>披露状态</span><strong>{DISCLOSURE_CN[String(detail.disclosure_status)] ?? String(detail.disclosure_status ?? '—')}</strong></div>
-            <div><span>负责人</span><strong>{String(detail.owner ?? '—')}</strong></div>
-            <div><span>编号</span><strong>{String(detail.investor_code ?? '—')}</strong></div>
-          </div>
-          {detail.notes ? <p className="muted-note" style={{ marginTop: 12 }}>备注:{String(detail.notes)}</p> : null}
+        <>
+          <section className="panel full-span motion-item">
+            <PanelTitle icon={User} title="投资人卡片" />
+            <div className="project-card-grid" data-testid="investor-card">
+              <div><span>投资人简称</span><strong>{name}</strong></div>
+              <div><span>投资人全称</span><strong>{String(detail.legal_name ?? name)}</strong></div>
+              <div><span>投资人类别</span><strong>{INVESTOR_KIND_CN[String(detail.investor_kind)] ?? String(detail.investor_kind ?? '—')}</strong></div>
+              <div><span>投资人分类</span><strong>{String(detail.investor_category ?? '—')}</strong></div>
+              <div><span>合格状态</span><strong><StatusBadge value={QUAL_CN[String(detail.qualification_status)] ?? String(detail.qualification_status ?? '—')} /></strong></div>
+              <div><span>风险等级</span><strong>{RISK_RATING_CN[String(detail.risk_rating)] ?? String(detail.risk_rating ?? '—')}</strong></div>
+              <div><span>城市</span><strong>{String(detail.city ?? '—')}</strong></div>
+              <div><span>披露状态</span><strong>{DISCLOSURE_CN[String(detail.disclosure_status)] ?? String(detail.disclosure_status ?? '—')}</strong></div>
+              <div><span>负责人</span><strong>{String(detail.owner ?? '—')}</strong></div>
+              <div><span>编号</span><strong>{String(detail.investor_code ?? '—')}</strong></div>
+            </div>
+            {detail.notes ? <p className="muted-note" style={{ marginTop: 12 }}>备注:{String(detail.notes)}</p> : null}
+          </section>
+          <section className="panel full-span motion-item">
+            <PanelTitle icon={Database} title="投资汇总" />
+            {profile == null ? <p className="muted-note">加载中…</p> : (
+              <div className="project-card-grid" data-testid="investor-summary">
+                <div><span>协议认缴总额</span><strong>{wan(profile.summary.committed_total)}</strong></div>
+                <div><span>已投基金</span><strong>{profile.summary.fund_count} 只</strong></div>
+                <div><span>累计缴款</span><strong>{wan(profile.summary.paid_in_total)}</strong></div>
+                <div><span>累计分配</span><strong>{wan(profile.summary.distributed_total)}</strong></div>
+                <div><span>其中:已分配本金</span><strong>{wan(profile.summary.distributed_principal)}</strong></div>
+                <div><span>其中:已分配收益</span><strong>{wan(profile.summary.distributed_gain)}</strong></div>
+                <div><span>剩余权益预估</span><strong>{wan(profile.summary.residual_estimate)}</strong></div>
+                <div><span>总体DPI</span><strong>{profile.summary.dpi}</strong></div>
+                <div><span>总体MOIC</span><strong>{profile.summary.moic}</strong></div>
+              </div>
+            )}
+          </section>
+        </>
+      ) : section === '签约基金' ? (
+        <section className="panel full-span motion-item" data-testid="investor-funds">
+          <PanelTitle icon={Database} title="签约基金" />
+          {profile == null ? <p className="muted-note">加载中…</p> : profile.funds.length === 0 ? <p className="muted-note">该投资人暂无签约基金。</p> : (
+            <DataTable
+              compact
+              rows={profile.funds.map((f) => ({
+                基金简称: String(f.fund_name ?? '—'),
+                合伙人类型: String(f.partner_type ?? '有限合伙人'),
+                签约日期: f.admission_date ? String(f.admission_date) : '—',
+                最新认缴金额: wan(_n(f.committed_amount)),
+                认缴占比: f.share_pct == null ? '—' : `${f.share_pct} %`,
+                累计缴款: wan(_n(f.paid_in_amount)),
+                DPI: String(f.dpi ?? 0),
+                MOIC: String(f.moic ?? 0),
+                剩余权益预估: wan(_n(f.residual_estimate)),
+                状态: String(f.status ?? '—'),
+              }))}
+            />
+          )}
         </section>
       ) : (
         <section className="panel full-span motion-item" data-testid="investor-section-data">
@@ -5141,6 +5639,33 @@ function FlowApplyModal({ def, onClose, onToast, onStarted }: {
   const [saving, setSaving] = useState(false)
   const set = (k: string, v: string) => setForm((f) => ({ ...f, [k]: v }))
 
+  // issue #28/#29:实体下拉接真实台账 —— 项目字段取项目列表,基金/出资主体字段取基金列表。
+  const PROJECT_FIELD = /^(项目名称|项目简称)$/
+  const FUND_FIELD = /^(基金简称|出资主体|投资主体|计划投资主体|基金管理人|普通合伙人|报销主体|付款主体|用章主体)$/
+  const [projectNames, setProjectNames] = useState<string[]>([])
+  const [fundNames, setFundNames] = useState<string[]>([])
+  useEffect(() => {
+    const wantsProject = def.fields.some((f) => f.kind === 'select' && PROJECT_FIELD.test(f.label))
+    const wantsFund = def.fields.some((f) => f.kind === 'select' && FUND_FIELD.test(f.label))
+    if (wantsProject) {
+      apiGet<{ items: Array<{ name?: string }> }>('/api/projects')
+        .then((r) => setProjectNames([...new Set((r.items ?? []).map((p) => String(p.name ?? '')).filter(Boolean))]))
+        .catch(() => setProjectNames([]))
+    }
+    if (wantsFund) {
+      apiGet<{ items: Array<{ name?: string }> }>('/api/funds')
+        .then((r) => setFundNames([...new Set((r.items ?? []).map((f) => String(f.name ?? '')).filter(Boolean))]))
+        .catch(() => setFundNames([]))
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [def.key])
+  const optionsFor = (f: FlowField): string[] => {
+    if (f.options && f.options.length) return f.options
+    if (PROJECT_FIELD.test(f.label)) return projectNames
+    if (FUND_FIELD.test(f.label)) return fundNames
+    return []
+  }
+
   const submit = async () => {
     const title = (form['标题'] || '').trim() || `${def.name}·${today}`
     setSaving(true)
@@ -5174,8 +5699,8 @@ function FlowApplyModal({ def, onClose, onToast, onStarted }: {
               {f.kind === 'select' ? (
                 <select value={form[f.label] ?? ''} onChange={(e) => set(f.label, e.target.value)}>
                   <option value="">请选择</option>
-                  {(f.options && f.options.length ? f.options : []).map((o) => <option key={o} value={o}>{o}</option>)}
-                  {(!f.options || !f.options.length) && form[f.label] && <option value={form[f.label]}>{form[f.label]}</option>}
+                  {optionsFor(f).map((o) => <option key={o} value={o}>{o}</option>)}
+                  {!optionsFor(f).length && form[f.label] && <option value={form[f.label]}>{form[f.label]}</option>}
                 </select>
               ) : f.kind === 'textarea' ? (
                 <textarea rows={3} value={form[f.label] ?? ''} onChange={(e) => set(f.label, e.target.value)} />
@@ -5943,7 +6468,7 @@ function ListPage({
   const fallbackRows = useMemo(() => listRows(screen.id), [screen.id])
   const [page, setPage] = useState(1)
   const [reloadKey, setReloadKey] = useState(0)
-  const [q, setQ] = useState('')
+  const [q, setQ] = useState(() => readRouteQuery('q')) // 看板阶段点击等入口经 ?q= 预置筛选(issue #27)
   // 明细抽屉:行点击从右侧滑出完整实体卡片(项目/基金),X 关闭回列表;带 ?id= 深链直接打开。
   const detailScreen = useMemo(() => (LIST_DETAIL_TARGET[screen.id] ? screens.find((s) => s.id === LIST_DETAIL_TARGET[screen.id]) ?? null : null), [screen.id])
   const [drawerId, setDrawerId] = useState<number | null>(() => (LIST_DETAIL_TARGET[screen.id] ? readRouteId() : null))
@@ -5958,7 +6483,7 @@ function ListPage({
     return () => window.removeEventListener('keydown', onKey)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [drawerId])
-  useEffect(() => { setPage(1); setQ(''); setDrawerId(LIST_DETAIL_TARGET[screen.id] ? readRouteId() : null) }, [screen.id]) // 换屏回到第一页 + 清搜索
+  useEffect(() => { setPage(1); setQ(readRouteQuery('q')); setDrawerId(LIST_DETAIL_TARGET[screen.id] ? readRouteId() : null) }, [screen.id]) // 换屏回到第一页;搜索从 ?q= 预置(无则清空)
   useEffect(() => {
     // 同屏深链(#/project-list?id=N 只变 query 不换屏)也要能拉开抽屉。
     if (!LIST_DETAIL_TARGET[screen.id]) return
@@ -5987,7 +6512,7 @@ function ListPage({
       <section className="panel full-span motion-item">
         <PanelTitle icon={ListIcon(screen.id)} title={`${screen.title}台账`} />
         <DataSourceBadge source={source} />
-        <ListControls canWrite={canWrite} onToast={onToast} screen={screen} onImported={() => { setPage(1); setReloadKey((k) => k + 1) }} onSearch={(kw) => { setPage(1); setQ(kw) }} />
+        <ListControls canWrite={canWrite} onToast={onToast} screen={screen} initialKw={q} onImported={() => { setPage(1); setReloadKey((k) => k + 1) }} onSearch={(kw) => { setPage(1); setQ(kw) }} />
         <DataTable
           rows={rows}
           storageKey={screen.id}
@@ -6031,13 +6556,15 @@ function ListPage({
         <div className="entity-drawer-backdrop" onClick={closeDrawer} data-testid="entity-drawer">
           <div className="entity-drawer" onClick={(e) => e.stopPropagation()} role="dialog" aria-label={`${screen.title}明细`}>
             <div className="entity-drawer-head">
-              <strong>{screen.id === 'fund-list' ? '基金明细' : '项目明细'}</strong>
+              <strong>{screen.id === 'fund-list' ? '基金明细' : screen.id === 'investor-list' ? '投资人详情' : '项目明细'}</strong>
               <button type="button" className="icon-button" aria-label="关闭明细" onClick={closeDrawer} data-testid="entity-drawer-close">
                 <X size={18} />
               </button>
             </div>
             <div className="entity-drawer-body">
-              <DetailPage screen={detailScreen} canWrite={canWrite} onToast={onToast} fixedId={drawerId} />
+              {screen.id === 'investor-list'
+                ? <InvestorDetailPage canWrite={canWrite} onToast={onToast} fixedId={drawerId} />
+                : <DetailPage screen={detailScreen} canWrite={canWrite} onToast={onToast} fixedId={drawerId} />}
             </div>
           </div>
         </div>
@@ -6052,15 +6579,20 @@ function ListControls({
   onToast,
   onImported,
   onSearch,
+  initialKw,
 }: {
   screen: Screen
   canWrite: boolean
   onToast: (toast: Toast) => void
   onImported?: () => void
   onSearch?: (q: string) => void
+  initialKw?: string
 }) {
   const fileRef = useRef<HTMLInputElement>(null)
-  const [kw, setKw] = useState('')
+  const [kw, setKw] = useState(initialKw ?? '')
+  useEffect(() => { setKw(initialKw ?? '') }, [initialKw]) // ?q= 深链预置(issue #27)与外部清空保持同步
+  // issue #31:投资人列表的「新增投资人」走真实弹框(而非占位主操作)
+  const [showInvestorCreate, setShowInvestorCreate] = useState(false)
   const canImport = screen.id === 'project-list' || screen.id === 'project-board' // 导入目前落到项目表
   // 新增按钮跳转到对应的独立新建页(反馈 issue #11)。
   const addTarget = ({ 'project-list': 'project-add', 'project-board': 'project-add', 'fund-list': 'fund-add' } as Record<string, string>)[screen.id]
@@ -6151,7 +6683,103 @@ function ListControls({
           {screen.id === 'fund-list' ? '新增基金' : '新增项目'}
         </button>
       )}
+      {screen.id === 'investor-list' && (
+        <button
+          className="primary-button"
+          type="button"
+          disabled={!canWrite}
+          onClick={() => setShowInvestorCreate(true)}
+          data-testid="list-add-investor"
+        >
+          <Plus size={16} />
+          新增投资人
+        </button>
+      )}
+      {showInvestorCreate && (
+        <InvestorCreateModal
+          onClose={() => setShowInvestorCreate(false)}
+          onToast={onToast}
+          onCreated={() => { setShowInvestorCreate(false); onImported?.() }}
+        />
+      )}
       {/* 「批量操作」原为只发审计不干实事的占位钮 → 移除(台账勾选行后有真实「批量删除」)。 */}
+    </div>
+  )
+}
+
+// issue #31:新增投资人弹框 —— 字段对齐参考系统「投资人详情」附件(简称/全称/类别/分类/风险评级/城市/备注)。
+function InvestorCreateModal({ onClose, onToast, onCreated }: { onClose: () => void; onToast: (t: Toast) => void; onCreated: () => void }) {
+  const [form, setForm] = useState({
+    investor_name: '', legal_name: '', investor_kind: 'institution',
+    investor_category: '境内法人机构(公司等)', risk_rating: 'professional', city: '', notes: '',
+  })
+  const [saving, setSaving] = useState(false)
+  const set = (k: keyof typeof form, v: string) => setForm((f) => ({ ...f, [k]: v }))
+  const CATEGORY_OPTIONS = ['境内法人机构(公司等)', '境内自然人', '境外法人机构', '境外自然人', '产品/资管计划', '其他']
+  const KIND_OPTIONS: Array<[string, string]> = [
+    ['institution', '机构'], ['corporate', '企业'], ['fof', '母基金'],
+    ['government_guidance', '政府引导基金'], ['family_office', '家族办公室'], ['individual', '个人'], ['other', '其他'],
+  ]
+  const RISK_OPTIONS: Array<[string, string]> = [
+    ['professional', '专业投资者'], ['growth', '进取'], ['balanced', '平衡'], ['conservative', '保守'],
+  ]
+  const submit = async () => {
+    if (!form.investor_name.trim()) { onToast({ title: '请填写投资人简称', detail: '该字段必填' }); return }
+    setSaving(true)
+    try {
+      const result = await apiPost('/api/investors', {
+        investor_name: form.investor_name.trim(),
+        legal_name: form.legal_name.trim() || undefined,
+        investor_kind: form.investor_kind,
+        investor_category: form.investor_category || undefined,
+        risk_rating: form.risk_rating,
+        city: form.city.trim() || undefined,
+        notes: form.notes.trim() || undefined,
+      })
+      onToast({ title: `投资人「${form.investor_name.trim()}」已创建`, detail: auditDetail(result), action: 'investor.create', entity: 'cap_investors', result })
+      onCreated()
+    } catch (error) {
+      onToast({ title: '新增投资人失败', detail: error instanceof Error ? error.message : 'API 调用失败' })
+    } finally {
+      setSaving(false)
+    }
+  }
+  return (
+    <div className="eq-modal-backdrop" onClick={onClose} data-testid="investor-create-modal">
+      <div className="eq-modal" onClick={(e) => e.stopPropagation()}>
+        <div className="eq-modal-head">
+          <h3>新增投资人</h3>
+          <button type="button" className="icon-button" aria-label="关闭" onClick={onClose}><X size={18} /></button>
+        </div>
+        <div className="form-grid">
+          <label><span>投资人简称 *</span><input value={form.investor_name} onChange={(e) => set('investor_name', e.target.value)} placeholder="如:JT-A" /></label>
+          <label><span>投资人全称</span><input value={form.legal_name} onChange={(e) => set('legal_name', e.target.value)} placeholder="不填则与简称一致" /></label>
+          <label>
+            <span>投资人类别</span>
+            <select value={form.investor_kind} onChange={(e) => set('investor_kind', e.target.value)}>
+              {KIND_OPTIONS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+            </select>
+          </label>
+          <label>
+            <span>投资人分类</span>
+            <select value={form.investor_category} onChange={(e) => set('investor_category', e.target.value)}>
+              {CATEGORY_OPTIONS.map((o) => <option key={o} value={o}>{o}</option>)}
+            </select>
+          </label>
+          <label>
+            <span>风险评级</span>
+            <select value={form.risk_rating} onChange={(e) => set('risk_rating', e.target.value)}>
+              {RISK_OPTIONS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+            </select>
+          </label>
+          <label><span>城市</span><input value={form.city} onChange={(e) => set('city', e.target.value)} /></label>
+          <label className="span-2"><span>备注</span><textarea rows={3} value={form.notes} onChange={(e) => set('notes', e.target.value)} /></label>
+        </div>
+        <div className="button-row eq-modal-actions">
+          <button type="button" className="secondary-button" onClick={onClose}>取消</button>
+          <button type="button" className="primary-button" disabled={saving} onClick={submit}>{saving ? '提交中…' : '提交'}</button>
+        </div>
+      </div>
     </div>
   )
 }

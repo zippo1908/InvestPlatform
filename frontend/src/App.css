@@ -2393,3 +2393,51 @@ tbody tr:hover {
   -webkit-backdrop-filter: blur(10px);
   box-shadow: 0 20px 50px rgba(13, 78, 68, 0.12);
 }
+
+/* issue #27:看板阶段标题可点击进入按阶段过滤的项目列表 */
+.kanban-stage-link {
+  border: none;
+  background: none;
+  padding: 0;
+  cursor: pointer;
+  color: inherit;
+  font: inherit;
+}
+.kanban-stage-link:hover strong {
+  text-decoration: underline;
+  color: var(--brand-strong, #0d4e44);
+}
+
+/* issue #32:新增投资记录弹框——原币金额+币种并排 */
+.eq-currency-row { display: flex; gap: 6px; }
+.eq-currency-row input { flex: 1; min-width: 0; }
+.eq-currency-row select { width: 110px; flex: none; }
+
+/* issue #24/#26:投后扩展块内联表单 */
+.pd-inline-form {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin: 10px 0 14px;
+}
+.pd-inline-form input,
+.pd-inline-form select {
+  padding: 7px 10px;
+  border: 1px solid var(--line, #dbe5e1);
+  border-radius: 8px;
+  font-size: 13px;
+}
+
+/* issue #25:投后预警 */
+.eq-tag.tone-red { background: #dc2626; }
+.alert-stat-row { display: flex; gap: 12px; align-items: center; margin: 10px 0 14px; flex-wrap: wrap; }
+.alert-stat {
+  display: flex; flex-direction: column; align-items: center; min-width: 90px;
+  padding: 10px 16px; border-radius: 10px; background: #f6f8f7; border: 1px solid #e3ebe8;
+}
+.alert-stat strong { font-size: 22px; line-height: 1.2; }
+.alert-stat span { font-size: 12px; color: #667085; }
+.alert-stat.tone-red strong { color: #dc2626; }
+.alert-stat.tone-orange strong { color: #d97706; }
+.alert-stat.tone-gray strong { color: #64748b; }

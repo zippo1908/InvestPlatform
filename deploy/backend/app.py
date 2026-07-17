@@ -231,14 +231,34 @@ class PostdataCollectionPayload(BaseModel):
 
 
 class PostdataReportPayload(BaseModel):
-    """填报数据行:金额单位为「万」,按参照系统直接存输入值。"""
+    """填报数据行:金额单位为「万」,按参照系统直接存输入值。
+    issue #24:补齐八项关键财务指标(+营业成本/三费/经营性现金流净额/总负债)。"""
     fill_year: str | None = Field(default=None, max_length=10)
     fill_period: str | None = Field(default=None, max_length=20)  # 年度/半年度/一季度/…
     fill_status: str | None = Field(default=None, max_length=20)  # 待填报/已填报
     total_assets: float | None = None
+    total_liabilities: float | None = None
     net_assets: float | None = None
     revenue: float | None = None
+    operating_cost: float | None = None
+    expense_three: float | None = None
     net_profit: float | None = None
+    operating_cash_flow: float | None = None
+
+
+class PostdataOperationPayload(BaseModel):
+    """运营信息(issue #24 ②):按期间沉淀,保留历史可检索。"""
+    period_label: str = Field(min_length=1, max_length=40)
+    content: str = Field(min_length=1, max_length=5000)
+    recorded_on: str | None = None  # YYYY-MM-DD
+
+
+class PostdataMeetingPayload(BaseModel):
+    """三会情况(issue #24 ④):股东会/董事会/监事会,决议文件关联投后文档。"""
+    meeting_kind: str = Field(min_length=1, max_length=20)
+    held_on: str | None = None
+    topic: str | None = Field(default=None, max_length=300)
+    document_id: int | None = None
 
 
 class PostdataBatchPayload(BaseModel):
@@ -248,9 +268,13 @@ class PostdataBatchPayload(BaseModel):
 class ExternalFillEntry(BaseModel):
     report_id: int
     total_assets: float | None = None
+    total_liabilities: float | None = None
     net_assets: float | None = None
     revenue: float | None = None
+    operating_cost: float | None = None
+    expense_three: float | None = None
     net_profit: float | None = None
+    operating_cash_flow: float | None = None
 
 
 class ExternalFillPayload(BaseModel):
@@ -287,6 +311,12 @@ class EquityChangePayload(BaseModel):
     post_money_ratio: float | None = None
     co_investors: str | None = Field(default=None, max_length=300)
     notes: str | None = Field(default=None, max_length=2000)
+    # issue #32(用户反馈 #27):基金持有项目估值(原币/币种/人民币)、历史投资方、暂存草稿
+    valuation_original: float | None = None
+    valuation_currency: str | None = Field(default=None, max_length=16)
+    valuation_cny: float | None = None
+    historical_investors: str | None = Field(default=None, max_length=2000)
+    is_draft: bool | None = None
 
 
 class CreateUserPayload(BaseModel):
@@ -486,12 +516,28 @@ LEDGER_QUERIES: dict[str, str] = {
         ORDER BY e.equity_change_id DESC
         """,
     "investor-list": """
-        SELECT investor_name AS '投资人', investor_kind AS '类型', qualification_status AS '适当性',
-               risk_rating AS '风险评级', city AS '城市', disclosure_status AS '披露状态',
-               updated_at AS '更新时间'
-        FROM cap_investors
-        WHERE deleted_at IS NULL AND tenant_id=%s
-        ORDER BY investor_id DESC
+        SELECT i.investor_id AS '__id', i.investor_name AS '投资人',
+               i.legal_name AS '投资人全称', i.investor_kind AS '类别',
+               ROUND(COALESCE(cm.committed, 0) / 10000, 1) AS '认缴总额(万)',
+               ROUND(COALESCE(cm.paid_in, 0) / 10000, 1) AS '累计缴款(万)',
+               ROUND(COALESCE(cf.distributed, 0) / 10000, 1) AS '累计分配(万)',
+               CASE WHEN COALESCE(cm.paid_in, 0) > 0
+                    THEN ROUND(COALESCE(cf.distributed, 0) / cm.paid_in, 2) ELSE 0 END AS 'DPI',
+               COALESCE(cm.fund_count, 0) AS '签约基金数',
+               i.disclosure_status AS '披露状态', i.updated_at AS '更新时间'
+        FROM cap_investors i
+        LEFT JOIN (
+            SELECT investor_id, SUM(committed_amount) AS committed,
+                   SUM(paid_in_amount) AS paid_in, COUNT(*) AS fund_count
+            FROM cap_fund_commitments WHERE deleted_at IS NULL GROUP BY investor_id
+        ) cm ON cm.investor_id = i.investor_id
+        LEFT JOIN (
+            SELECT investor_id,
+                   SUM(CASE WHEN cashflow_kind = 'investor_distribution' THEN amount ELSE 0 END) AS distributed
+            FROM cap_cashflows WHERE deleted_at IS NULL GROUP BY investor_id
+        ) cf ON cf.investor_id = i.investor_id
+        WHERE i.deleted_at IS NULL AND i.tenant_id=%s
+        ORDER BY i.investor_id DESC
         """,
     "manager-orgs": """
         SELECT org_name AS '机构名称', org_kind AS '类型', city AS '城市',
@@ -583,11 +629,26 @@ FUND_STATUS_CN: dict[str, str] = {
 POSITION_STATUS_CN: dict[str, str] = {
     "funded": "已出资", "committed": "已认缴", "exited": "已退出", "writeoff": "已减记",
 }
+INVESTOR_KIND_CN: dict[str, str] = {
+    "institution": "机构", "individual": "个人", "fof": "母基金",
+    "government_guidance": "政府引导基金", "corporate": "企业", "family_office": "家族办公室", "other": "其他",
+}
+DISCLOSURE_STATUS_CN: dict[str, str] = {
+    "not_started": "未开始", "scheduled": "已排期", "sent": "已发送", "viewed": "已查看", "confirmed": "已确认",
+}
+COMMIT_STATUS_CN: dict[str, str] = {
+    "draft": "草拟", "signed": "已签约", "active": "存续", "defaulted": "违约", "transferred": "已转让", "redeemed": "已赎回",
+}
+CASHFLOW_KIND_CN: dict[str, str] = {
+    "investor_call": "缴款", "investor_distribution": "分配", "project_investment": "项目投资",
+    "project_return": "项目回款", "management_fee": "管理费", "operating_expense": "运营支出", "other": "其他",
+}
 # 屏 → 需要翻译的列及其枚举表
 LEDGER_ENUM_COLS: dict[str, dict[str, dict[str, str]]] = {
     "project-list": {"状态": OPP_STATUS_CN, "阶段": STAGE_LABEL_CN},
     "fund-list": {"状态": FUND_STATUS_CN},
     "investment-info": {"状态": POSITION_STATUS_CN},
+    "investor-list": {"类别": INVESTOR_KIND_CN, "披露状态": DISCLOSURE_STATUS_CN},
 }
 
 
@@ -1678,9 +1739,9 @@ def get_investor(investor_id: int, user: AuthedUser = Depends(current_user)) -> 
     try:
         with connection.cursor() as cursor:
             cursor.execute(
-                """SELECT i.investor_id AS id, i.investor_name, i.investor_code, i.investor_kind,
-                          i.qualification_status, i.risk_rating, i.city, i.country_code, i.disclosure_status,
-                          i.notes, u.display_name AS owner, i.updated_at
+                """SELECT i.investor_id AS id, i.investor_name, i.legal_name, i.investor_code, i.investor_kind,
+                          i.investor_category, i.qualification_status, i.risk_rating, i.city, i.country_code,
+                          i.disclosure_status, i.notes, u.display_name AS owner, i.updated_at
                    FROM cap_investors i LEFT JOIN cap_users u ON u.user_id=i.owner_user_id
                    WHERE i.investor_id=%s AND i.tenant_id=%s AND i.deleted_at IS NULL""",
                 (investor_id, tid),
@@ -1730,6 +1791,163 @@ def investor_contacts(investor_id: int, user: AuthedUser = Depends(current_user)
     finally:
         connection.close()
     return {"count": len(rows), "items": rows}
+
+
+class CreateInvestorPayload(BaseModel):
+    """新增投资人(issue #26/GitHub #31):字段对齐参考系统「投资人详情」附件。"""
+
+    investor_name: str = Field(min_length=1, max_length=180)
+    legal_name: str | None = Field(default=None, max_length=200)
+    investor_kind: str = Field(default="institution", max_length=32)
+    investor_category: str | None = Field(default=None, max_length=64)
+    risk_rating: str = Field(default="professional", max_length=32)
+    city: str | None = Field(default=None, max_length=80)
+    notes: str | None = Field(default=None, max_length=2000)
+
+
+@app.post("/api/investors")
+def create_investor(
+    payload: CreateInvestorPayload,
+    user: AuthedUser = Depends(require_roles("system_admin", "managing_partner", "fund_operator")),
+) -> dict[str, Any]:
+    if payload.investor_kind not in INVESTOR_KIND_CN:
+        raise HTTPException(status_code=422, detail="invalid investor_kind")
+    if payload.risk_rating not in {"conservative", "balanced", "growth", "professional"}:
+        raise HTTPException(status_code=422, detail="invalid risk_rating")
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO cap_investors
+                  (investor_code, investor_name, legal_name, investor_kind, investor_category,
+                   qualification_status, risk_rating, city, disclosure_status, notes, created_by, tenant_id)
+                VALUES (%s, %s, %s, %s, %s, 'pending', %s, %s, 'not_started', %s, %s, %s)
+                """,
+                (
+                    f"INV-API-{uuid.uuid4().hex[:8].upper()}",
+                    payload.investor_name,
+                    payload.legal_name or payload.investor_name,
+                    payload.investor_kind,
+                    payload.investor_category,
+                    payload.risk_rating,
+                    payload.city,
+                    payload.notes,
+                    user.user_id,
+                    tenant_of(user),
+                ),
+            )
+            investor_id = int(cursor.lastrowid)
+            audit_id = write_audit(
+                cursor,
+                user.user_id,
+                "investor.create",
+                "investor",
+                investor_id,
+                payload.investor_name,
+                after=payload.model_dump(),
+            )
+        connection.commit()
+    finally:
+        connection.close()
+    return {"ok": True, "investor_id": investor_id, "audit_id": audit_id}
+
+
+@app.get("/api/investors/{investor_id}/cashflows")
+def investor_cashflows(investor_id: int, user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
+    """现金流 section:该投资人的缴款/分配流水(参考系统「投资人详情」底部现金流表)。"""
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            _assert_investor(cursor, investor_id, tid)
+            cursor.execute(
+                """SELECT f.fund_name, c.cashflow_kind, c.amount, c.currency, c.occurred_on, c.settlement_status
+                   FROM cap_cashflows c LEFT JOIN cap_funds f ON f.fund_id=c.fund_id
+                   WHERE c.investor_id=%s AND c.deleted_at IS NULL
+                   ORDER BY c.occurred_on DESC, c.cashflow_id DESC LIMIT 200""",
+                (investor_id,),
+            )
+            rows = cursor.fetchall()
+    finally:
+        connection.close()
+    return {"count": len(rows), "items": rows}
+
+
+@app.get("/api/investors/{investor_id}/profile")
+def investor_profile(investor_id: int, user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
+    """投资汇总(issue #25/GitHub #30):认缴/缴款/分配/DPI/MOIC 与签约基金明细,
+    结构对齐参考系统「投资人详情」。剩余权益预估按基金 NAV 折算实缴份额(演示口径)。"""
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            _assert_investor(cursor, investor_id, tid)
+            cursor.execute(
+                """SELECT f.fund_name, c.committed_amount, c.paid_in_amount, c.admission_date, c.status,
+                          f.committed_size AS fund_committed_size,
+                          f.paid_in_size AS fund_paid_in_size, f.net_asset_value AS fund_nav,
+                          COALESCE(d.distributed, 0) AS distributed
+                   FROM cap_fund_commitments c
+                   LEFT JOIN cap_funds f ON f.fund_id = c.fund_id
+                   LEFT JOIN (
+                       SELECT fund_id, investor_id,
+                              SUM(CASE WHEN cashflow_kind='investor_distribution' THEN amount ELSE 0 END) AS distributed
+                       FROM cap_cashflows WHERE deleted_at IS NULL GROUP BY fund_id, investor_id
+                   ) d ON d.fund_id = c.fund_id AND d.investor_id = c.investor_id
+                   WHERE c.investor_id=%s AND c.deleted_at IS NULL
+                   ORDER BY c.committed_amount DESC""",
+                (investor_id,),
+            )
+            funds = cursor.fetchall()
+    finally:
+        connection.close()
+
+    def _f(v: Any) -> float:
+        try:
+            return float(v or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    committed_total = sum(_f(r["committed_amount"]) for r in funds)
+    paid_in_total = sum(_f(r["paid_in_amount"]) for r in funds)
+    distributed_total = sum(_f(r["distributed"]) for r in funds)
+    residual_total = 0.0
+    fund_rows: list[dict[str, Any]] = []
+    for r in funds:
+        paid_in = _f(r["paid_in_amount"])
+        distributed = _f(r["distributed"])
+        fund_paid = _f(r["fund_paid_in_size"])
+        # 剩余权益(演示口径):按基金整体 NAV/实缴 比例折算该投资人实缴部分
+        residual = paid_in * (_f(r["fund_nav"]) / fund_paid) if fund_paid > 0 else 0.0
+        residual_total += residual
+        share_base = _f(r["fund_committed_size"])
+        fund_rows.append({
+            "fund_name": r["fund_name"],
+            "partner_type": "有限合伙人",
+            "admission_date": r["admission_date"].isoformat() if r["admission_date"] else None,
+            "committed_amount": _f(r["committed_amount"]),
+            "share_pct": round(_f(r["committed_amount"]) / share_base * 100, 1) if share_base > 0 else None,
+            "paid_in_amount": paid_in,
+            "distributed": distributed,
+            "dpi": round(distributed / paid_in, 2) if paid_in > 0 else 0,
+            "moic": round((distributed + residual) / paid_in, 2) if paid_in > 0 else 0,
+            "residual_estimate": round(residual, 2),
+            "status": COMMIT_STATUS_CN.get(str(r["status"]), str(r["status"])),
+        })
+    distributed_principal = min(distributed_total, paid_in_total)
+    summary = {
+        "committed_total": committed_total,
+        "paid_in_total": paid_in_total,
+        "distributed_total": distributed_total,
+        "distributed_principal": distributed_principal,
+        "distributed_gain": max(0.0, distributed_total - paid_in_total),
+        "residual_estimate": round(residual_total, 2),
+        "dpi": round(distributed_total / paid_in_total, 2) if paid_in_total > 0 else 0,
+        "moic": round((distributed_total + residual_total) / paid_in_total, 2) if paid_in_total > 0 else 0,
+        "fund_count": len(funds),
+    }
+    return {"summary": summary, "funds": fund_rows}
 
 
 @app.get("/api/investors/{investor_id}/touchpoints")
@@ -2435,7 +2653,9 @@ def project_equity_changes(project_id: int, user: AuthedUser = Depends(current_u
                           e.change_reason, e.round_label, e.is_lead_investor,
                           e.investment_method, e.investment_method_label,
                           e.pre_money_ratio, e.post_money_ratio, e.co_investors,
-                          e.share_count_delta, e.agreement_date, e.approval_date, e.notes
+                          e.share_count_delta, e.agreement_date, e.approval_date, e.notes,
+                          e.valuation_original, e.valuation_currency, e.valuation_cny,
+                          e.historical_investors, e.is_draft
                    FROM cap_equity_changes e
                    LEFT JOIN cap_funds f ON f.fund_id=e.fund_id
                    WHERE e.project_id=%s AND e.tenant_id=%s AND e.deleted_at IS NULL
@@ -2452,6 +2672,7 @@ _EQUITY_EDITABLE = {
     "fund_id", "change_reason", "agreement_date", "approval_date", "round_label",
     "is_lead_investor", "investment_method_label", "pre_money_ratio", "post_money_ratio",
     "co_investors", "notes",
+    "valuation_original", "valuation_currency", "valuation_cny", "historical_investors", "is_draft",
 }
 
 
@@ -2467,7 +2688,9 @@ def list_equity_changes(user: AuthedUser = Depends(current_user)) -> dict[str, A
                           e.fund_id, COALESCE(f.fund_name, '-') AS fund_name,
                           e.change_reason, e.agreement_date, e.approval_date, e.round_label,
                           e.is_lead_investor, e.investment_method, e.investment_method_label,
-                          e.pre_money_ratio, e.post_money_ratio, e.co_investors, e.notes
+                          e.pre_money_ratio, e.post_money_ratio, e.co_investors, e.notes,
+                          e.valuation_original, e.valuation_currency, e.valuation_cny,
+                          e.historical_investors, e.is_draft
                    FROM cap_equity_changes e
                    LEFT JOIN cap_projects p ON p.project_id=e.project_id
                    LEFT JOIN cap_funds f ON f.fund_id=e.fund_id
@@ -2501,8 +2724,10 @@ def create_equity_change(payload: EquityChangePayload, user: AuthedUser = Depend
                 """INSERT INTO cap_equity_changes
                      (project_id, fund_id, change_code, change_reason, agreement_date, approval_date,
                       round_label, is_lead_investor, investment_method, investment_method_label,
-                      pre_money_ratio, post_money_ratio, co_investors, notes, created_by, tenant_id)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'other', %s, %s, %s, %s, %s, %s, %s)""",
+                      pre_money_ratio, post_money_ratio, co_investors, notes,
+                      valuation_original, valuation_currency, valuation_cny, historical_investors, is_draft,
+                      created_by, tenant_id)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'other', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
                 (
                     payload.project_id, payload.fund_id or None,
                     f"EQ-{uuid.uuid4().hex[:10].upper()}",
@@ -2511,7 +2736,11 @@ def create_equity_change(payload: EquityChangePayload, user: AuthedUser = Depend
                     payload.round_label or "-", 1 if payload.is_lead_investor else 0,
                     payload.investment_method_label,
                     payload.pre_money_ratio, payload.post_money_ratio,
-                    payload.co_investors, payload.notes, user.user_id, tid,
+                    payload.co_investors, payload.notes,
+                    payload.valuation_original, payload.valuation_currency or "万人民币",
+                    payload.valuation_cny, payload.historical_investors,
+                    1 if payload.is_draft else 0,
+                    user.user_id, tid,
                 ),
             )
             change_id = int(cursor.lastrowid)
@@ -2534,6 +2763,8 @@ def update_equity_change(change_id: int, payload: EquityChangePayload, user: Aut
         raise HTTPException(status_code=400, detail="No editable fields provided")
     if "is_lead_investor" in updates:
         updates["is_lead_investor"] = 1 if updates["is_lead_investor"] else 0
+    if "is_draft" in updates:
+        updates["is_draft"] = 1 if updates["is_draft"] else 0
     connection = connect_db()
     try:
         with connection.cursor() as cursor:
@@ -3338,13 +3569,48 @@ def get_project_postdata(project_id: int, user: AuthedUser = Depends(current_use
             col = _ensure_collection_row(cursor, project_id, tid)
             settings = _mail_settings(cursor)
             cursor.execute(
-                """SELECT report_id, fill_year, fill_period, fill_status, total_assets, net_assets,
-                          revenue, net_profit, filled_at, filled_by
+                """SELECT report_id, fill_year, fill_period, fill_status, total_assets, total_liabilities,
+                          net_assets, revenue, operating_cost, expense_three, net_profit, operating_cash_flow,
+                          filled_at, filled_by
                    FROM cap_postdata_reports WHERE project_id=%s AND tenant_id=%s
                    ORDER BY fill_year DESC, report_id DESC""",
                 (project_id, tid),
             )
             reports = cursor.fetchall()
+            # issue #24 ①:投资信息(投资额/估值等基本信息,取自本项目投资持仓)
+            cursor.execute(
+                """SELECT SUM(agreement_amount) AS agreement_total, SUM(cumulative_paid_amount) AS paid_total,
+                          MAX(latest_valuation) AS latest_valuation, SUM(current_ownership_ratio) AS ownership_total,
+                          MIN(first_payment_on) AS first_payment_on, COUNT(*) AS position_count
+                   FROM cap_investment_positions
+                   WHERE project_id=%s AND tenant_id=%s AND deleted_at IS NULL""",
+                (project_id, tid),
+            )
+            investment = cursor.fetchone() or {}
+            # issue #24 ②:运营信息历史
+            cursor.execute(
+                """SELECT op_id, period_label, content, recorded_on, created_by, created_at
+                   FROM cap_postdata_operations WHERE project_id=%s ORDER BY op_id DESC LIMIT 200""",
+                (project_id,),
+            )
+            operations = cursor.fetchall()
+            # issue #24 ④:三会情况(最新+历史,决议文件带文件名)
+            cursor.execute(
+                """SELECT m.meeting_id, m.meeting_kind, m.held_on, m.topic, m.document_id,
+                          d.filename AS document_name, m.created_at
+                   FROM cap_postdata_meetings m
+                   LEFT JOIN cap_postdata_documents d ON d.document_id=m.document_id
+                   WHERE m.project_id=%s ORDER BY m.held_on DESC, m.meeting_id DESC LIMIT 200""",
+                (project_id,),
+            )
+            meetings = cursor.fetchall()
+            # issue #26:投后文档存档
+            cursor.execute(
+                """SELECT document_id, doc_kind, filename, content_type, size_bytes, uploaded_by, created_at
+                   FROM cap_postdata_documents WHERE project_id=%s ORDER BY document_id DESC LIMIT 500""",
+                (project_id,),
+            )
+            documents = cursor.fetchall()
         connection.commit()  # _ensure_collection_row 可能建行/补 token
     finally:
         connection.close()
@@ -3354,6 +3620,10 @@ def get_project_postdata(project_id: int, user: AuthedUser = Depends(current_use
         "collection": {k: col.get(k) for k in ("collector_name", "recipient_email", "collect_status", "send_attempts", "last_sent_at", "collected_on", "notes", "external_enabled")},
         "external_link": _postdata_link(settings, str(col["external_token"])) if col.get("external_enabled") else None,
         "reports": reports,
+        "investment": investment,
+        "operations": operations,
+        "meetings": meetings,
+        "documents": documents,
     }
 
 
@@ -3369,11 +3639,13 @@ def create_postdata_report(project_id: int, payload: PostdataReportPayload, user
             _assert_project(cursor, project_id, tid)
             cursor.execute(
                 """INSERT INTO cap_postdata_reports
-                     (tenant_id, project_id, fill_year, fill_period, fill_status, total_assets, net_assets, revenue, net_profit)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                     (tenant_id, project_id, fill_year, fill_period, fill_status, total_assets, total_liabilities,
+                      net_assets, revenue, operating_cost, expense_three, net_profit, operating_cash_flow)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
                 (tid, project_id, payload.fill_year.strip(), payload.fill_period.strip(),
-                 (payload.fill_status or "待填报").strip(), payload.total_assets, payload.net_assets,
-                 payload.revenue, payload.net_profit),
+                 (payload.fill_status or "待填报").strip(), payload.total_assets, payload.total_liabilities,
+                 payload.net_assets, payload.revenue, payload.operating_cost, payload.expense_three,
+                 payload.net_profit, payload.operating_cash_flow),
             )
             report_id = int(cursor.lastrowid)
             audit_id = write_audit(cursor, user.user_id, "postdata.report.create", "postdata", project_id,
@@ -3389,7 +3661,8 @@ def update_postdata_report(report_id: int, payload: PostdataReportPayload, user:
     """内部修改填报行(数值/期间/状态)。"""
     tid = tenant_of(user)
     fields = payload.model_dump(exclude_unset=True)
-    allowed = {"fill_year", "fill_period", "fill_status", "total_assets", "net_assets", "revenue", "net_profit"}
+    allowed = {"fill_year", "fill_period", "fill_status", "total_assets", "total_liabilities",
+               "net_assets", "revenue", "operating_cost", "expense_three", "net_profit", "operating_cash_flow"}
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
         raise HTTPException(status_code=400, detail="No editable fields provided")
@@ -3427,6 +3700,321 @@ def delete_postdata_report(report_id: int, user: AuthedUser = Depends(require_pe
     finally:
         connection.close()
     return {"ok": True, "audit_id": audit_id}
+
+
+# ── 投后运营信息 / 三会 / 文档存档(issue #24/#26,用户反馈 #19/#21) ──
+
+_POSTDATA_DOC_DIR = os.path.join(UPLOAD_DIR, "postdata_docs")
+_POSTDATA_DOC_KINDS = {"财务报表", "经营情况分析", "三会决议议案", "其他"}
+_POSTDATA_MEETING_KINDS = {"股东会", "董事会", "监事会"}
+
+
+@app.post("/api/projects/{project_id}/postdata/operations")
+def create_postdata_operation(project_id: int, payload: PostdataOperationPayload, user: AuthedUser = Depends(require_permission("project.edit"))) -> dict[str, Any]:
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            _assert_project(cursor, project_id, tid)
+            cursor.execute(
+                """INSERT INTO cap_postdata_operations (tenant_id, project_id, period_label, content, recorded_on, created_by)
+                   VALUES (%s, %s, %s, %s, %s, %s)""",
+                (tid, project_id, payload.period_label.strip(), payload.content.strip(),
+                 payload.recorded_on or None, user.display_name),
+            )
+            op_id = int(cursor.lastrowid)
+            audit_id = write_audit(cursor, user.user_id, "postdata.operation.create", "postdata", project_id,
+                                   payload.period_label.strip())
+        connection.commit()
+    finally:
+        connection.close()
+    return {"ok": True, "op_id": op_id, "audit_id": audit_id}
+
+
+@app.get("/api/projects/{project_id}/postdata/operations")
+def list_postdata_operations(project_id: int, q: str = "", user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
+    """运营信息历史,支持关键词检索(期间/内容)。"""
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            _assert_project(cursor, project_id, tid)
+            if q.strip():
+                like = f"%{q.strip()}%"
+                cursor.execute(
+                    """SELECT op_id, period_label, content, recorded_on, created_by, created_at
+                       FROM cap_postdata_operations
+                       WHERE project_id=%s AND (period_label LIKE %s OR content LIKE %s)
+                       ORDER BY op_id DESC LIMIT 200""",
+                    (project_id, like, like),
+                )
+            else:
+                cursor.execute(
+                    """SELECT op_id, period_label, content, recorded_on, created_by, created_at
+                       FROM cap_postdata_operations WHERE project_id=%s ORDER BY op_id DESC LIMIT 200""",
+                    (project_id,),
+                )
+            rows = cursor.fetchall()
+    finally:
+        connection.close()
+    return {"count": len(rows), "items": rows}
+
+
+@app.delete("/api/postdata/operations/{op_id}")
+def delete_postdata_operation(op_id: int, user: AuthedUser = Depends(require_permission("project.edit"))) -> dict[str, Any]:
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT project_id, period_label FROM cap_postdata_operations WHERE op_id=%s", (op_id,))
+            row = cursor.fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail="Operation record not found")
+            cursor.execute("DELETE FROM cap_postdata_operations WHERE op_id=%s", (op_id,))
+            audit_id = write_audit(cursor, user.user_id, "postdata.operation.delete", "postdata",
+                                   int(row["project_id"]), str(row["period_label"]))
+        connection.commit()
+    finally:
+        connection.close()
+    return {"ok": True, "audit_id": audit_id}
+
+
+@app.post("/api/projects/{project_id}/postdata/meetings")
+def create_postdata_meeting(project_id: int, payload: PostdataMeetingPayload, user: AuthedUser = Depends(require_permission("project.edit"))) -> dict[str, Any]:
+    if payload.meeting_kind not in _POSTDATA_MEETING_KINDS:
+        raise HTTPException(status_code=422, detail="meeting_kind 须为 股东会/董事会/监事会")
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            _assert_project(cursor, project_id, tid)
+            if payload.document_id:
+                cursor.execute("SELECT document_id FROM cap_postdata_documents WHERE document_id=%s AND project_id=%s",
+                               (payload.document_id, project_id))
+                if cursor.fetchone() is None:
+                    raise HTTPException(status_code=404, detail="决议文件不存在(先在文档存档上传)")
+            cursor.execute(
+                """INSERT INTO cap_postdata_meetings (tenant_id, project_id, meeting_kind, held_on, topic, document_id, created_by)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                (tid, project_id, payload.meeting_kind, payload.held_on or None,
+                 payload.topic, payload.document_id, user.display_name),
+            )
+            meeting_id = int(cursor.lastrowid)
+            audit_id = write_audit(cursor, user.user_id, "postdata.meeting.create", "postdata", project_id,
+                                   f"{payload.meeting_kind} {payload.held_on or ''}".strip())
+        connection.commit()
+    finally:
+        connection.close()
+    return {"ok": True, "meeting_id": meeting_id, "audit_id": audit_id}
+
+
+@app.delete("/api/postdata/meetings/{meeting_id}")
+def delete_postdata_meeting(meeting_id: int, user: AuthedUser = Depends(require_permission("project.edit"))) -> dict[str, Any]:
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT project_id, meeting_kind FROM cap_postdata_meetings WHERE meeting_id=%s", (meeting_id,))
+            row = cursor.fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail="Meeting record not found")
+            cursor.execute("DELETE FROM cap_postdata_meetings WHERE meeting_id=%s", (meeting_id,))
+            audit_id = write_audit(cursor, user.user_id, "postdata.meeting.delete", "postdata",
+                                   int(row["project_id"]), str(row["meeting_kind"]))
+        connection.commit()
+    finally:
+        connection.close()
+    return {"ok": True, "audit_id": audit_id}
+
+
+@app.post("/api/projects/{project_id}/postdata/documents")
+async def upload_postdata_document(
+    project_id: int,
+    file: UploadFile = File(...),
+    doc_kind: str = "其他",
+    user: AuthedUser = Depends(require_permission("project.edit")),
+) -> dict[str, Any]:
+    """投后文档存档上传(issue #26):财务报表/经营情况分析/三会决议议案。文件落 UPLOAD_DIR/postdata_docs。"""
+    if doc_kind not in _POSTDATA_DOC_KINDS:
+        doc_kind = "其他"
+    data = await file.read()
+    if len(data) > 20 * 1024 * 1024:
+        raise HTTPException(status_code=422, detail="单个文件不超过 20MB")
+    if not data:
+        raise HTTPException(status_code=422, detail="空文件")
+    tid = tenant_of(user)
+    safe_name = re.sub(r"[^\w.\-一-鿿]", "_", file.filename or "file")[:200]
+    stored_name = f"{project_id}_{uuid.uuid4().hex[:10]}_{safe_name}"
+    os.makedirs(_POSTDATA_DOC_DIR, exist_ok=True)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            _assert_project(cursor, project_id, tid)
+            with open(os.path.join(_POSTDATA_DOC_DIR, stored_name), "wb") as fh:
+                fh.write(data)
+            cursor.execute(
+                """INSERT INTO cap_postdata_documents
+                     (tenant_id, project_id, doc_kind, filename, stored_name, content_type, size_bytes, uploaded_by)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+                (tid, project_id, doc_kind, safe_name, stored_name,
+                 file.content_type or "application/octet-stream", len(data), user.display_name),
+            )
+            document_id = int(cursor.lastrowid)
+            audit_id = write_audit(cursor, user.user_id, "postdata.document.upload", "postdata", project_id,
+                                   f"{doc_kind}:{safe_name}")
+        connection.commit()
+    finally:
+        connection.close()
+    return {"ok": True, "document_id": document_id, "audit_id": audit_id}
+
+
+@app.get("/api/postdata/documents/{document_id}/download")
+def download_postdata_document(document_id: int, user: AuthedUser = Depends(current_user)) -> FileResponse:
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT filename, stored_name, content_type FROM cap_postdata_documents WHERE document_id=%s", (document_id,))
+            row = cursor.fetchone()
+    finally:
+        connection.close()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+    path = os.path.join(_POSTDATA_DOC_DIR, str(row["stored_name"]))
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="文件已不在服务器(可能未随备份迁移)")
+    return FileResponse(path, media_type=str(row["content_type"] or "application/octet-stream"), filename=str(row["filename"]))
+
+
+@app.delete("/api/postdata/documents/{document_id}")
+def delete_postdata_document(document_id: int, user: AuthedUser = Depends(require_permission("project.edit"))) -> dict[str, Any]:
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT project_id, filename, stored_name FROM cap_postdata_documents WHERE document_id=%s", (document_id,))
+            row = cursor.fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail="Document not found")
+            cursor.execute("UPDATE cap_postdata_meetings SET document_id=NULL WHERE document_id=%s", (document_id,))
+            cursor.execute("DELETE FROM cap_postdata_documents WHERE document_id=%s", (document_id,))
+            audit_id = write_audit(cursor, user.user_id, "postdata.document.delete", "postdata",
+                                   int(row["project_id"]), str(row["filename"]))
+        connection.commit()
+    finally:
+        connection.close()
+    try:
+        os.remove(os.path.join(_POSTDATA_DOC_DIR, str(row["stored_name"])))
+    except OSError:
+        pass
+    return {"ok": True, "audit_id": audit_id}
+
+
+@app.get("/api/postdata/alerts")
+def postdata_alerts(user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
+    """投后预警 v1(issue #25,用户反馈 #20)。规则实时计算,不落表:
+    ① 填报逾期:存在「待填报」期间(已发送超 14 天升高级)
+    ② 财务恶化:最新已填报期净利润为负 / 营收环比下滑超 30%
+    ③ 三会逾期:最近一次三会距今超 180 天(或从未记录)
+    ④ 决议文件缺失:三会记录未关联决议文件
+    """
+    tid = tenant_of(user)
+    alerts: list[dict[str, Any]] = []
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            # 纳入投后收集范围的项目
+            cursor.execute(
+                """SELECT c.project_id, p.short_name AS project_name, c.last_sent_at
+                   FROM cap_postdata_collections c JOIN cap_projects p ON p.project_id=c.project_id
+                   WHERE c.tenant_id=%s AND p.deleted_at IS NULL""",
+                (tid,),
+            )
+            projects = {int(r["project_id"]): r for r in cursor.fetchall()}
+            if not projects:
+                return {"count": 0, "items": [], "generated_rules": 4}
+            ids = tuple(projects.keys())
+            marks = ", ".join(["%s"] * len(ids))
+
+            # ① 填报逾期
+            cursor.execute(
+                f"""SELECT project_id, COUNT(*) AS pending
+                    FROM cap_postdata_reports
+                    WHERE tenant_id=%s AND project_id IN ({marks}) AND fill_status='待填报'
+                    GROUP BY project_id""",
+                (tid, *ids),
+            )
+            for r in cursor.fetchall():
+                pid = int(r["project_id"])
+                sent = projects[pid].get("last_sent_at")
+                overdue = bool(sent and isinstance(sent, datetime) and datetime.now() - sent > timedelta(days=14))
+                alerts.append({
+                    "project_id": pid, "project_name": projects[pid]["project_name"],
+                    "alert_kind": "填报逾期", "level": "高" if overdue else "中",
+                    "message": f"有 {int(r['pending'])} 期数据待填报" + (",填报邮件已发出超 14 天" if overdue else ""),
+                })
+
+            # ② 财务恶化:每项目最近两期已填报
+            cursor.execute(
+                f"""SELECT project_id, fill_year, fill_period, revenue, net_profit
+                    FROM cap_postdata_reports
+                    WHERE tenant_id=%s AND project_id IN ({marks}) AND fill_status='已填报'
+                    ORDER BY project_id, fill_year DESC, report_id DESC""",
+                (tid, *ids),
+            )
+            by_project: dict[int, list[dict[str, Any]]] = {}
+            for r in cursor.fetchall():
+                by_project.setdefault(int(r["project_id"]), []).append(r)
+            for pid, rows in by_project.items():
+                latest = rows[0]
+                label = f"{latest['fill_year']} {latest['fill_period']}"
+                if latest["net_profit"] is not None and float(latest["net_profit"]) < 0:
+                    alerts.append({
+                        "project_id": pid, "project_name": projects[pid]["project_name"],
+                        "alert_kind": "财务恶化", "level": "高",
+                        "message": f"{label} 净利润为负({float(latest['net_profit']):,.0f} 万)",
+                    })
+                if len(rows) >= 2 and latest["revenue"] is not None and rows[1]["revenue"] not in (None, 0):
+                    prev = float(rows[1]["revenue"])
+                    if prev > 0:
+                        drop = (prev - float(latest["revenue"])) / prev
+                        if drop > 0.30:
+                            alerts.append({
+                                "project_id": pid, "project_name": projects[pid]["project_name"],
+                                "alert_kind": "财务恶化", "level": "中",
+                                "message": f"{label} 营业收入环比下滑 {drop * 100:.0f}%",
+                            })
+
+            # ③ 三会逾期 / ④ 决议文件缺失
+            cursor.execute(
+                f"""SELECT project_id, MAX(held_on) AS last_meeting,
+                           SUM(CASE WHEN document_id IS NULL THEN 1 ELSE 0 END) AS missing_docs
+                    FROM cap_postdata_meetings WHERE project_id IN ({marks}) GROUP BY project_id""",
+                ids,
+            )
+            meeting_stats = {int(r["project_id"]): r for r in cursor.fetchall()}
+            for pid, info in projects.items():
+                stat = meeting_stats.get(pid)
+                last = stat["last_meeting"] if stat else None
+                if last is None:
+                    alerts.append({
+                        "project_id": pid, "project_name": info["project_name"],
+                        "alert_kind": "三会逾期", "level": "低",
+                        "message": "尚无股东会/董事会/监事会记录",
+                    })
+                elif (date.today() - last).days > 180:
+                    alerts.append({
+                        "project_id": pid, "project_name": info["project_name"],
+                        "alert_kind": "三会逾期", "level": "中",
+                        "message": f"最近一次三会在 {last.isoformat()},已超 180 天",
+                    })
+                if stat and int(stat["missing_docs"] or 0) > 0:
+                    alerts.append({
+                        "project_id": pid, "project_name": info["project_name"],
+                        "alert_kind": "决议文件缺失", "level": "低",
+                        "message": f"{int(stat['missing_docs'])} 条三会记录未关联决议文件",
+                    })
+    finally:
+        connection.close()
+    level_order = {"高": 0, "中": 1, "低": 2}
+    alerts.sort(key=lambda a: (level_order.get(a["level"], 9), a["project_id"]))
+    return {"count": len(alerts), "items": alerts, "generated_rules": 4}
 
 
 def _wan_cell(v: Any) -> str:
@@ -3527,7 +4115,8 @@ def external_get_postdata(token: str) -> dict[str, Any]:
             if col is None or not col["external_enabled"]:
                 raise HTTPException(status_code=404, detail="链接无效或外部填报已关闭")
             cursor.execute(
-                """SELECT report_id, fill_year, fill_period, fill_status, total_assets, net_assets, revenue, net_profit
+                """SELECT report_id, fill_year, fill_period, fill_status, total_assets, total_liabilities,
+                          net_assets, revenue, operating_cost, expense_three, net_profit, operating_cash_flow
                    FROM cap_postdata_reports WHERE project_id=%s AND tenant_id=%s
                    ORDER BY fill_year DESC, report_id DESC""",
                 (col["project_id"], col["tenant_id"]),
@@ -3564,10 +4153,12 @@ def external_fill_postdata(token: str, payload: ExternalFillPayload) -> dict[str
                     continue
                 cursor.execute(
                     """UPDATE cap_postdata_reports
-                       SET total_assets=%s, net_assets=%s, revenue=%s, net_profit=%s,
+                       SET total_assets=%s, total_liabilities=%s, net_assets=%s, revenue=%s,
+                           operating_cost=%s, expense_three=%s, net_profit=%s, operating_cash_flow=%s,
                            fill_status='已填报', filled_at=NOW(), filled_by=%s
                        WHERE report_id=%s""",
-                    (e.total_assets, e.net_assets, e.revenue, e.net_profit,
+                    (e.total_assets, e.total_liabilities, e.net_assets, e.revenue,
+                     e.operating_cost, e.expense_three, e.net_profit, e.operating_cash_flow,
                      (payload.filled_by or col.get("recipient_email") or "external")[:200], e.report_id),
                 )
                 filled += 1

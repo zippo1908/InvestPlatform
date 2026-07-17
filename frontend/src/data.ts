@@ -284,6 +284,14 @@ export const screens: Screen[] = [
     primaryAction: '发送填报邮件',
   },
   {
+    id: 'post-alerts',
+    title: '投后预警',
+    group: '投后管理',
+    description: '填报逾期、财务恶化、三会逾期、决议文件缺失自动预警',
+    kind: 'list',
+    primaryAction: '刷新预警',
+  },
+  {
     id: 'risk-clauses',
     title: '项目关键条款',
     group: '风险管理',
