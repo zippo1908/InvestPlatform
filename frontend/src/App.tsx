@@ -93,7 +93,7 @@ function Markdown({ text }: { text: string }) {
 }
 
 // 处理中动效:GSAP 无限旋转 spinner + 轮播状态文字(交叉淡入),让观众感知"正在处理"。
-function AiProcessing({ messages }: { messages: string[] }) {
+function AiProcessing({ messages, note }: { messages: string[]; note?: string }) {
   const [idx, setIdx] = useState(0)
   const spinRef = useRef<SVGSVGElement>(null)
   const textRef = useRef<HTMLSpanElement>(null)
@@ -116,7 +116,7 @@ function AiProcessing({ messages }: { messages: string[] }) {
   return (
     <div className="ai-processing" data-testid="ai-processing">
       <Bot ref={spinRef} size={30} className="ai-processing-spin" />
-      <span className="ai-processing-text" ref={textRef}>{messages[idx]}</span>
+      <span className="ai-processing-text" ref={textRef}>{note || messages[idx]}</span>
       <div className="ai-processing-dots"><i /><i /><i /></div>
     </div>
   )
@@ -2000,6 +2000,7 @@ function FormPage({
   const [aiFields, setAiFields] = useState<Record<string, unknown> | null>(null)
   const [aiBusy, setAiBusy] = useState(false)
   const [aiError, setAiError] = useState<string | null>(null)
+  const [aiProgress, setAiProgress] = useState('')
   const [extracting, setExtracting] = useState(false)
   const bpFileRef = useRef<HTMLInputElement>(null)
 
@@ -2024,15 +2025,23 @@ function FormPage({
 
   const runAiParse = async () => {
     if (!bpText.trim()) return
-    setAiBusy(true); setAiError(null); setAiFields(null)
+    setAiBusy(true); setAiError(null); setAiFields(null); setAiProgress('')
+    // 走流式分块解析:逐段进度平滑呈现,末帧回结构化字段(全量解析、不截断长文)。
+    let fields: Record<string, unknown> | null = null
+    let model = ''
     try {
-      const res = await apiPost<{ fields: Record<string, unknown>; model: string }>('/api/ai/parse-bp', { text: bpText })
-      setAiFields(res.fields)
-      onToast({ title: 'AI 解析完成', detail: `模型 ${res.model} 已返回结构化字段`, action: 'ai.parse_bp', entity: 'ai_parse_job' })
+      await streamPost('/api/ai/parse-bp/stream', { text: bpText }, () => {}, undefined, (ev) => {
+        if (typeof ev.i === 'number' && typeof ev.n === 'number') setAiProgress(`分段解析 ${ev.i}/${ev.n}…`)
+        if (ev.fields && typeof ev.fields === 'object') fields = ev.fields as Record<string, unknown>
+        if (typeof ev.model === 'string') model = ev.model
+      })
+      if (!fields) throw new Error('未返回解析结果')
+      setAiFields(fields)
+      onToast({ title: 'AI 解析完成', detail: `模型 ${model} 已返回结构化字段`, action: 'ai.parse_bp', entity: 'ai_parse_job' })
     } catch (error) {
-      setAiError(error instanceof Error ? error.message : 'AI 调用失败')
+      setAiError(error instanceof Error ? error.message.replace(/^\{"detail":"?|"?\}$/g, '') : 'AI 调用失败')
     } finally {
-      setAiBusy(false)
+      setAiBusy(false); setAiProgress('')
     }
   }
 
@@ -2238,7 +2247,7 @@ function FormPage({
               <Bot size={15} />
               {aiBusy ? 'AI 解析中…' : 'AI 解析'}
             </button>
-            {aiBusy && !aiFields && <AiProcessing messages={BP_MSGS} />}
+            {aiBusy && !aiFields && <AiProcessing messages={BP_MSGS} note={aiProgress || undefined} />}
             {aiError && (
               <div className="ai-hint is-error">
                 <AlertTriangle size={14} />

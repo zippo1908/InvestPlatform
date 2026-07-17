@@ -4991,33 +4991,77 @@ _BP_SYSTEM_PROMPT = (
 )
 
 
-@app.post("/api/ai/parse-bp")
-def parse_bp(payload: BpParsePayload, user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
-    """BP 文本 → 结构化项目字段(真模型)。可直接回填到「新增项目」表单。"""
-    text = payload.text.strip()
-    if not text:
-        raise HTTPException(status_code=400, detail="text required")
-    if len(text) > 20000:
-        text = text[:20000]
-    if not llm.is_configured():
-        raise HTTPException(
-            status_code=503,
-            detail="AI 未配置:请在 deploy/.env 设置 LLM_ENABLED=true 及 LLM_BASE_URL / LLM_MODEL / LLM_API_KEY",
-        )
-    try:
-        fields = llm.chat_json(
-            [
-                {"role": "system", "content": _BP_SYSTEM_PROMPT},
-                {"role": "user", "content": f"BP 文本如下:\n\n{text}"},
-            ],
-            temperature=0.1,
-        )
-    except llm.LLMNotConfigured as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
-    except llm.LLMError as exc:
-        raise HTTPException(status_code=502, detail=str(exc))
+# ── BP 分块解析(map-reduce)—— 全量切段逐段抽取再合并,保业务完整性,不截断长文 ──
+_BP_SCALARS = ("short_name", "legal_name", "industry_group", "city", "funding_round", "summary")
+_BP_CHUNK_SIZE = 6000   # 每段字符数:够短能在超时内返回,够长保留上下文
+_BP_CHUNK_OVERLAP = 200  # 段间重叠,避免把跨段的实体/数字切碎
 
-    # 记一条真实的 AI 解析作业 + 审计(替代原来纯占位的 cap_ai_parse_jobs)。
+
+def _split_bp_chunks(text: str, size: int = _BP_CHUNK_SIZE, overlap: int = _BP_CHUNK_OVERLAP) -> list[str]:
+    """把 BP 全文切成带重叠的片段,覆盖整篇(不丢内容)。"""
+    text = text.strip()
+    if not text:
+        return []
+    if len(text) <= size:
+        return [text]
+    chunks: list[str] = []
+    start = 0
+    while start < len(text):
+        end = min(start + size, len(text))
+        chunks.append(text[start:end])
+        if end >= len(text):
+            break
+        start = end - overlap
+    return chunks
+
+
+def _extract_bp_chunk(chunk: str, hint: str = "") -> dict[str, Any]:
+    """对单段 BP 文本抽结构化字段(单次调用短、稳,不易超时)。"""
+    result = llm.chat_json(
+        [
+            {"role": "system", "content": _BP_SYSTEM_PROMPT},
+            {"role": "user", "content": f"{hint}BP 文本片段如下:\n\n{chunk}"},
+        ],
+        temperature=0.1,
+    )
+    return result if isinstance(result, dict) else {}
+
+
+def _merge_bp_fields(parts: list[dict[str, Any]]) -> dict[str, Any]:
+    """合并各段结果:标量取置信度最高段的非空值,数组并集去重,置信度取最大。"""
+    ordered = sorted(
+        (p for p in parts if isinstance(p, dict)),
+        key=lambda p: float(p.get("confidence") or 0),
+        reverse=True,
+    )
+    merged: dict[str, Any] = {}
+    for key in _BP_SCALARS:
+        value = ""
+        for part in ordered:
+            candidate = part.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                value = candidate.strip()
+                break
+        merged[key] = value
+    for key in ("highlights", "risks"):
+        seen: set[str] = set()
+        acc: list[str] = []
+        for part in ordered:
+            arr = part.get(key)
+            if isinstance(arr, list):
+                for item in arr:
+                    s = str(item).strip()
+                    if s and s not in seen:
+                        seen.add(s)
+                        acc.append(s)
+        merged[key] = acc[:12]
+    confs = [float(p.get("confidence") or 0) for p in parts if isinstance(p, dict)]
+    merged["confidence"] = round(max(confs), 2) if confs else 0.0
+    return merged
+
+
+def _record_bp_job(fields: dict[str, Any], user: AuthedUser) -> int:
+    """记一条真实的 AI 解析作业 + 审计(替代原来纯占位的 cap_ai_parse_jobs)。"""
     connection = connect_db()
     try:
         with connection.cursor() as cursor:
@@ -5033,8 +5077,70 @@ def parse_bp(payload: BpParsePayload, user: AuthedUser = Depends(current_user)) 
         connection.commit()
     finally:
         connection.close()
+    return job_id
 
+
+@app.post("/api/ai/parse-bp")
+def parse_bp(payload: BpParsePayload, user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
+    """BP 文本 → 结构化项目字段(真模型)。全量分块解析,可直接回填到「新增项目」表单。"""
+    text = payload.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text required")
+    if not llm.is_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="AI 未配置:请在 deploy/.env 设置 LLM_ENABLED=true 及 LLM_BASE_URL / LLM_MODEL / LLM_API_KEY",
+        )
+    chunks = _split_bp_chunks(text)
+    total = len(chunks)
+    try:
+        parts = [
+            _extract_bp_chunk(chunk, f"(第 {i}/{total} 段,共 {total} 段)" if total > 1 else "")
+            for i, chunk in enumerate(chunks, 1)
+        ]
+    except llm.LLMNotConfigured as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except llm.LLMError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+    fields = _merge_bp_fields(parts)
+    job_id = _record_bp_job(fields, user)
     return {"ok": True, "model": llm.status()["model"], "job_id": job_id, "fields": fields}
+
+
+@app.post("/api/ai/parse-bp/stream")
+def parse_bp_stream(payload: BpParsePayload, user: AuthedUser = Depends(current_user)) -> StreamingResponse:
+    """BP 分块解析的流式版:逐段下发进度事件,末帧回结构化字段。前端平滑呈现。"""
+    text = payload.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text required")
+    if not llm.is_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="AI 未配置:请在 deploy/.env 设置 LLM_ENABLED=true 及 LLM_BASE_URL / LLM_MODEL / LLM_API_KEY",
+        )
+
+    def event_stream():
+        try:
+            chunks = _split_bp_chunks(text)
+            total = len(chunks)
+            parts: list[dict[str, Any]] = []
+            for i, chunk in enumerate(chunks, 1):
+                yield f"data: {dumps({'phase': 'chunk', 'i': i, 'n': total}, ensure_ascii=False)}\n\n"
+                parts.append(_extract_bp_chunk(chunk, f"(第 {i}/{total} 段,共 {total} 段)" if total > 1 else ""))
+            fields = _merge_bp_fields(parts)
+            job_id = _record_bp_job(fields, user)
+            yield f"data: {dumps({'fields': fields, 'job_id': job_id, 'model': llm.status()['model'], 'done': True}, ensure_ascii=False)}\n\n"
+        except (llm.LLMError, llm.LLMNotConfigured) as exc:
+            yield f"data: {dumps({'error': str(exc)}, ensure_ascii=False)}\n\n"
+        except Exception as exc:  # noqa: BLE001 —— 兜底,避免流中断成 500 白屏
+            yield f"data: {dumps({'error': f'BP 解析失败: {exc}'}, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+    )
 
 
 @app.post("/api/ai/summarize")

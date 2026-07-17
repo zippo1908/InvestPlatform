@@ -124,6 +124,7 @@ export async function streamPost(
   body: unknown,
   onDelta: (text: string) => void,
   signal?: AbortSignal,
+  onEvent?: (obj: Record<string, unknown>) => void,
 ): Promise<void> {
   const token = getToken()
   const res = await fetch(`${API_BASE}${path}`, {
@@ -152,14 +153,15 @@ export async function streamPost(
       buf = buf.slice(idx + 2)
       const dataLine = frame.split('\n').find((l) => l.startsWith('data:'))
       if (!dataLine) continue
-      let obj: { delta?: string; done?: boolean; error?: string }
+      let obj: { delta?: string; done?: boolean; error?: string } & Record<string, unknown>
       try {
         obj = JSON.parse(dataLine.slice(5).trim())
       } catch {
         continue
       }
-      if (obj.error) throw new Error(obj.error)
-      if (obj.delta) onDelta(obj.delta)
+      if (obj.error) throw new Error(String(obj.error))
+      onEvent?.(obj)
+      if (obj.delta) onDelta(String(obj.delta))
     }
   }
 }

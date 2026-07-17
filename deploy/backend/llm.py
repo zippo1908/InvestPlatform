@@ -13,7 +13,7 @@
                   本地 vLLM/Ollama  http://127.0.0.1:11434/v1
   LLM_API_KEY   密钥(本地模型可留空)
   LLM_MODEL     模型名,如 gpt-4o-mini / deepseek-chat / moonshot-v1-8k / qwen-plus
-  LLM_TIMEOUT   单次调用超时秒数(默认 30)
+  LLM_TIMEOUT   单次调用超时秒数(默认 120)
 
 调试:GET /api/ai/status 可直接看当前是否配好、指向哪个 base_url/model(不回显 key)。
 """
@@ -40,7 +40,7 @@ def _cfg() -> dict[str, Any]:
         "base_url": os.getenv("LLM_BASE_URL", "").strip().rstrip("/"),
         "api_key": os.getenv("LLM_API_KEY", "").strip(),
         "model": os.getenv("LLM_MODEL", "").strip(),
-        "timeout": float(os.getenv("LLM_TIMEOUT", "30") or 30),
+        "timeout": float(os.getenv("LLM_TIMEOUT", "120") or 120),
     }
 
 
