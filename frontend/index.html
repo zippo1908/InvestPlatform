@@ -5,8 +5,12 @@
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <script>
+      // API 基址:经 nginx 子路径(/invest)访问时走同源反代;直连端口(8089)时保持 hostname:7997。
       window.__CAPITALOS_API_BASE__ =
-        window.__CAPITALOS_API_BASE__ || `${window.location.protocol}//${window.location.hostname}:7997`
+        window.__CAPITALOS_API_BASE__ ||
+        (window.location.pathname.startsWith('/invest')
+          ? '/invest'
+          : `${window.location.protocol}//${window.location.hostname}:7997`)
     </script>
     <title>capitalos-app</title>
   </head>
