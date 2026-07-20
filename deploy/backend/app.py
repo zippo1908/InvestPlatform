@@ -6311,6 +6311,49 @@ _DD_MERGE_PROMPT = """任务:把一份新确认归档的材料,增量融入该�
 红旗规则(flags_md):对照红旗清单逐项排查新旧信息,每条格式:
 - 🚩 风险点——大白话解释为什么危险、建议下一步核实什么。没有红旗就写「暂未发现明显红旗(基于现有材料)」。"""
 
+# 融合的流式版指令:规则与 _DD_MERGE_PROMPT 完全一致,只是输出从 JSON 改为
+# 三段分隔符纯文本——JSON 要收尾才能解析,分隔符文本可以边生成边按段下发给前端。
+_DD_MERGE_STREAM_PROMPT = """任务:把一份新确认归档的材料,增量融入该模块已有的尽调文档。
+输出**不是 JSON**,而是按固定分隔符组织的三段纯文本,顺序与格式严格如下(三行分隔符
+必须一字不差、各自独占一行;除三段正文和分隔行外,不要输出任何开场白、解释或代码围栏):
+===CONTENT===
+(第一段:新版模块尽调文档,Markdown)
+===GAPS===
+(第二段:缺口清单,Markdown 列表)
+===FLAGS===
+(第三段:红旗与待核实项,Markdown 列表)
+
+增量融合规则(CONTENT 段):
+- 在已有文档基础上**合并**,不是重写:已有的事实与章节结构要保留;与新材料重复的合并去重;
+  互相矛盾的两边都列出,并标注「⚠ 两份材料不一致,待人工核实」。
+- 每个关键事实句尾用【文件名】标注来源;已有内容里的来源标注要沿用,不得丢失。
+- 突出数字与日期(金额、比例、期限写清单位与口径)。
+- 用 Markdown 小节(## 开头)组织;没有信息的小节不要硬编。已有文档为空时,按本模块该有的章节从头搭骨架。
+
+缺口规则(GAPS 段):站在完整尽调的标准,列出本模块**还缺什么材料**,每条格式:
+- 缺什么(材料名)——大白话解释为什么需要它、缺了会看不清什么。已被新材料补上的缺口要移除。
+
+红旗规则(FLAGS 段):对照红旗清单逐项排查新旧信息,每条格式:
+- 🚩 风险点——大白话解释为什么危险、建议下一步核实什么。没有红旗就写「暂未发现明显红旗(基于现有材料)」。"""
+
+# 流式融合输出的分隔符 → 段名(服务端状态机与终切共用一份定义)。
+_DD_STREAM_MARKERS = {"===CONTENT===": "content", "===GAPS===": "gaps", "===FLAGS===": "flags"}
+
+
+def _dd_split_stream_output(raw: str) -> dict[str, str]:
+    """把 _DD_MERGE_STREAM_PROMPT 约定的三段分隔符文本切成 {content, gaps, flags}。
+    分隔符须独占一行(strip 后精确匹配);首个分隔符之前的文字(模型偶发的开场白)丢弃。"""
+    section: str | None = None
+    parts: dict[str, list[str]] = {"content": [], "gaps": [], "flags": []}
+    for line in raw.splitlines():
+        marker = _DD_STREAM_MARKERS.get(line.strip())
+        if marker:
+            section = marker
+            continue
+        if section:
+            parts[section].append(line)
+    return {key: "\n".join(lines).strip() for key, lines in parts.items()}
+
 
 def _dd_extract_text(name: str, data: bytes) -> str:
     """尽调材料 → 纯文本(复用 /api/ai/extract-text 的抽取器);抽不出直接 4xx。"""
@@ -6355,45 +6398,19 @@ def _dd_llm_guard() -> None:
         raise HTTPException(status_code=503, detail="AI 未配置:请在 deploy/.env 配置 LLM_PROVIDER 及对应 LLM_*/TINCI_AI_*")
 
 
-@app.post("/api/projects/{project_id}/dd/analyze")
-async def dd_analyze_document(
-    project_id: int,
-    file: UploadFile = File(...),
-    user: AuthedUser = Depends(require_permission("project.edit")),
-) -> dict[str, Any]:
-    """尽调材料预分析(**不落库**):抽文本 → AI 判模块/材料类型/摘要/关键事实,
-    文件暂存 dd_tmp/{token},前端预览确认后携 token 调 commit 才真正归档。"""
-    _dd_llm_guard()
-    name = file.filename or "file"
-    data = await file.read(20 * 1024 * 1024 + 1)
-    await file.close()
-    if len(data) > 20 * 1024 * 1024:
-        raise HTTPException(status_code=413, detail="文件过大(上限 20MB)")
-    if not data:
-        raise HTTPException(status_code=422, detail="空文件")
-    text = _dd_extract_text(name, data)
-
-    tid = tenant_of(user)
-    connection = connect_db()  # 先校验项目归属,LLM 长调用期间不占连接
-    try:
-        with connection.cursor() as cursor:
-            _assert_project(cursor, project_id, tid)
-    finally:
-        connection.close()
-
-    try:
-        result = llm.chat_json(
-            [
-                {"role": "system", "content": _DD_EXPERT_PROMPT + "\n\n" + _DD_CLASSIFY_PROMPT},
-                {"role": "user", "content": f"文件名:{name}\n\n材料全文(截断):\n\n{text[:_DD_TEXT_LIMIT]}"},
-            ],
-            temperature=0.1,
-            max_tokens=2000,
-        )
-    except llm.LLMNotConfigured as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
-    except llm.LLMError as exc:
-        raise HTTPException(status_code=502, detail=str(exc))
+def _dd_run_analyze(project_id: int, user: AuthedUser, name: str, data: bytes, text: str,
+                    *, stream: bool = False) -> dict[str, Any]:
+    """analyze 主体(AI 判类 → 收敛脏值 → 暂存文件 → 审计),流式/非流式端点共用。
+    返回体即老端点响应;llm.LLMError/LLMNotConfigured 原样抛出,由调用方
+    各自转 HTTP 错误(老端点)或 SSE error 帧(流式端点)。"""
+    result = llm.chat_json(
+        [
+            {"role": "system", "content": _DD_EXPERT_PROMPT + "\n\n" + _DD_CLASSIFY_PROMPT},
+            {"role": "user", "content": f"文件名:{name}\n\n材料全文(截断):\n\n{text[:_DD_TEXT_LIMIT]}"},
+        ],
+        temperature=0.1,
+        max_tokens=2000,
+    )
     if not isinstance(result, dict):
         raise HTTPException(status_code=502, detail="AI 返回结构异常,请重试")
 
@@ -6432,13 +6449,100 @@ async def dd_analyze_document(
     connection = connect_db()
     try:
         with connection.cursor() as cursor:
+            after = {"module": module, "doc_label": proposal["doc_label"]}
+            if stream:
+                after["stream"] = True  # 审计里区分走的是流式端点
             audit_id = write_audit(cursor, user.user_id, "dd.analyze", "dd_document", project_id,
-                                   safe_name, after={"module": module, "doc_label": proposal["doc_label"]})
+                                   safe_name, after=after)
         connection.commit()
     finally:
         connection.close()
     return {"ok": True, "token": token, "proposal": proposal, "file_name": name,
             "chars": len(text), "model": llm.status()["model"], "audit_id": audit_id}
+
+
+@app.post("/api/projects/{project_id}/dd/analyze")
+async def dd_analyze_document(
+    project_id: int,
+    file: UploadFile = File(...),
+    user: AuthedUser = Depends(require_permission("project.edit")),
+) -> dict[str, Any]:
+    """尽调材料预分析(**不落库**):抽文本 → AI 判模块/材料类型/摘要/关键事实,
+    文件暂存 dd_tmp/{token},前端预览确认后携 token 调 commit 才真正归档。"""
+    _dd_llm_guard()
+    name = file.filename or "file"
+    data = await file.read(20 * 1024 * 1024 + 1)
+    await file.close()
+    if len(data) > 20 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="文件过大(上限 20MB)")
+    if not data:
+        raise HTTPException(status_code=422, detail="空文件")
+    text = _dd_extract_text(name, data)
+
+    tid = tenant_of(user)
+    connection = connect_db()  # 先校验项目归属,LLM 长调用期间不占连接
+    try:
+        with connection.cursor() as cursor:
+            _assert_project(cursor, project_id, tid)
+    finally:
+        connection.close()
+
+    try:
+        return _dd_run_analyze(project_id, user, name, data, text)
+    except llm.LLMNotConfigured as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except llm.LLMError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+@app.post("/api/projects/{project_id}/dd/analyze/stream")
+async def dd_analyze_document_stream(
+    project_id: int,
+    file: UploadFile = File(...),
+    user: AuthedUser = Depends(require_permission("project.edit")),
+) -> StreamingResponse:
+    """dd/analyze 的 SSE 流式版(老端点原样保留):阶段帧让前端看到 AI 在干什么。
+    帧契约(统一 `data: {json}\\n\\n`):
+      {"type":"stage","label":...} → {"type":"result",content_type+老端点全部字段} / {"type":"error","message":...}"""
+    _dd_llm_guard()
+    name = file.filename or "file"
+    content_type = file.content_type or None
+    data = await file.read(20 * 1024 * 1024 + 1)
+    await file.close()
+    if len(data) > 20 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="文件过大(上限 20MB)")
+    if not data:
+        raise HTTPException(status_code=422, detail="空文件")
+    tid = tenant_of(user)
+    connection = connect_db()  # 项目归属流开始前校验(此时仍能走常规 4xx),流期间不占连接
+    try:
+        with connection.cursor() as cursor:
+            _assert_project(cursor, project_id, tid)
+    finally:
+        connection.close()
+
+    def event_stream():
+        def frame(obj: dict[str, Any]) -> str:
+            return "data: " + dumps(obj, ensure_ascii=False) + "\n\n"
+
+        try:
+            yield frame({"type": "stage", "label": "正在读取文件"})
+            text = _dd_extract_text(name, data)
+            yield frame({"type": "stage", "label": "AI 正在判断材料类别"})
+            result = _dd_run_analyze(project_id, user, name, data, text, stream=True)
+            yield frame({"type": "result", "content_type": content_type, **result})
+        except HTTPException as exc:  # 抽取失败等:流已开、HTTP 状态定格 200,只能帧内报错
+            yield frame({"type": "error", "message": str(exc.detail)})
+        except (llm.LLMError, llm.LLMNotConfigured) as exc:
+            yield frame({"type": "error", "message": str(exc)})
+        except Exception as exc:  # noqa: BLE001 —— 兜底,避免流中断成白屏
+            yield frame({"type": "error", "message": f"分析失败:{exc}"})
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+    )
 
 
 @app.post("/api/projects/{project_id}/dd/commit")
@@ -6506,8 +6610,16 @@ def dd_commit_document(
         raise HTTPException(status_code=502, detail="AI 融合失败(未产出模块文档),材料未入库,请重试")
     gaps_md = str(merged.get("gaps_md") or "").strip()
     flags_md = str(merged.get("flags_md") or "").strip()
+    return _dd_land_commit(project_id, tid, user, payload, tmp_path, txt_path,
+                           content_md, gaps_md, flags_md, module_name)
 
-    # LLM 成功后才落定:归档文件 + 单事务写 dd_documents / dd_sections / 审计
+
+def _dd_land_commit(project_id: int, tid: Any, user: AuthedUser, payload: DdCommitPayload,
+                    tmp_path: str, txt_path: str, content_md: str, gaps_md: str, flags_md: str,
+                    module_name: str, *, stream: bool = False) -> dict[str, Any]:
+    """commit 落库主体(LLM 成功后才落定:归档文件 + 单事务写 dd_documents /
+    dd_sections / 审计 + 清暂存),流式/非流式端点共用;返回体即老端点响应。"""
+    file_label = payload.file_name.strip()
     safe_name = re.sub(r"[^\w.\-一-鿿]", "_", file_label or "file")[:200]
     stored_name = f"{project_id}_{uuid.uuid4().hex[:10]}_{safe_name}"
     os.makedirs(_DD_DOC_DIR, exist_ok=True)
@@ -6535,9 +6647,11 @@ def dd_commit_document(
                      flags_md=VALUES(flags_md), status='draft', confirmed_by=NULL, confirmed_at=NULL""",
                 (tid, project_id, payload.module, content_md, gaps_md, flags_md),
             )
+            after = {"module": payload.module, "doc_label": payload.doc_label}
+            if stream:
+                after["stream"] = True  # 审计里区分走的是流式端点
             audit_id = write_audit(cursor, user.user_id, "dd.commit", "dd_document", document_id,
-                                   f"{module_name}:{safe_name}",
-                                   after={"module": payload.module, "doc_label": payload.doc_label})
+                                   f"{module_name}:{safe_name}", after=after)
         connection.commit()
     finally:
         connection.close()
@@ -6560,6 +6674,110 @@ def dd_commit_document(
         "section": {"module": payload.module, "module_name": module_name, "status": "draft",
                     "content_md": content_md, "gaps_md": gaps_md, "flags_md": flags_md},
     }
+
+
+@app.post("/api/projects/{project_id}/dd/commit/stream")
+def dd_commit_document_stream(
+    project_id: int,
+    payload: DdCommitPayload,
+    user: AuthedUser = Depends(require_permission("project.edit")),
+) -> StreamingResponse:
+    """dd/commit 的 SSE 流式版(老端点原样保留):AI 融合过程**逐增量可视**。
+    帧契约(统一 `data: {json}\\n\\n`):
+      {"type":"stage","label":...}
+      {"type":"delta","section":"content|gaps|flags","text":增量}(分隔符行本身不下发)
+      {"type":"done","document_id":...,"audit_id":...,"landed":...,"message":...,"section":{...}}
+      {"type":"error","message":...}(暂存文件保留,token 仍可重试)
+    实现:LLM 按 _DD_MERGE_STREAM_PROMPT 产三段分隔符文本;服务端**按行缓冲**做
+    分隔符状态机把增量路由到对应段(跨 chunk 到达的分隔符也不会误判);流结束后
+    以完整文本重切三段为准落库,入库逻辑与老 commit 完全一致(失败不落库)。"""
+    _dd_llm_guard()
+    # ── 流开始前的校验与备料(与老 commit 相同;此阶段仍能走常规 4xx)──
+    if payload.module not in _DD_MODULE_NAMES:
+        raise HTTPException(status_code=422, detail=f"module 须为 {'/'.join(_DD_MODULE_ORDER)} 之一")
+    if not re.fullmatch(r"[0-9a-f]{32}", payload.token):  # token 即文件名前缀,严格校验防路径穿越
+        raise HTTPException(status_code=422, detail="token 非法")
+    module_name = _DD_MODULE_NAMES[payload.module]
+    tmp_files = [fn for fn in (os.listdir(_DD_TMP_DIR) if os.path.isdir(_DD_TMP_DIR) else [])
+                 if fn.startswith(payload.token + "__")]
+    txt_path = os.path.join(_DD_TMP_DIR, f"{payload.token}.txt")
+    if not tmp_files or not os.path.isfile(txt_path):
+        raise HTTPException(status_code=404, detail="暂存材料不存在或已过期(24h),请重新上传分析")
+    tmp_path = os.path.join(_DD_TMP_DIR, tmp_files[0])
+    with open(txt_path, "r", encoding="utf-8") as fh:
+        text = fh.read()
+
+    tid = tenant_of(user)
+    connection = connect_db()  # 短连接:校验项目 + 取该模块现有尽调文档,LLM 流期间不占连接
+    try:
+        with connection.cursor() as cursor:
+            _assert_project(cursor, project_id, tid)
+            cursor.execute(
+                "SELECT content_md, gaps_md, flags_md FROM dd_sections WHERE project_id=%s AND module=%s",
+                (project_id, payload.module),
+            )
+            existing = cursor.fetchone() or {}
+    finally:
+        connection.close()
+
+    old_md = str(existing.get("content_md") or "").strip()
+    file_label = payload.file_name.strip()
+    user_prompt = (
+        f"模块:{module_name}({payload.module})\n"
+        f"新材料文件名:{file_label}\n"
+        f"新材料类型:{payload.doc_label or '未标注'}\n"
+        f"新材料摘要(用户已确认):{(payload.summary or '').strip() or '无'}\n\n"
+        f"── 该模块已有尽调文档 ──\n{old_md or '(空,首份材料,从头搭骨架)'}\n\n"
+        f"── 该模块已有缺口清单 ──\n{str(existing.get('gaps_md') or '').strip() or '(空)'}\n\n"
+        f"── 新材料全文(截断)──\n{text[:_DD_TEXT_LIMIT]}"
+    )
+    messages = [{"role": "system", "content": _DD_EXPERT_PROMPT + "\n\n" + _DD_MERGE_STREAM_PROMPT},
+                {"role": "user", "content": user_prompt}]
+
+    def event_stream():
+        def frame(obj: dict[str, Any]) -> str:
+            return "data: " + dumps(obj, ensure_ascii=False) + "\n\n"
+
+        try:
+            yield frame({"type": "stage", "label": "正在通读已有尽调文档与新材料"})
+            chunks: list[str] = []  # 全量累积:流结束后重切三段,以此为准落库
+            buf = ""                # 行缓冲:分隔符必须整行匹配,拆在两个 chunk 里也不会误判/漏判
+            section: str | None = None  # 当前增量归属段;首个分隔符之前的开场白不下发
+            for delta in llm.chat_stream(messages, temperature=0.2, max_tokens=4000):
+                chunks.append(delta)
+                buf += delta
+                while "\n" in buf:  # 只路由完整行,末尾半行(可能是半个分隔符)留在缓冲
+                    line, buf = buf.split("\n", 1)
+                    marker = _DD_STREAM_MARKERS.get(line.strip())
+                    if marker:
+                        section = marker  # 分隔符行本身不下发
+                    elif section is not None:
+                        yield frame({"type": "delta", "section": section, "text": line + "\n"})
+            marker = _DD_STREAM_MARKERS.get(buf.strip())  # 冲刷缓冲里最后一个不带换行的尾巴
+            if marker:
+                section = marker
+            elif section is not None and buf:
+                yield frame({"type": "delta", "section": section, "text": buf})
+
+            parts = _dd_split_stream_output("".join(chunks))
+            if not parts["content"]:
+                yield frame({"type": "error", "message": "AI 融合失败(未产出模块文档),材料未入库,请重试"})
+                return
+            # gaps/flags 允许为空串;入库与老 commit 完全一致
+            resp = _dd_land_commit(project_id, tid, user, payload, tmp_path, txt_path,
+                                   parts["content"], parts["gaps"], parts["flags"], module_name, stream=True)
+            yield frame({"type": "done", "document_id": resp["document_id"], "audit_id": resp["audit_id"],
+                         "landed": resp["landed"], "message": resp["message"], "section": resp["section"]})
+        except (llm.LLMError, llm.LLMNotConfigured) as exc:
+            yield frame({"type": "error", "message": f"AI 融合中断:{exc}。材料仍在暂存区,可稍后重试。"})
+        except Exception as exc:  # noqa: BLE001 —— 落库等异常兜底,避免流中断成白屏
+            yield frame({"type": "error", "message": f"归档失败:{exc}。材料仍在暂存区,可稍后重试。"})
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+    )
 
 
 def _dd_completeness(row: dict[str, Any] | None) -> int:

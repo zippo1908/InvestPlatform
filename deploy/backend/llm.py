@@ -235,13 +235,92 @@ def _claude_chat(messages: list[dict[str, str]], timeout: float | None = None) -
     return text
 
 
-def _tinci_agent_chat(c: dict[str, Any], messages: list[dict[str, str]]) -> str:
-    """公司 AI 网关(ai.tinci.com,自研 agent SSE 接口)单轮补全适配。
+def _claude_chat_stream(messages: list[dict[str, str]]):
+    """claude -p 真流式:`--output-format stream-json --include-partial-messages` 起子进程,
+    逐行读 stdout,yield 文本增量。
 
-    非 OpenAI 协议:POST /api/v1/chat/stream(SSE),body 带 agentId/message/conversationId/
-    modelName/modelProvider,鉴权 Bearer + x-workspace-id。把 system+user 拼成单条 message,
-    消费流:优先取 done 事件 segments 里 type=content 的完整文本,兜底累积 content_delta。
-    (移植自采购台 core/llm.py,httpx 改标准库 urllib。)"""
+    事件解析(Claude Code stream-json 结构):
+    - type=stream_event 且 event.type=content_block_delta、delta.type=text_delta → 文本增量;
+    - 兼容不产 partial 事件的旧版 CLI:type=assistant 帧带整段 message.content[].text,
+      仅在此前**没有任何增量**时一次性下发,避免与 delta 重复。
+    并发闸沿用 _claude_gate(生成器存活期间占一个名额);总时长超 LLM_TIMEOUT 由
+    看门狗线程 kill 进程并抛 LLMError;退出码非 0 且无任何输出也抛 LLMError。"""
+    system = "\n\n".join(m["content"] for m in messages if m.get("role") == "system")
+    prompt = "\n\n".join(m["content"] for m in messages if m.get("role") != "system")
+    if not prompt.strip():
+        raise LLMError("claude-cli:没有可发送的用户内容")
+    cmd = [
+        "claude", "-p", prompt,
+        "--output-format", "stream-json",
+        "--include-partial-messages",
+        "--verbose",  # CLI 要求:-p 搭配 stream-json 必须带 --verbose 才逐事件输出
+        "--max-turns", "3",
+        "--disallowedTools", _NO_TOOLS,
+        "--append-system-prompt",
+        (system + "\n\n" if system else "") + "直接输出最终回答,不要调用任何工具,不要解释你的过程。",
+    ]
+    timeout = _cfg()["timeout"]
+    with _claude_gate:
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        except Exception as exc:  # noqa: BLE001
+            raise LLMError(f"claude-cli 启动失败: {exc}")
+        # stderr 用后台线程排空:防止 stderr 管道写满时,子进程阻塞写、主线程阻塞读 stdout 互相卡死。
+        stderr_buf: list[str] = []
+        drain = threading.Thread(target=lambda: stderr_buf.append(proc.stderr.read() or ""), daemon=True)
+        drain.start()
+        # 超时看门狗:readline 会一直阻塞,循环内计时截不住;到点直接 kill 进程,
+        # stdout 随即 EOF,循环自然退出后按 timed_out 抛错。
+        timed_out = threading.Event()
+
+        def _kill_on_timeout() -> None:
+            timed_out.set()
+            proc.kill()
+
+        timer = threading.Timer(timeout, _kill_on_timeout)
+        timer.start()
+        emitted = 0
+        try:
+            for raw in proc.stdout:
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                kind = obj.get("type")
+                if kind == "stream_event":
+                    ev = obj.get("event") or {}
+                    if ev.get("type") == "content_block_delta":
+                        delta = ev.get("delta") or {}
+                        if delta.get("type") == "text_delta" and delta.get("text"):
+                            emitted += 1
+                            yield delta["text"]
+                elif kind == "assistant" and emitted == 0:
+                    content = (obj.get("message") or {}).get("content") or []
+                    text = "".join(b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text")
+                    if text:
+                        emitted += 1
+                        yield text
+            proc.wait()
+        finally:
+            # 消费方中途断开(GeneratorExit)也会走到这:停表、杀进程,不留孤儿。
+            timer.cancel()
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+        if timed_out.is_set():
+            raise LLMError(f"claude-cli 流式调用超时(>{timeout:.0f}s,进程已终止)")
+        if emitted == 0:
+            drain.join(timeout=2)
+            err = (stderr_buf[0] if stderr_buf else "")[:200]
+            raise LLMError(f"claude-cli 流式返回空内容(exit={proc.returncode}): {err}")
+
+
+def _tinci_build_request(c: dict[str, Any], messages: list[dict[str, str]]) -> urllib.request.Request:
+    """公司 AI 网关请求构造(非流式/流式共用):把 system+user 拼成单条 message,
+    POST /api/v1/chat/stream(SSE),鉴权 Bearer + x-workspace-id。"""
     import uuid
 
     system = "\n\n".join(m["content"] for m in messages if m.get("role") == "system")
@@ -265,29 +344,46 @@ def _tinci_agent_chat(c: dict[str, Any], messages: list[dict[str, str]]) -> str:
     req.add_header("Accept", "text/event-stream")
     req.add_header("authorization", f"Bearer {c['tinci_token']}")
     req.add_header("x-workspace-id", str(c["tinci_workspace_id"]))
+    return req
+
+
+def _tinci_sse_events(resp):
+    """逐行解析网关 SSE(非流式/流式共用):yield (事件名, data 字典);data 非 JSON 的行跳过。"""
+    cur = None
+    for raw in resp:
+        line = raw.decode("utf-8", "ignore").rstrip("\r\n")
+        if line.startswith("event:"):
+            cur = line[6:].strip()
+        elif line.startswith("data:"):
+            try:
+                d = json.loads(line[5:])
+            except ValueError:
+                continue
+            yield cur, d
+
+
+def _tinci_agent_chat(c: dict[str, Any], messages: list[dict[str, str]]) -> str:
+    """公司 AI 网关(ai.tinci.com,自研 agent SSE 接口)单轮补全适配。
+
+    非 OpenAI 协议:POST /api/v1/chat/stream(SSE),body 带 agentId/message/conversationId/
+    modelName/modelProvider,鉴权 Bearer + x-workspace-id。把 system+user 拼成单条 message,
+    消费流:优先取 done 事件 segments 里 type=content 的完整文本,兜底累积 content_delta。
+    (移植自采购台 core/llm.py,httpx 改标准库 urllib。)"""
+    req = _tinci_build_request(c, messages)
     text = ""
     try:
         with urllib.request.urlopen(req, timeout=c["timeout"]) as resp:
-            cur = None
-            for raw in resp:
-                line = raw.decode("utf-8", "ignore").rstrip("\r\n")
-                if line.startswith("event:"):
-                    cur = line[6:].strip()
-                elif line.startswith("data:"):
-                    try:
-                        d = json.loads(line[5:])
-                    except ValueError:
-                        continue
-                    if cur == "content_delta" and "delta" in d:
-                        text += d["delta"]
-                    elif cur == "done" and "segments" in d:
-                        seg = "".join(s.get("text", "") for s in d["segments"] if s.get("type") == "content")
-                        if seg:
-                            text = seg
-                    elif cur == "error":
-                        # 网关用 HTTP 200 + SSE error 帧报错(如 token 过期"未登录,请先登录"),
-                        # HTTP 层抓不到——显式抛错,否则失败被静默吞、无从排查。
-                        raise LLMError(f"Tinci AI 网关返回错误帧: {d.get('message') or d}")
+            for cur, d in _tinci_sse_events(resp):
+                if cur == "content_delta" and "delta" in d:
+                    text += d["delta"]
+                elif cur == "done" and "segments" in d:
+                    seg = "".join(s.get("text", "") for s in d["segments"] if s.get("type") == "content")
+                    if seg:
+                        text = seg
+                elif cur == "error":
+                    # 网关用 HTTP 200 + SSE error 帧报错(如 token 过期"未登录,请先登录"),
+                    # HTTP 层抓不到——显式抛错,否则失败被静默吞、无从排查。
+                    raise LLMError(f"Tinci AI 网关返回错误帧: {d.get('message') or d}")
     except LLMError:
         raise
     except urllib.error.HTTPError as exc:
@@ -298,6 +394,39 @@ def _tinci_agent_chat(c: dict[str, Any], messages: list[dict[str, str]]) -> str:
     if not text:
         raise LLMError("Tinci AI 返回空内容(无 content/done 段)")
     return text
+
+
+def _tinci_agent_chat_stream(c: dict[str, Any], messages: list[dict[str, str]]):
+    """公司 AI 网关流式变体(与 _tinci_agent_chat 共用请求构造与 SSE 解析):
+    content_delta 逐段 yield,done 事件仍作结束信号——此前已有增量则不再回吐整段,
+    避免下游拼出重复内容;全程无增量时才用 done.segments 一次性补发。"""
+    req = _tinci_build_request(c, messages)
+    emitted = False
+    try:
+        with urllib.request.urlopen(req, timeout=c["timeout"]) as resp:
+            for cur, d in _tinci_sse_events(resp):
+                if cur == "content_delta" and d.get("delta"):
+                    emitted = True
+                    yield d["delta"]
+                elif cur == "done":
+                    if not emitted and "segments" in d:
+                        seg = "".join(s.get("text", "") for s in d["segments"] if s.get("type") == "content")
+                        if seg:
+                            emitted = True
+                            yield seg
+                    break
+                elif cur == "error":
+                    # 同 _tinci_agent_chat:HTTP 200 + error 帧,必须显式抛。
+                    raise LLMError(f"Tinci AI 网关返回错误帧: {d.get('message') or d}")
+    except LLMError:
+        raise
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "ignore")[:400]
+        raise LLMError(f"Tinci AI HTTP {exc.code}: {detail}")
+    except Exception as exc:  # noqa: BLE001
+        raise LLMError(f"Tinci AI 调用失败: {type(exc).__name__}: {exc}")
+    if not emitted:
+        raise LLMError("Tinci AI 返回空内容(无 content/done 段)")
 
 
 def _not_configured_msg(provider: str) -> str:
@@ -336,15 +465,8 @@ def chat(messages: list[dict[str, str]], *, temperature: float = 0.2, max_tokens
         raise
 
 
-def chat_stream(messages: list[dict[str, str]], *, temperature: float = 0.3, max_tokens: int = 1500):
-    """流式调用:逐 token yield 文本增量(SSE 低延迟体验的后端来源)。
-    claude-cli / tinci-agent 不支持逐 token 流,降级为一次性 yield 完整回答(前端仍可用)。"""
-    c = _cfg()
-    if not is_configured():
-        raise LLMNotConfigured(_not_configured_msg(c["provider"]))
-    if c["provider"] != "openai":
-        yield chat(messages, temperature=temperature, max_tokens=max_tokens)
-        return
+def _openai_chat_stream(c: dict[str, Any], messages: list[dict[str, str]], *, temperature: float, max_tokens: int):
+    """OpenAI 兼容 /chat/completions 流式(历史行为,原样从 chat_stream 提出)。"""
     body = {
         "model": c["model"],
         "messages": messages,
@@ -382,6 +504,41 @@ def chat_stream(messages: list[dict[str, str]], *, temperature: float = 0.3, max
             continue
         if delta:
             yield delta
+
+
+def chat_stream(messages: list[dict[str, str]], *, temperature: float = 0.3, max_tokens: int = 1500):
+    """流式调用:逐 token yield 文本增量(SSE 低延迟体验的后端来源)。
+
+    三种 provider 均为**真流式**:openai 走 /chat/completions stream;
+    claude-cli 走 `claude -p --output-format stream-json` 逐事件;
+    tinci-agent 逐段消费网关 content_delta。
+
+    失败兜底与 chat() 同向:选定 provider 抛 LLMError 且**尚未产出任何增量**时,
+    若本机 claude 可用则兜底改 yield claude-cli 流(打 warning 日志);
+    已经吐过增量的中途失败不重播(重播会让下游拼出重复内容),直接抛 LLMError。"""
+    c = _cfg()
+    if not is_configured():
+        raise LLMNotConfigured(_not_configured_msg(c["provider"]))
+    if c["provider"] == "claude-cli":
+        yield from _claude_chat_stream(messages)
+        return
+    emitted = False
+    try:
+        if c["provider"] == "tinci-agent":
+            source = _tinci_agent_chat_stream(c, messages)
+        else:
+            source = _openai_chat_stream(c, messages, temperature=temperature, max_tokens=max_tokens)
+        for delta in source:
+            emitted = True
+            yield delta
+    except LLMError as exc:
+        if emitted or not _claude_available():
+            raise
+        logger.warning("LLM provider=%s 流式调用失败,兜底本机 claude-cli 流: %s", c["provider"], exc)
+        try:
+            yield from _claude_chat_stream(messages)
+        except LLMError as exc2:
+            raise LLMError(f"{exc};claude-cli 兜底亦失败: {exc2}")
 
 
 def chat_json(messages: list[dict[str, str]], **kwargs: Any) -> Any:

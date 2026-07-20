@@ -71,7 +71,7 @@ import type { DataRow, Project, Screen } from './data'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
 import html2canvas from 'html2canvas'
-import { API_BASE, apiDelete, apiDownload, apiGet, apiPatch, apiPost, apiPut, auditDetail, getPerms, getRoles, getToken, getUserName, setPerms, setRoles, setUserName, streamPost, setToken } from './api'
+import { API_BASE, apiDelete, apiDownload, apiGet, apiPatch, apiPost, apiPut, auditDetail, getPerms, getRoles, getToken, getUserName, setPerms, setRoles, setUserName, streamPost, streamPostForm, setToken } from './api'
 import { FLOW_TYPES, type FlowField, type FlowTypeDef } from './flowCenter'
 import LoginScene from './LoginScene'
 
@@ -4626,7 +4626,6 @@ const DD_MODULES: Array<{ key: string; cn: string }> = [
   { key: 'risk', cn: '风险与其他' },
 ]
 const DD_MODULE_CN: Record<string, string> = Object.fromEntries(DD_MODULES.map((m) => [m.key, m.cn]))
-const DD_MSGS = ['正在阅读材料…', '正在判断材料类别…', '正在对照尽调清单…', '正在提炼关键事实与风险…']
 const DD_STATUS_TAG: Record<string, { cn: string; tone: string }> = {
   empty: { cn: '空', tone: 'tone-gray' },
   draft: { cn: '草稿', tone: 'tone-orange' },
@@ -4644,6 +4643,137 @@ type DdPending = { file: File; token: string; proposal: DdProposal; module: stri
 const ddIs404 = (e: unknown): boolean => e instanceof Error && (e.message.includes('404') || e.message.includes('Not Found'))
 const ddErrMsg = (e: unknown): string =>
   ddIs404(e) ? '尽调后端接口尚未上线(并行开发中),稍后再试' : e instanceof Error ? e.message : 'API 调用失败'
+
+// 三形状载入动画:圆○ 方□ 三角△ 逐个旋转(同一时刻只有一个在转),纯 CSS
+// keyframes + animation-delay 实现,无 JS 定时器;done 时形状换成 ✓。
+function DdShapesLoader({ label, done }: { label?: string; done?: boolean }) {
+  return (
+    <div className="dd-shapes-loader" data-testid="dd-shapes-loader">
+      {done ? (
+        <span className="dd-shapes-done"><CheckCircle size={26} /></span>
+      ) : (
+        <span className="dd-shapes-row" aria-hidden="true">
+          <i className="dd-shape dd-shape-circle" />
+          <i className="dd-shape dd-shape-square" />
+          <i className="dd-shape dd-shape-triangle" />
+        </span>
+      )}
+      {label ? <p className="dd-shapes-label">{label}</p> : null}
+    </div>
+  )
+}
+
+// commit 流式「生成视图」的状态机:wait(首帧前)→ streaming(delta 追加)→ done | error。
+type DdGenSectionKey = 'content' | 'gaps' | 'flags'
+type DdGenState = {
+  phase: 'wait' | 'streaming' | 'done' | 'error'
+  stage: string | null
+  content: string
+  gaps: string
+  flags: string
+  last: DdGenSectionKey | null // 最近收到增量的区,光标闪烁跟着它
+  module: string
+  error?: string
+}
+
+const DD_GEN_SECTIONS: Array<{ key: DdGenSectionKey; cn: string; cls: string }> = [
+  { key: 'content', cn: '模块文档', cls: '' },
+  { key: 'gaps', cn: '还缺什么', cls: 'is-gap' },
+  { key: 'flags', cn: '风险提示', cls: 'is-flag' },
+]
+
+// 生成视图弹层:用户能看着尽调文档逐字生长。生成期间点遮罩不关(防误触),
+// 只提示等待;error 时提供「用稳妥模式重试」(走老 commit 一次性端点)。
+function DdGenerateModal({ state, fileName, retrying, onRetry, onClose }: {
+  state: DdGenState
+  fileName: string
+  retrying: boolean
+  onRetry: () => void
+  onClose: () => void
+}) {
+  const contentRef = useRef<HTMLDivElement>(null)
+  const [blockHint, setBlockHint] = useState(false)
+
+  // 文档区自动滚到底,视线始终跟着最新生成的文字。
+  useEffect(() => {
+    const el = contentRef.current
+    if (el) el.scrollTop = el.scrollHeight
+  }, [state.content])
+
+  const busy = state.phase === 'wait' || state.phase === 'streaming'
+  const hasBody = Boolean(state.content || state.gaps || state.flags)
+  const moduleCn = DD_MODULE_CN[state.module] ?? state.module
+
+  return (
+    <div
+      className="eq-modal-backdrop"
+      data-testid="dd-generate-modal"
+      onClick={() => { if (busy) setBlockHint(true); else if (state.phase === 'error') onClose() }}
+    >
+      <div className="eq-modal dd-gen-modal" onClick={(e) => e.stopPropagation()}>
+        <div className="eq-modal-head">
+          <h3>
+            {state.phase === 'done' ? '尽调底稿已生成'
+              : state.phase === 'error' ? '生成遇到问题'
+                : `AI 正在把「${fileName}」写进${moduleCn}底稿`}
+          </h3>
+          {state.phase === 'error' && (
+            <button type="button" className="icon-button" aria-label="关闭" onClick={onClose}><X size={18} /></button>
+          )}
+        </div>
+
+        {!hasBody ? (
+          <div className="dd-gen-wait">
+            <DdShapesLoader
+              done={state.phase === 'done'}
+              label={state.phase === 'done' ? '生成完成' : state.stage || 'AI 正在通读材料、准备动笔…'}
+            />
+          </div>
+        ) : (
+          <>
+            {busy && state.stage ? <p className="dd-gen-stage">{state.stage}</p> : null}
+            {DD_GEN_SECTIONS.map((s) => {
+              const text = state[s.key]
+              if (!text && s.key !== 'content') return null // gaps/flags 有内容才出现,少占视线
+              return (
+                <details key={s.key} className={classNames('dd-gen-sec', s.cls)} open data-testid={`dd-gen-${s.key}`}>
+                  <summary>{s.cn}</summary>
+                  <div className="dd-gen-body" ref={s.key === 'content' ? contentRef : undefined}>
+                    {text || '…'}
+                    {state.phase === 'streaming' && state.last === s.key ? <span className="dd-gen-cursor" /> : null}
+                  </div>
+                </details>
+              )
+            })}
+            {state.phase === 'done' && (
+              <div className="dd-gen-donebar" data-testid="dd-gen-done">
+                <CheckCircle size={16} /> 已写入「{moduleCn}」,正在带你过去…
+              </div>
+            )}
+          </>
+        )}
+
+        {state.phase === 'error' ? (
+          <>
+            <p className="dd-gen-error" data-testid="dd-gen-error">{state.error || '生成失败,请重试。'}</p>
+            <div className="button-row eq-modal-actions">
+              <button type="button" className="primary-button" disabled={retrying} onClick={onRetry} data-testid="dd-gen-retry">
+                {retrying ? '稳妥模式生成中…' : '用稳妥模式重试'}
+              </button>
+              <button type="button" className="secondary-button" disabled={retrying} onClick={onClose}>关闭</button>
+            </div>
+          </>
+        ) : (
+          <p className={classNames('muted-note dd-gen-note', blockHint && 'is-hint')}>
+            {blockHint
+              ? 'AI 还在生成中,请稍候——马上就好,完成后会自动归档并带你到对应模块。'
+              : '生成期间请不要关闭本窗口;完成后会自动归档并跳到对应模块。'}
+          </p>
+        )}
+      </div>
+    </div>
+  )
+}
 
 // 确认卡:AI 判定结果给用户过目——这是什么、归哪个模块、为什么有用;模块可改;点头才 commit。
 function DdConfirmModal({ pending, committing, onModule, onCommit, onClose }: {
@@ -4710,8 +4840,10 @@ function DdWorkbench({ projectId, projectName, canWrite, onToast }: {
   const [reloadKey, setReloadKey] = useState(0)
   const reload = () => setReloadKey((k) => k + 1)
   const [analyzing, setAnalyzing] = useState<string | null>(null) // 正在分析的文件名(等待动画)
+  const [analyzeStage, setAnalyzeStage] = useState<string | null>(null) // analyze 流式 stage 文案
   const [pending, setPending] = useState<DdPending | null>(null)
   const [committing, setCommitting] = useState(false)
+  const [genState, setGenState] = useState<DdGenState | null>(null) // commit 流式生成视图
   const [activeModule, setActiveModule] = useState('business')
   const [editModule, setEditModule] = useState<string | null>(null)
   const [editText, setEditText] = useState('')
@@ -4730,54 +4862,141 @@ function DdWorkbench({ projectId, projectName, canWrite, onToast }: {
 
   // 切项目时收起编辑/待确认状态,回到第一个模块。
   useEffect(() => {
-    setPending(null); setEditModule(null); setActiveModule('business')
+    setPending(null); setGenState(null); setEditModule(null); setActiveModule('business')
   }, [projectId])
+
+  // 老 /dd/analyze 一次性端点:流式端点 404/解析失败时的降级路径。
+  const analyzeOnce = async (f: File): Promise<{ token: string; proposal: DdProposal }> => {
+    const fd = new FormData()
+    fd.append('file', f)
+    const token = getToken()
+    const res = await fetch(`${API_BASE}/api/projects/${projectId}/dd/analyze`, {
+      method: 'POST', headers: token ? { Authorization: `Bearer ${token}` } : {}, body: fd,
+    })
+    if (!res.ok) throw new Error(res.status === 404 ? '404' : (await res.text()) || `HTTP ${res.status}`)
+    return await res.json() as { token: string; proposal: DdProposal }
+  }
 
   const analyzeFile = async (f: File) => {
     if (!canWrite) { onToast({ title: '无编辑权限', detail: '当前账号没有项目编辑权限,无法上传尽调材料' }); return }
     if (f.size > 20 * 1024 * 1024) { onToast({ title: '文件过大', detail: '上限 20MB' }); return }
     setAnalyzing(f.name)
+    setAnalyzeStage(null)
     try {
-      const fd = new FormData()
-      fd.append('file', f)
-      const token = getToken()
-      const res = await fetch(`${API_BASE}/api/projects/${projectId}/dd/analyze`, {
-        method: 'POST', headers: token ? { Authorization: `Bearer ${token}` } : {}, body: fd,
-      })
-      if (!res.ok) throw new Error(res.status === 404 ? '404' : (await res.text()) || `HTTP ${res.status}`)
-      const out = await res.json() as { token: string; proposal: DdProposal }
+      // 首选流式端点:stage 帧驱动等待区文案,result 帧即 analyze 结果。
+      let out: { token: string; proposal: DdProposal } | null = null
+      let frameErr: string | null = null
+      try {
+        const fd = new FormData()
+        fd.append('file', f)
+        await streamPostForm(`/api/projects/${projectId}/dd/analyze/stream`, fd, (ev) => {
+          const t = ev.type
+          if (t === 'stage') setAnalyzeStage(typeof ev.label === 'string' ? ev.label : null)
+          else if (t === 'result') out = { token: String(ev.token ?? ''), proposal: ev.proposal as DdProposal }
+          else if (t === 'error') frameErr = typeof ev.message === 'string' && ev.message ? ev.message : 'AI 分析失败'
+        })
+      } catch {
+        // 流式端点不可用(404/网络/解析失败)→ 静默退回一次性端点,保持可用。
+        out = null
+        frameErr = null
+      }
+      if (frameErr) throw new Error(frameErr) // 后端明确报错:toast + 回上传态,不再降级
+      if (!out) out = await analyzeOnce(f)
+      if (!out.token || !out.proposal) throw new Error('AI 分析返回不完整,请重试')
       // AI 给的模块若不在五模块里,兜底到「风险与其他」,不让用户卡住。
       setPending({ file: f, token: out.token, proposal: out.proposal, module: DD_MODULE_CN[out.proposal.module] ? out.proposal.module : 'risk' })
     } catch (e) {
       onToast({ title: 'AI 分析失败', detail: ddErrMsg(e) })
     } finally {
       setAnalyzing(null)
+      setAnalyzeStage(null)
     }
+  }
+
+  const commitBody = (p: DdPending) => ({
+    token: p.token,
+    file_name: p.file.name,
+    content_type: p.file.type || 'application/octet-stream',
+    module: p.module,
+    doc_label: p.proposal.doc_label,
+    summary: p.proposal.summary,
+  })
+
+  // 归档收尾(流式/一次性共用):toast → 关弹层 → 跳到刚更新的模块并刷新工作台。
+  const finishCommit = (p: DdPending, landed: string) => {
+    onToast({
+      title: `材料已归入「${DD_MODULE_CN[p.module]}」`,
+      detail: landed || 'AI 已把材料要点融进模块草稿,到模块里过目确认即可',
+      action: 'dd.document.commit', entity: 'cap_dd_documents',
+    })
+    setGenState(null)
+    setPending(null)
+    setActiveModule(p.module) // 引导用户直达刚更新的模块
+    reload()
+  }
+
+  // 老 /dd/commit 一次性端点:流式 404 时自动降级,error 后「稳妥模式重试」也走这里。
+  const commitOnce = async (p: DdPending) => {
+    const out = await apiPost<{ ok?: boolean; landed?: unknown }>(`/api/projects/${projectId}/dd/commit`, commitBody(p))
+    finishCommit(p, typeof out.landed === 'string' ? out.landed : '')
   }
 
   const commit = async () => {
     if (!pending) return
+    const p = pending
     setCommitting(true)
+    // 确认卡切到「生成视图」:首帧前 loader,delta 后逐字生长。
+    setGenState({ phase: 'wait', stage: null, content: '', gaps: '', flags: '', last: null, module: p.module })
     try {
-      const p = pending
-      const out = await apiPost<{ ok?: boolean; landed?: unknown }>(`/api/projects/${projectId}/dd/commit`, {
-        token: p.token,
-        file_name: p.file.name,
-        content_type: p.file.type || 'application/octet-stream',
-        module: p.module,
-        doc_label: p.proposal.doc_label,
-        summary: p.proposal.summary,
-      })
-      onToast({
-        title: `材料已归入「${DD_MODULE_CN[p.module]}」`,
-        detail: typeof out.landed === 'string' && out.landed ? out.landed : 'AI 已把材料要点融进模块草稿,到模块里过目确认即可',
-        action: 'dd.document.commit', entity: 'cap_dd_documents',
-      })
-      setPending(null)
-      setActiveModule(p.module) // 引导用户直达刚更新的模块
-      reload()
+      let doneLanded: string | null = null
+      let frameErr: string | null = null
+      try {
+        await streamPost(`/api/projects/${projectId}/dd/commit/stream`, commitBody(p), () => {}, undefined, (ev) => {
+          const t = ev.type
+          if (t === 'stage') {
+            setGenState((g) => (g ? { ...g, stage: typeof ev.label === 'string' ? ev.label : g.stage } : g))
+          } else if (t === 'delta') {
+            const sec: DdGenSectionKey = ev.section === 'gaps' ? 'gaps' : ev.section === 'flags' ? 'flags' : 'content'
+            const text = typeof ev.text === 'string' ? ev.text : ''
+            if (text) setGenState((g) => (g ? { ...g, phase: 'streaming', last: sec, [sec]: g[sec] + text } : g))
+          } else if (t === 'done') {
+            doneLanded = typeof ev.landed === 'string' ? ev.landed : ''
+          } else if (t === 'error') {
+            frameErr = typeof ev.message === 'string' && ev.message ? ev.message : '生成失败'
+          }
+        })
+        if (frameErr) throw new Error(frameErr)
+        if (doneLanded == null) throw new Error('生成流意外中断,请用稳妥模式重试')
+      } catch (e) {
+        if (ddIs404(e)) {
+          // 流式端点尚未上线 → 自动降级到一次性 commit,保持可用。
+          setGenState((g) => (g ? { ...g, phase: 'wait', stage: '流式通道未就绪,已切换稳妥模式生成…' } : g))
+          await commitOnce(p)
+          return
+        }
+        throw e
+      }
+      // done:短暂「完成」状态(✓)再收尾,让用户看清生成已落定。
+      const landed = doneLanded
+      setGenState((g) => (g ? { ...g, phase: 'done' } : g))
+      window.setTimeout(() => finishCommit(p, landed ?? ''), 900)
     } catch (e) {
-      onToast({ title: '归档失败', detail: ddErrMsg(e) })
+      setGenState((g) => (g ? { ...g, phase: 'error', error: ddErrMsg(e) } : g))
+    } finally {
+      setCommitting(false)
+    }
+  }
+
+  // 「用稳妥模式重试」:清掉半截流式内容,走老 commit 一次性端点。
+  const retryCommitSafe = async () => {
+    if (!pending) return
+    const p = pending
+    setCommitting(true)
+    setGenState((g) => (g ? { ...g, phase: 'wait', stage: '稳妥模式生成中…', content: '', gaps: '', flags: '', last: null, error: undefined } : g))
+    try {
+      await commitOnce(p)
+    } catch (e) {
+      setGenState((g) => (g ? { ...g, phase: 'error', error: ddErrMsg(e) } : g))
     } finally {
       setCommitting(false)
     }
@@ -4891,7 +5110,7 @@ function DdWorkbench({ projectId, projectName, canWrite, onToast }: {
         </div>
         {analyzing != null ? (
           <div className="dd-drop is-busy" data-testid="dd-analyzing">
-            <AiProcessing messages={DD_MSGS} />
+            <DdShapesLoader label={analyzeStage || 'AI 正在阅读材料…'} />
             <p className="muted-note">正在分析「{analyzing}」,AI 马上告诉你它是什么、有什么用。</p>
           </div>
         ) : (
@@ -5010,13 +5229,23 @@ function DdWorkbench({ projectId, projectName, canWrite, onToast }: {
         </section>
       )}
 
-      {pending && (
+      {pending && !genState && (
         <DdConfirmModal
           pending={pending}
           committing={committing}
           onModule={(m) => setPending((prev) => (prev ? { ...prev, module: m } : prev))}
           onCommit={() => void commit()}
           onClose={() => setPending(null)}
+        />
+      )}
+
+      {pending && genState && (
+        <DdGenerateModal
+          state={genState}
+          fileName={pending.file.name}
+          retrying={committing}
+          onRetry={() => void retryCommitSafe()}
+          onClose={() => setGenState(null)} // 仅 error 态可关:回到确认卡,可再次尝试
         />
       )}
     </div>

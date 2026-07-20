@@ -118,29 +118,14 @@ export function apiDelete<T = ApiResult>(path: string): Promise<T> {
   return request<T>(path, { method: 'DELETE' })
 }
 
-// SSE 流式 POST:逐帧解析 `data: {...}`,把文本增量回调给 onDelta,实现边吞吐边渲染。
-export async function streamPost(
-  path: string,
-  body: unknown,
-  onDelta: (text: string) => void,
-  signal?: AbortSignal,
+// 读取 SSE 响应体:逐帧解析 `data: {...}`,事件回调 onEvent、文本增量回调 onDelta。
+// streamPost(JSON body)与 streamPostForm(multipart)共用这段行解析逻辑。
+async function pumpSse(
+  body: ReadableStream<Uint8Array>,
+  onDelta?: (text: string) => void,
   onEvent?: (obj: Record<string, unknown>) => void,
 ): Promise<void> {
-  const token = getToken()
-  const res = await fetch(`${API_BASE}${path}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
-    body: JSON.stringify(body),
-    signal,
-  })
-  if (res.status === 401) {
-    setToken(null)
-    if (!location.hash.startsWith('#/login')) location.hash = '#/login'
-    throw new Error('未认证或登录已过期')
-  }
-  if (!res.ok || !res.body) throw new Error((await res.text().catch(() => '')) || `HTTP ${res.status}`)
-
-  const reader = res.body.getReader()
+  const reader = body.getReader()
   const decoder = new TextDecoder()
   let buf = ''
   for (;;) {
@@ -161,9 +146,57 @@ export async function streamPost(
       }
       if (obj.error) throw new Error(String(obj.error))
       onEvent?.(obj)
-      if (obj.delta) onDelta(String(obj.delta))
+      if (obj.delta) onDelta?.(String(obj.delta))
     }
   }
+}
+
+// SSE 流式 POST(JSON body):把文本增量回调给 onDelta,实现边吞吐边渲染。
+export async function streamPost(
+  path: string,
+  body: unknown,
+  onDelta: (text: string) => void,
+  signal?: AbortSignal,
+  onEvent?: (obj: Record<string, unknown>) => void,
+): Promise<void> {
+  const token = getToken()
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+    body: JSON.stringify(body),
+    signal,
+  })
+  if (res.status === 401) {
+    setToken(null)
+    if (!location.hash.startsWith('#/login')) location.hash = '#/login'
+    throw new Error('未认证或登录已过期')
+  }
+  if (!res.ok || !res.body) throw new Error((await res.text().catch(() => '')) || `HTTP ${res.status}`)
+  await pumpSse(res.body, onDelta, onEvent)
+}
+
+// SSE 流式 POST(multipart 表单,如带文件的 analyze):不手动设 Content-Type,
+// 交给浏览器生成 boundary;帧解析逻辑与 streamPost 完全一致。
+export async function streamPostForm(
+  path: string,
+  formData: FormData,
+  onEvent: (obj: Record<string, unknown>) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const token = getToken()
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: 'POST',
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+    body: formData,
+    signal,
+  })
+  if (res.status === 401) {
+    setToken(null)
+    if (!location.hash.startsWith('#/login')) location.hash = '#/login'
+    throw new Error('未认证或登录已过期')
+  }
+  if (!res.ok || !res.body) throw new Error((await res.text().catch(() => '')) || `HTTP ${res.status}`)
+  await pumpSse(res.body, undefined, onEvent)
 }
 
 // 真文件下载:带鉴权拉取 → blob → 触发浏览器下载。
