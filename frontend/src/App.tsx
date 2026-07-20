@@ -4150,10 +4150,16 @@ function PostAlertsPage({ onToast }: { onToast: (toast: Toast) => void }) {
   const [alerts, setAlerts] = useState<Alert[] | null>(null)
   const [kindFilter, setKindFilter] = useState('全部')
   const [reloadKey, setReloadKey] = useState(0)
+  const [computedAt, setComputedAt] = useState<string | null>(null)
   useEffect(() => {
     let ignore = false
     apiGet<{ items: Alert[] }>('/api/postdata/alerts')
-      .then((r) => { if (!ignore) setAlerts(r.items ?? []) })
+      .then((r) => {
+        if (ignore) return
+        setAlerts(r.items ?? [])
+        // issue #33:以前端收到响应的时刻作为「本次计算时间」,刷新后随之更新。
+        setComputedAt(new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }))
+      })
       .catch(() => { if (!ignore) { setAlerts([]); onToast({ title: '预警加载失败', detail: '请稍后重试' }) } })
     return () => { ignore = true }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -4176,6 +4182,7 @@ function PostAlertsPage({ onToast }: { onToast: (toast: Toast) => void }) {
             </div>
           ))}
           <button type="button" className="secondary-button" onClick={() => setReloadKey((k) => k + 1)}>刷新</button>
+          {computedAt && <span className="muted-note" style={{ marginLeft: 'auto' }}>计算于 {computedAt}</span>}
         </div>
         <div className="segmented" style={{ marginBottom: 12 }}>
           {KINDS.map((k) => (
