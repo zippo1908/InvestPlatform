@@ -201,6 +201,22 @@ class ExtractClausesPayload(BaseModel):
     text: str = Field(min_length=1)
 
 
+class DdCommitPayload(BaseModel):
+    """尽调材料入库确认(AI 只产草稿,用户确认才落定):
+    token 指向 analyze 暂存的文件;module/doc_label/summary 允许用户在前端改过再提交。"""
+    token: str = Field(min_length=8, max_length=64)
+    file_name: str = Field(min_length=1, max_length=300)
+    content_type: str | None = Field(default=None, max_length=120)
+    module: str = Field(min_length=1, max_length=16)  # business|finance|legal|team|risk|other
+    doc_label: str | None = Field(default=None, max_length=64)
+    summary: str | None = Field(default=None, max_length=4000)
+
+
+class DdSectionPayload(BaseModel):
+    """尽调模块文档手工编辑(保存后回 draft,需重新确认)。"""
+    content_md: str = Field(min_length=1)
+
+
 class FeedbackAttachmentIn(BaseModel):
     name: str = Field(default="attachment", max_length=200)
     data_url: str  # data:<mime>;base64,.... 用户手动上传的附件(图片/PDF 等)
@@ -6216,6 +6232,539 @@ async def extract_text(file: UploadFile = File(...), user: AuthedUser = Depends(
     if not text:
         raise HTTPException(status_code=422, detail="未抽取到文本(可能是扫描件/图片型 PDF,需 OCR)")
     return {"ok": True, "file_name": name, "chars": len(text), "text": text}
+
+
+# ── AI 尽调助手(DD Copilot)────────────────────────────────────────────────
+# 核心理念:用户不懂尽调,AI 是懂行的一方——判材料类别、增量沉淀模块化尽调文档、
+# 主动指出缺口和红旗;AI 只产草稿,用户确认才落定(analyze 预览 → commit 落库)。
+# 表:dd_documents / dd_sections(deploy/db/patch_dd.sql);文件:UPLOAD_DIR/dd_docs、dd_tmp。
+
+_DD_DOC_DIR = os.path.join(UPLOAD_DIR, "dd_docs")
+_DD_TMP_DIR = os.path.join(UPLOAD_DIR, "dd_tmp")
+_DD_MODULE_ORDER = ["business", "finance", "legal", "team", "risk", "other"]
+_DD_MODULE_NAMES = {
+    "business": "业务尽调",
+    "finance": "财务尽调",
+    "legal": "法律尽调",
+    "team": "团队尽调",
+    "risk": "风险与红旗",
+    "other": "其他材料",
+}
+_DD_TEXT_LIMIT = 12000  # 送模型的材料全文截断上限(防超上下文)
+
+# 尽调专家人设(灵魂 prompt):判类与融合共用,任务指令分别追加在后。
+_DD_EXPERT_PROMPT = """你是一位有 15 年经验的股权投资尽调专家(会计师+律师复合背景),现在服务的用户**不懂尽调**。
+你是懂行的一方,要替用户把关;用户只负责上传材料和确认结果。
+
+【说话方式】
+- 面向外行:所有解释用大白话,像跟朋友讲清楚一件事;专业术语第一次出现要顺手解释一句。
+- 直说结论,不绕弯子;拿数字和日期说话。
+- 你只产草稿,最终以用户确认为准;拿不准就明说「待人工核实」,绝不编造材料里没有的事实。
+
+【五模块尽调框架】(module 取值固定为英文枚举)
+- business 业务尽调:商业模式、产品与技术、市场规模与竞争格局、客户与订单、供应链、收入构成与增长逻辑。典型材料:商业计划书、业务合同、客户清单、市场研究报告、产品资料。
+- finance 财务尽调:三张报表、收入确认、毛利与费用、应收应付、现金流、纳税、财务预测。典型材料:审计报告、财务报表、银行流水、纳税申报表、财务预测模型。
+- legal 法律尽调:公司设立与股权结构、历史沿革与出资、重大合同、资质证照、知识产权、诉讼仲裁、劳动合规。典型材料:营业执照、公司章程、股东协议、增资协议、诉讼文书、专利证书。
+- team 团队尽调:创始人与核心团队背景、股权激励、关键人依赖、全职与竞业情况、过往履历真实性。典型材料:简历、组织架构图、劳动合同、期权计划。
+- risk 风险与红旗:跨模块的重大风险汇总(对赌回购、关联交易、股权代持、重大依赖等)。
+- other 其他:确实无法归入以上五类的材料。
+
+【常见红旗清单】(材料中一旦发现,必须写进红旗项,并用大白话解释为什么危险)
+- 应收账款占营收比例过高或增速远超营收 → 可能是「纸面收入」,钱没真收回来
+- 客户集中度过高(前五大客户占比过大)→ 大客户一走业绩就塌方
+- 关联交易(和股东/亲属控制的公司做买卖)→ 可能虚增收入或利益输送
+- 未决诉讼/仲裁、行政处罚 → 潜在赔偿责任和资质风险
+- 对赌/回购/一票否决等特殊条款 → 条件一触发,公司或创始人就要掏钱回购股份
+- 股权代持、出资未实缴、历史股权转让瑕疵 → 股权归属可能有争议,影响交割
+- 毛利率显著高于同行且解释不清 → 数据真实性存疑
+- 净利润为正但经营性现金流长期为负 → 赚的是「账面钱」,不是真金白银
+- 社保/公积金欠缴、主要资质证照缺失或即将到期 → 合规补缴成本与经营中断风险
+- 核心技术权属不清(职务发明、前雇主纠纷)、创始人未全职投入或有竞业限制"""
+
+_DD_CLASSIFY_PROMPT = """任务:判定一份新上传材料在尽调中的归属,并做首轮解读。只输出一个 JSON 对象:
+{
+  "module": "business|finance|legal|team|risk|other 六选一",
+  "doc_label": "材料类型,尽量用行业通名(如:审计报告/商业计划书/公司章程/银行流水),不超过 20 字",
+  "confidence": 0到1的小数(对 module+doc_label 判定的把握),
+  "summary": "这份材料讲了什么,200 字以内,突出数字与日期",
+  "key_facts": [{"fact": "关键事实(带数字/日期)", "source_hint": "出处提示,如:第3页/资产负债表/第2.3条"}],
+  "plain_explain": "一句大白话:这份材料在尽调里是干什么用的、为什么重要"
+}
+判类规则:按材料的**主要用途**归类,不按提到了什么归类(如商业计划书里有财务预测仍归 business);
+审计报告/财务报表/流水/纳税 → finance;章程/协议/证照/诉讼 → legal;简历/组织架构/期权 → team;
+明确的风险清单/合规排查类材料 → risk;实在无法判断 → other 且 confidence 给低。
+key_facts 最多 5 条,只挑对投资判断最有用的。"""
+
+_DD_MERGE_PROMPT = """任务:把一份新确认归档的材料,增量融入该模块已有的尽调文档。只输出一个 JSON 对象:
+{"content_md": "新版模块尽调文档(Markdown)", "gaps_md": "缺口清单(Markdown 列表)", "flags_md": "红旗与待核实项(Markdown 列表)"}
+
+增量融合规则(content_md):
+- 在已有文档基础上**合并**,不是重写:已有的事实与章节结构要保留;与新材料重复的合并去重;
+  互相矛盾的两边都列出,并标注「⚠ 两份材料不一致,待人工核实」。
+- 每个关键事实句尾用【文件名】标注来源;已有内容里的来源标注要沿用,不得丢失。
+- 突出数字与日期(金额、比例、期限写清单位与口径)。
+- 用 Markdown 小节(## 开头)组织;没有信息的小节不要硬编。已有文档为空时,按本模块该有的章节从头搭骨架。
+
+缺口规则(gaps_md):站在完整尽调的标准,列出本模块**还缺什么材料**,每条格式:
+- 缺什么(材料名)——大白话解释为什么需要它、缺了会看不清什么。已被新材料补上的缺口要移除。
+
+红旗规则(flags_md):对照红旗清单逐项排查新旧信息,每条格式:
+- 🚩 风险点——大白话解释为什么危险、建议下一步核实什么。没有红旗就写「暂未发现明显红旗(基于现有材料)」。"""
+
+
+def _dd_extract_text(name: str, data: bytes) -> str:
+    """尽调材料 → 纯文本(复用 /api/ai/extract-text 的抽取器);抽不出直接 4xx。"""
+    ext = os.path.splitext(name)[1].lower()
+    try:
+        if ext in (".txt", ".md", ".markdown"):
+            text = data.decode("utf-8", "ignore")
+        elif ext == ".pdf":
+            text = _extract_pdf(data)
+        elif ext == ".docx":
+            text = _extract_docx(data)
+        elif ext in (".xlsx", ".xls"):
+            raise HTTPException(status_code=422, detail="暂不支持 Excel:现有抽取组件不认表格文件,请转存为 PDF 再上传")
+        elif ext == ".doc":
+            raise HTTPException(status_code=415, detail="旧版 .doc 不支持,请另存为 .docx 或 PDF")
+        else:
+            raise HTTPException(status_code=415, detail=f"不支持的文件类型:{ext or '未知'}(支持 pdf/docx/txt/md)")
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001 —— 抽取失败(损坏/加密等)统一提示
+        raise HTTPException(status_code=422, detail=f"文件解析失败:{exc}")
+    text = text.strip()[:50000]
+    if not text:
+        raise HTTPException(status_code=422, detail="未抽取到文本(可能是扫描件/图片型 PDF,需 OCR)")
+    return text
+
+
+def _dd_cleanup_tmp() -> None:
+    """机会式清理:analyze 暂存超过 24h 未 commit 的文件直接删(用户放弃的草稿)。"""
+    try:
+        cutoff = datetime.now().timestamp() - 24 * 3600
+        for fn in os.listdir(_DD_TMP_DIR):
+            path = os.path.join(_DD_TMP_DIR, fn)
+            if os.path.isfile(path) and os.path.getmtime(path) < cutoff:
+                os.remove(path)
+    except OSError:
+        pass
+
+
+def _dd_llm_guard() -> None:
+    if not llm.is_configured():
+        raise HTTPException(status_code=503, detail="AI 未配置:请在 deploy/.env 配置 LLM_PROVIDER 及对应 LLM_*/TINCI_AI_*")
+
+
+@app.post("/api/projects/{project_id}/dd/analyze")
+async def dd_analyze_document(
+    project_id: int,
+    file: UploadFile = File(...),
+    user: AuthedUser = Depends(require_permission("project.edit")),
+) -> dict[str, Any]:
+    """尽调材料预分析(**不落库**):抽文本 → AI 判模块/材料类型/摘要/关键事实,
+    文件暂存 dd_tmp/{token},前端预览确认后携 token 调 commit 才真正归档。"""
+    _dd_llm_guard()
+    name = file.filename or "file"
+    data = await file.read(20 * 1024 * 1024 + 1)
+    await file.close()
+    if len(data) > 20 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="文件过大(上限 20MB)")
+    if not data:
+        raise HTTPException(status_code=422, detail="空文件")
+    text = _dd_extract_text(name, data)
+
+    tid = tenant_of(user)
+    connection = connect_db()  # 先校验项目归属,LLM 长调用期间不占连接
+    try:
+        with connection.cursor() as cursor:
+            _assert_project(cursor, project_id, tid)
+    finally:
+        connection.close()
+
+    try:
+        result = llm.chat_json(
+            [
+                {"role": "system", "content": _DD_EXPERT_PROMPT + "\n\n" + _DD_CLASSIFY_PROMPT},
+                {"role": "user", "content": f"文件名:{name}\n\n材料全文(截断):\n\n{text[:_DD_TEXT_LIMIT]}"},
+            ],
+            temperature=0.1,
+            max_tokens=2000,
+        )
+    except llm.LLMNotConfigured as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except llm.LLMError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    if not isinstance(result, dict):
+        raise HTTPException(status_code=502, detail="AI 返回结构异常,请重试")
+
+    # 收敛 AI 输出:枚举回退、条数与长度截断(AI 只产草稿,脏值不出后端)
+    module = str(result.get("module") or "other").strip().lower()
+    if module not in _DD_MODULE_NAMES:
+        module = "other"
+    facts = []
+    for item in (result.get("key_facts") or [])[:5]:
+        if isinstance(item, dict) and str(item.get("fact") or "").strip():
+            facts.append({"fact": str(item["fact"]).strip()[:300], "source_hint": str(item.get("source_hint") or "").strip()[:100]})
+    try:
+        confidence = round(min(1.0, max(0.0, float(result.get("confidence") or 0))), 2)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    proposal = {
+        "module": module,
+        "module_name": _DD_MODULE_NAMES[module],
+        "doc_label": str(result.get("doc_label") or "未识别材料").strip()[:64],
+        "confidence": confidence,
+        "summary": str(result.get("summary") or "").strip()[:1000],
+        "key_facts": facts,
+        "plain_explain": str(result.get("plain_explain") or "").strip()[:300],
+    }
+
+    # 暂存原始文件 + 抽取文本(commit 融合时直接读文本,免二次解析)
+    os.makedirs(_DD_TMP_DIR, exist_ok=True)
+    _dd_cleanup_tmp()
+    token = uuid.uuid4().hex
+    safe_name = re.sub(r"[^\w.\-一-鿿]", "_", name)[:200]
+    with open(os.path.join(_DD_TMP_DIR, f"{token}__{safe_name}"), "wb") as fh:
+        fh.write(data)
+    with open(os.path.join(_DD_TMP_DIR, f"{token}.txt"), "w", encoding="utf-8") as fh:
+        fh.write(text)
+
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            audit_id = write_audit(cursor, user.user_id, "dd.analyze", "dd_document", project_id,
+                                   safe_name, after={"module": module, "doc_label": proposal["doc_label"]})
+        connection.commit()
+    finally:
+        connection.close()
+    return {"ok": True, "token": token, "proposal": proposal, "file_name": name,
+            "chars": len(text), "model": llm.status()["model"], "audit_id": audit_id}
+
+
+@app.post("/api/projects/{project_id}/dd/commit")
+def dd_commit_document(
+    project_id: int,
+    payload: DdCommitPayload,
+    user: AuthedUser = Depends(require_permission("project.edit")),
+) -> dict[str, Any]:
+    """用户确认 analyze 草稿 → 归档文件 + 插 dd_documents(confirmed)+
+    AI 把新材料**增量融入**该模块尽调文档(dd_sections UPSERT,状态回 draft 等再确认)。"""
+    _dd_llm_guard()
+    if payload.module not in _DD_MODULE_NAMES:
+        raise HTTPException(status_code=422, detail=f"module 须为 {'/'.join(_DD_MODULE_ORDER)} 之一")
+    if not re.fullmatch(r"[0-9a-f]{32}", payload.token):  # token 即文件名前缀,严格校验防路径穿越
+        raise HTTPException(status_code=422, detail="token 非法")
+    module_name = _DD_MODULE_NAMES[payload.module]
+
+    # 定位暂存文件与抽取文本
+    tmp_files = [fn for fn in (os.listdir(_DD_TMP_DIR) if os.path.isdir(_DD_TMP_DIR) else [])
+                 if fn.startswith(payload.token + "__")]
+    txt_path = os.path.join(_DD_TMP_DIR, f"{payload.token}.txt")
+    if not tmp_files or not os.path.isfile(txt_path):
+        raise HTTPException(status_code=404, detail="暂存材料不存在或已过期(24h),请重新上传分析")
+    tmp_path = os.path.join(_DD_TMP_DIR, tmp_files[0])
+    with open(txt_path, "r", encoding="utf-8") as fh:
+        text = fh.read()
+
+    tid = tenant_of(user)
+    connection = connect_db()  # 短连接:校验项目 + 取该模块现有尽调文档(可能为空)
+    try:
+        with connection.cursor() as cursor:
+            _assert_project(cursor, project_id, tid)
+            cursor.execute(
+                "SELECT content_md, gaps_md, flags_md FROM dd_sections WHERE project_id=%s AND module=%s",
+                (project_id, payload.module),
+            )
+            existing = cursor.fetchone() or {}
+    finally:
+        connection.close()
+
+    old_md = str(existing.get("content_md") or "").strip()
+    file_label = payload.file_name.strip()
+    user_prompt = (
+        f"模块:{module_name}({payload.module})\n"
+        f"新材料文件名:{file_label}\n"
+        f"新材料类型:{payload.doc_label or '未标注'}\n"
+        f"新材料摘要(用户已确认):{(payload.summary or '').strip() or '无'}\n\n"
+        f"── 该模块已有尽调文档 ──\n{old_md or '(空,首份材料,从头搭骨架)'}\n\n"
+        f"── 该模块已有缺口清单 ──\n{str(existing.get('gaps_md') or '').strip() or '(空)'}\n\n"
+        f"── 新材料全文(截断)──\n{text[:_DD_TEXT_LIMIT]}"
+    )
+    try:
+        merged = llm.chat_json(
+            [{"role": "system", "content": _DD_EXPERT_PROMPT + "\n\n" + _DD_MERGE_PROMPT},
+             {"role": "user", "content": user_prompt}],
+            temperature=0.2,
+            max_tokens=4000,
+        )
+    except llm.LLMNotConfigured as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except llm.LLMError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    content_md = str((merged or {}).get("content_md") or "").strip() if isinstance(merged, dict) else ""
+    if not content_md:
+        raise HTTPException(status_code=502, detail="AI 融合失败(未产出模块文档),材料未入库,请重试")
+    gaps_md = str(merged.get("gaps_md") or "").strip()
+    flags_md = str(merged.get("flags_md") or "").strip()
+
+    # LLM 成功后才落定:归档文件 + 单事务写 dd_documents / dd_sections / 审计
+    safe_name = re.sub(r"[^\w.\-一-鿿]", "_", file_label or "file")[:200]
+    stored_name = f"{project_id}_{uuid.uuid4().hex[:10]}_{safe_name}"
+    os.makedirs(_DD_DOC_DIR, exist_ok=True)
+    size_bytes = os.path.getsize(tmp_path)
+    with open(tmp_path, "rb") as src, open(os.path.join(_DD_DOC_DIR, stored_name), "wb") as dst:
+        dst.write(src.read())
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """INSERT INTO dd_documents
+                     (tenant_id, project_id, filename, stored_name, content_type, size_bytes,
+                      module, doc_label, summary, status, uploaded_by)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'confirmed', %s)""",
+                (tid, project_id, safe_name, stored_name,
+                 payload.content_type or "application/octet-stream", size_bytes,
+                 payload.module, (payload.doc_label or "").strip() or None,
+                 (payload.summary or "").strip() or None, user.display_name),
+            )
+            document_id = int(cursor.lastrowid)
+            cursor.execute(
+                """INSERT INTO dd_sections (tenant_id, project_id, module, content_md, gaps_md, flags_md, status)
+                   VALUES (%s, %s, %s, %s, %s, %s, 'draft')
+                   ON DUPLICATE KEY UPDATE content_md=VALUES(content_md), gaps_md=VALUES(gaps_md),
+                     flags_md=VALUES(flags_md), status='draft', confirmed_by=NULL, confirmed_at=NULL""",
+                (tid, project_id, payload.module, content_md, gaps_md, flags_md),
+            )
+            audit_id = write_audit(cursor, user.user_id, "dd.commit", "dd_document", document_id,
+                                   f"{module_name}:{safe_name}",
+                                   after={"module": payload.module, "doc_label": payload.doc_label})
+        connection.commit()
+    finally:
+        connection.close()
+    for fn in (tmp_path, txt_path):  # 归档成功才清暂存
+        try:
+            os.remove(fn)
+        except OSError:
+            pass
+    return {
+        "ok": True,
+        "document_id": document_id,
+        "audit_id": audit_id,
+        "module": payload.module,
+        "module_name": module_name,
+        "message": f"「{file_label}」已归档为{module_name}·{payload.doc_label or '尽调材料'},"
+                   f"该模块尽调文档已更新为草稿,请审阅后确认。",
+        # landed:与前端确认卡 toast 的契约字段(同 message,采购台万能上传同名惯例)
+        "landed": f"「{file_label}」已归档为{module_name}·{payload.doc_label or '尽调材料'},"
+                  f"该模块尽调文档已更新为草稿,请审阅后确认。",
+        "section": {"module": payload.module, "module_name": module_name, "status": "draft",
+                    "content_md": content_md, "gaps_md": gaps_md, "flags_md": flags_md},
+    }
+
+
+def _dd_completeness(row: dict[str, Any] | None) -> int:
+    """模块完整度粗估(仅供前端进度条):无内容 0;草稿按篇幅线性升到 70;已确认保底 90。"""
+    content = str((row or {}).get("content_md") or "").strip()
+    if not content:
+        return 0
+    score = min(70, 15 + len(content) // 120)
+    if (row or {}).get("status") == "confirmed":
+        score = max(score, 90)
+    return score
+
+
+@app.get("/api/projects/{project_id}/dd")
+def get_dd_overview(project_id: int, user: AuthedUser = Depends(current_user)) -> dict[str, Any]:
+    """尽调总览:六模块(没内容也给空壳,前端始终看到完整框架)+ 已归档材料清单。"""
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            _assert_project(cursor, project_id, tid)
+            cursor.execute(
+                """SELECT module, content_md, gaps_md, flags_md, status, updated_at, confirmed_by, confirmed_at
+                   FROM dd_sections WHERE project_id=%s""",
+                (project_id,),
+            )
+            by_module = {str(r["module"]): r for r in cursor.fetchall()}
+            cursor.execute(
+                """SELECT id, filename, module, doc_label, summary, status, content_type, size_bytes,
+                          uploaded_by, created_at
+                   FROM dd_documents WHERE project_id=%s ORDER BY id DESC LIMIT 500""",
+                (project_id,),
+            )
+            documents = cursor.fetchall()
+    finally:
+        connection.close()
+    sections = []
+    for module in _DD_MODULE_ORDER:
+        row = by_module.get(module)
+        sections.append({
+            "module": module,
+            "module_name": _DD_MODULE_NAMES[module],
+            "status": str(row["status"]) if row else "empty",
+            "content_md": str(row["content_md"] or "") if row else "",
+            "gaps_md": str(row["gaps_md"] or "") if row else "",
+            "flags_md": str(row["flags_md"] or "") if row else "",
+            "updated_at": row["updated_at"] if row else None,
+            "confirmed_by": row["confirmed_by"] if row else None,
+            "confirmed_at": row["confirmed_at"] if row else None,
+            "completeness": _dd_completeness(row),
+            "doc_count": sum(1 for d in documents if str(d["module"]) == module),
+        })
+    return {"sections": sections, "documents": documents, "ai": {"configured": llm.is_configured(), "model": llm.status()["model"]}}
+
+
+@app.put("/api/projects/{project_id}/dd/sections/{module}")
+def dd_edit_section(
+    project_id: int,
+    module: str,
+    payload: DdSectionPayload,
+    user: AuthedUser = Depends(require_permission("project.edit")),
+) -> dict[str, Any]:
+    """用户手工编辑模块文档(AI 草稿之上人改):保存后状态回 draft,需重新确认。"""
+    if module not in _DD_MODULE_NAMES:
+        raise HTTPException(status_code=422, detail=f"module 须为 {'/'.join(_DD_MODULE_ORDER)} 之一")
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            _assert_project(cursor, project_id, tid)
+            cursor.execute(
+                """INSERT INTO dd_sections (tenant_id, project_id, module, content_md, status)
+                   VALUES (%s, %s, %s, %s, 'draft')
+                   ON DUPLICATE KEY UPDATE content_md=VALUES(content_md), status='draft',
+                     confirmed_by=NULL, confirmed_at=NULL""",
+                (tid, project_id, module, payload.content_md),
+            )
+            audit_id = write_audit(cursor, user.user_id, "dd.section.edit", "dd_section", project_id,
+                                   _DD_MODULE_NAMES[module])
+        connection.commit()
+    finally:
+        connection.close()
+    return {"ok": True, "module": module, "status": "draft", "audit_id": audit_id}
+
+
+@app.post("/api/projects/{project_id}/dd/sections/{module}/confirm")
+def dd_confirm_section(
+    project_id: int,
+    module: str,
+    user: AuthedUser = Depends(require_permission("project.edit")),
+) -> dict[str, Any]:
+    """用户确认模块文档定稿(AI 只产草稿,确认权在人)。"""
+    if module not in _DD_MODULE_NAMES:
+        raise HTTPException(status_code=422, detail=f"module 须为 {'/'.join(_DD_MODULE_ORDER)} 之一")
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            _assert_project(cursor, project_id, tid)
+            cursor.execute("SELECT id, content_md FROM dd_sections WHERE project_id=%s AND module=%s",
+                           (project_id, module))
+            row = cursor.fetchone()
+            if row is None or not str(row["content_md"] or "").strip():
+                raise HTTPException(status_code=422, detail="该模块还没有内容,先上传材料生成草稿")
+            cursor.execute(
+                """UPDATE dd_sections SET status='confirmed', confirmed_by=%s, confirmed_at=%s
+                   WHERE id=%s""",
+                (user.display_name, datetime.now(), int(row["id"])),
+            )
+            audit_id = write_audit(cursor, user.user_id, "dd.section.confirm", "dd_section", int(row["id"]),
+                                   _DD_MODULE_NAMES[module])
+        connection.commit()
+    finally:
+        connection.close()
+    return {"ok": True, "module": module, "status": "confirmed", "audit_id": audit_id}
+
+
+@app.get("/api/projects/{project_id}/dd/export.md")
+def dd_export_markdown(project_id: int, user: AuthedUser = Depends(current_user)) -> Response:
+    """拼装完整尽调报告下载(Markdown):封面元信息 + 各模块按序(未确认标「草稿」)+
+    汇总红旗 + 材料清单附录。"""
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            project = _assert_project(cursor, project_id, tid)
+            cursor.execute(
+                """SELECT module, content_md, gaps_md, flags_md, status, updated_at, confirmed_by, confirmed_at
+                   FROM dd_sections WHERE project_id=%s""",
+                (project_id,),
+            )
+            by_module = {str(r["module"]): r for r in cursor.fetchall()}
+            cursor.execute(
+                """SELECT filename, module, doc_label, uploaded_by, created_at
+                   FROM dd_documents WHERE project_id=%s ORDER BY module, id""",
+                (project_id,),
+            )
+            documents = cursor.fetchall()
+            write_audit(cursor, user.user_id, "dd.export", "dd_section", project_id, str(project["short_name"]))
+        connection.commit()
+    finally:
+        connection.close()
+
+    lines: list[str] = [
+        f"# 尽调报告 · {project['short_name']}",
+        "",
+        f"- 项目:{project['short_name']}(ID {project_id})",
+        f"- 导出时间:{datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        f"- 导出人:{user.display_name}",
+        "- 说明:本报告由 AI 尽调助手增量生成、人工确认;标注「草稿」的模块尚未经人工确认,仅供参考。",
+        "",
+    ]
+    all_flags: list[str] = []
+    for module in _DD_MODULE_ORDER:
+        row = by_module.get(module)
+        name = _DD_MODULE_NAMES[module]
+        badge = "" if (row and str(row["status"]) == "confirmed") else "(草稿·未确认)"
+        lines.append(f"\n---\n\n# {name}{badge}\n")
+        if row and str(row["content_md"] or "").strip():
+            lines.append(str(row["content_md"]).strip())
+            if str(row["gaps_md"] or "").strip():
+                lines.append(f"\n### 本模块材料缺口\n\n{str(row['gaps_md']).strip()}")
+            if str(row["flags_md"] or "").strip():
+                all_flags.append(f"### {name}\n\n{str(row['flags_md']).strip()}")
+        else:
+            lines.append("(尚未收到该模块材料)")
+    lines.append("\n---\n\n# 红旗与待核实项汇总\n")
+    lines.append("\n\n".join(all_flags) if all_flags else "(各模块暂未记录红旗)")
+    lines.append("\n---\n\n# 附录:尽调材料清单\n")
+    if documents:
+        lines.append("| 材料 | 模块 | 类型 | 上传人 | 归档时间 |")
+        lines.append("| --- | --- | --- | --- | --- |")
+        for d in documents:
+            lines.append(f"| {d['filename']} | {_DD_MODULE_NAMES.get(str(d['module']), d['module'])} "
+                         f"| {d['doc_label'] or '-'} | {d['uploaded_by'] or '-'} | {d['created_at']} |")
+    else:
+        lines.append("(暂无归档材料)")
+    body = "\n".join(lines) + "\n"
+    return Response(
+        content=body.encode("utf-8"),
+        media_type="text/markdown; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="dd_report_{project_id}.md"'},
+    )
+
+
+@app.get("/api/dd/documents/{document_id}/download")
+def dd_download_document(document_id: int, user: AuthedUser = Depends(current_user)) -> FileResponse:
+    """下载已归档尽调材料(限本租户)。"""
+    tid = tenant_of(user)
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT filename, stored_name, content_type FROM dd_documents WHERE id=%s AND tenant_id=%s",
+                (document_id, tid),
+            )
+            row = cursor.fetchone()
+    finally:
+        connection.close()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+    path = os.path.join(_DD_DOC_DIR, str(row["stored_name"]))
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="文件已不在服务器(可能未随备份迁移)")
+    return FileResponse(path, media_type=str(row["content_type"] or "application/octet-stream"), filename=str(row["filename"]))
 
 
 # ── 真文件上传 / 下载 ──────────────────────────────────────────────────────

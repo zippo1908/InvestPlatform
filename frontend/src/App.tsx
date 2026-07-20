@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import type { FormEvent } from 'react'
+import type { DragEvent, FormEvent } from 'react'
 import { gsap } from 'gsap'
 import type { LucideIcon } from 'lucide-react'
 import {
@@ -2367,7 +2367,8 @@ type ProjectSubtab = (typeof PROJECT_SUBTABS)[number]
 // 「投资关系」= 原 基金投资情况 + 权益变动 两个页签合并(对应老导航「项目详情-投资关系」);
 // 「投后数据」= 收集配置 + 填报数据明细(对应老导航「项目详情-投后数据」,原财务表在二级 tab「财务数据」);
 // 「流程文件」「文档」对齐老系统项目抽屉的最后两个页签(issue #13 参考图)。
-const PROJECT_SECTIONS = ['概况', '日程', '投资关系', '三会', '现金流', '估值', '投后数据', '协议条款(AI)', '流程文件', '文档'] as const
+// 「尽调」= AI 尽调助手工作台(上传任意材料 → AI 判定归属模块 → 人工确认落定)。
+const PROJECT_SECTIONS = ['概况', '尽调', '日程', '投资关系', '三会', '现金流', '估值', '投后数据', '协议条款(AI)', '流程文件', '文档'] as const
 const _n = (v: unknown): number | null => (v == null || v === '' ? null : Number(v))
 const CF_KIND_CN: Record<string, string> = { project_return: '项目回款', capital_call: '出资', investment: '投资打款', management_fee: '管理费', distribution: '分配', expense: '费用' }
 const CF_DIR_CN: Record<string, string> = { inflow: '流入', outflow: '流出' }
@@ -4613,6 +4614,415 @@ function ExternalFillPage() {
   )
 }
 
+// ── AI 尽调助手(项目卡片「尽调」section)──────────────────────────────────
+// 产品理念:用户不懂尽调也能被"带着走"——扔进任何材料,AI 说清"这是什么、归哪个
+// 模块、为什么有用",用户点头后 AI 才把它融进模块底稿,并顺手告诉你"还缺什么/
+// 发现了什么风险"。AI 只产草稿,人工确认才落定(empty → draft → confirmed)。
+const DD_MODULES: Array<{ key: string; cn: string }> = [
+  { key: 'business', cn: '业务尽调' },
+  { key: 'finance', cn: '财务尽调' },
+  { key: 'legal', cn: '法律尽调' },
+  { key: 'team', cn: '团队尽调' },
+  { key: 'risk', cn: '风险与其他' },
+]
+const DD_MODULE_CN: Record<string, string> = Object.fromEntries(DD_MODULES.map((m) => [m.key, m.cn]))
+const DD_MSGS = ['正在阅读材料…', '正在判断材料类别…', '正在对照尽调清单…', '正在提炼关键事实与风险…']
+const DD_STATUS_TAG: Record<string, { cn: string; tone: string }> = {
+  empty: { cn: '空', tone: 'tone-gray' },
+  draft: { cn: '草稿', tone: 'tone-orange' },
+  confirmed: { cn: '已确认', tone: 'tone-teal' },
+}
+
+type DdKeyFact = { fact: string; source_hint?: string | null }
+type DdProposal = { module: string; doc_label: string; confidence: number; summary: string; key_facts: DdKeyFact[]; plain_explain: string }
+type DdSection = { module: string; module_cn: string; content_md: string; gaps_md: string; flags_md: string; status: 'empty' | 'draft' | 'confirmed'; updated_at: string | null; doc_count: number }
+type DdDocument = { id: number; filename: string; module: string; doc_label: string; summary: string; created_at: string | null }
+type DdData = { sections: DdSection[]; documents: DdDocument[] }
+type DdPending = { file: File; token: string; proposal: DdProposal; module: string } // analyze 结果,等用户点头
+
+// 后端并行开发中:404 时给友好提示而不是裸抛 HTTP 错误。
+const ddIs404 = (e: unknown): boolean => e instanceof Error && (e.message.includes('404') || e.message.includes('Not Found'))
+const ddErrMsg = (e: unknown): string =>
+  ddIs404(e) ? '尽调后端接口尚未上线(并行开发中),稍后再试' : e instanceof Error ? e.message : 'API 调用失败'
+
+// 确认卡:AI 判定结果给用户过目——这是什么、归哪个模块、为什么有用;模块可改;点头才 commit。
+function DdConfirmModal({ pending, committing, onModule, onCommit, onClose }: {
+  pending: DdPending
+  committing: boolean
+  onModule: (m: string) => void
+  onCommit: () => void
+  onClose: () => void
+}) {
+  const p = pending.proposal
+  const confPct = p.confidence <= 1 ? Math.round(p.confidence * 100) : Math.round(p.confidence)
+  return (
+    <div className="eq-modal-backdrop" onClick={onClose} data-testid="dd-confirm-modal">
+      <div className="eq-modal" onClick={(e) => e.stopPropagation()}>
+        <div className="eq-modal-head">
+          <h3>AI 看完了这份材料</h3>
+          <button type="button" className="icon-button" aria-label="关闭" onClick={onClose}><X size={18} /></button>
+        </div>
+        <div className="dd-confirm-file"><Paperclip size={14} /> {pending.file.name}</div>
+        <div className="dd-confirm-verdict" data-testid="dd-verdict">
+          <span className="eq-tag tone-blue">{p.doc_label || '未识别类型'}</span>
+          <span>建议归入「{DD_MODULE_CN[pending.module] ?? pending.module}」(AI 置信 {confPct}%)</span>
+        </div>
+        <div className="dd-explain">
+          <Bot size={16} />
+          <p>{p.plain_explain || '这份材料可以充实项目尽调底稿。'}</p>
+        </div>
+        {p.summary ? <p className="dd-confirm-summary">{p.summary}</p> : null}
+        {(p.key_facts ?? []).length > 0 && (
+          <div className="dd-key-facts">
+            <h4>AI 从材料里读到的关键事实</h4>
+            <ul>
+              {p.key_facts.map((k, i) => (
+                <li key={i}>{k.fact}{k.source_hint ? <small>(来源:{k.source_hint})</small> : null}</li>
+              ))}
+            </ul>
+          </div>
+        )}
+        <label className="dd-module-pick">
+          <span>归入模块(AI 判断不对可以改)</span>
+          <select value={pending.module} onChange={(e) => onModule(e.target.value)} data-testid="dd-module-select">
+            {DD_MODULES.map((m) => <option key={m.key} value={m.key}>{m.cn}</option>)}
+          </select>
+        </label>
+        <div className="button-row eq-modal-actions">
+          <button type="button" className="primary-button" disabled={committing} onClick={onCommit} data-testid="dd-commit">
+            <CheckCircle size={15} /> {committing ? '归档中…' : '确认归入'}
+          </button>
+          <button type="button" className="secondary-button" disabled={committing} onClick={onClose}>先不归档</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function DdWorkbench({ projectId, projectName, canWrite, onToast }: {
+  projectId: number
+  projectName: string
+  canWrite: boolean
+  onToast: (toast: Toast) => void
+}) {
+  const [data, setData] = useState<DdData | null>(null)
+  const [loadErr, setLoadErr] = useState<'none' | 'notready' | 'fail'>('none')
+  const [reloadKey, setReloadKey] = useState(0)
+  const reload = () => setReloadKey((k) => k + 1)
+  const [analyzing, setAnalyzing] = useState<string | null>(null) // 正在分析的文件名(等待动画)
+  const [pending, setPending] = useState<DdPending | null>(null)
+  const [committing, setCommitting] = useState(false)
+  const [activeModule, setActiveModule] = useState('business')
+  const [editModule, setEditModule] = useState<string | null>(null)
+  const [editText, setEditText] = useState('')
+  const [savingEdit, setSavingEdit] = useState(false)
+  const [confirming, setConfirming] = useState(false)
+  const [dragOver, setDragOver] = useState(false)
+  const fileRef = useRef<HTMLInputElement>(null)
+
+  useEffect(() => {
+    let ignore = false
+    apiGet<DdData>(`/api/projects/${projectId}/dd`)
+      .then((d) => { if (!ignore) { setData({ sections: d.sections ?? [], documents: d.documents ?? [] }); setLoadErr('none') } })
+      .catch((e) => { if (!ignore) { setData(null); setLoadErr(ddIs404(e) ? 'notready' : 'fail') } })
+    return () => { ignore = true }
+  }, [projectId, reloadKey])
+
+  // 切项目时收起编辑/待确认状态,回到第一个模块。
+  useEffect(() => {
+    setPending(null); setEditModule(null); setActiveModule('business')
+  }, [projectId])
+
+  const analyzeFile = async (f: File) => {
+    if (!canWrite) { onToast({ title: '无编辑权限', detail: '当前账号没有项目编辑权限,无法上传尽调材料' }); return }
+    if (f.size > 20 * 1024 * 1024) { onToast({ title: '文件过大', detail: '上限 20MB' }); return }
+    setAnalyzing(f.name)
+    try {
+      const fd = new FormData()
+      fd.append('file', f)
+      const token = getToken()
+      const res = await fetch(`${API_BASE}/api/projects/${projectId}/dd/analyze`, {
+        method: 'POST', headers: token ? { Authorization: `Bearer ${token}` } : {}, body: fd,
+      })
+      if (!res.ok) throw new Error(res.status === 404 ? '404' : (await res.text()) || `HTTP ${res.status}`)
+      const out = await res.json() as { token: string; proposal: DdProposal }
+      // AI 给的模块若不在五模块里,兜底到「风险与其他」,不让用户卡住。
+      setPending({ file: f, token: out.token, proposal: out.proposal, module: DD_MODULE_CN[out.proposal.module] ? out.proposal.module : 'risk' })
+    } catch (e) {
+      onToast({ title: 'AI 分析失败', detail: ddErrMsg(e) })
+    } finally {
+      setAnalyzing(null)
+    }
+  }
+
+  const commit = async () => {
+    if (!pending) return
+    setCommitting(true)
+    try {
+      const p = pending
+      const out = await apiPost<{ ok?: boolean; landed?: unknown }>(`/api/projects/${projectId}/dd/commit`, {
+        token: p.token,
+        file_name: p.file.name,
+        content_type: p.file.type || 'application/octet-stream',
+        module: p.module,
+        doc_label: p.proposal.doc_label,
+        summary: p.proposal.summary,
+      })
+      onToast({
+        title: `材料已归入「${DD_MODULE_CN[p.module]}」`,
+        detail: typeof out.landed === 'string' && out.landed ? out.landed : 'AI 已把材料要点融进模块草稿,到模块里过目确认即可',
+        action: 'dd.document.commit', entity: 'cap_dd_documents',
+      })
+      setPending(null)
+      setActiveModule(p.module) // 引导用户直达刚更新的模块
+      reload()
+    } catch (e) {
+      onToast({ title: '归档失败', detail: ddErrMsg(e) })
+    } finally {
+      setCommitting(false)
+    }
+  }
+
+  const saveModule = async (module: string) => {
+    setSavingEdit(true)
+    try {
+      await apiPut(`/api/projects/${projectId}/dd/sections/${module}`, { content_md: editText })
+      onToast({ title: '模块底稿已保存', detail: `「${DD_MODULE_CN[module]}」回到草稿状态,确认后落定`, action: 'dd.section.update', entity: 'cap_dd_sections' })
+      setEditModule(null)
+      reload()
+    } catch (e) {
+      onToast({ title: '保存失败', detail: ddErrMsg(e) })
+    } finally {
+      setSavingEdit(false)
+    }
+  }
+
+  const confirmModule = async (module: string) => {
+    setConfirming(true)
+    try {
+      await apiPost(`/api/projects/${projectId}/dd/sections/${module}/confirm`)
+      onToast({ title: '模块已确认', detail: `「${DD_MODULE_CN[module]}」已由你确认落定;再编辑会回到草稿`, action: 'dd.section.confirm', entity: 'cap_dd_sections' })
+      reload()
+    } catch (e) {
+      onToast({ title: '确认失败', detail: ddErrMsg(e) })
+    } finally {
+      setConfirming(false)
+    }
+  }
+
+  const exportMd = () =>
+    apiDownload(`/api/projects/${projectId}/dd/export.md`, `${projectName}-尽调报告.md`)
+      .catch((e) => onToast({ title: '导出失败', detail: ddErrMsg(e) }))
+
+  const downloadDoc = (d: DdDocument) =>
+    apiDownload(`/api/dd/documents/${d.id}/download`, d.filename)
+      .catch((e) => onToast({ title: '下载失败', detail: ddErrMsg(e) }))
+
+  const onDrop = (e: DragEvent<HTMLDivElement>) => {
+    e.preventDefault()
+    setDragOver(false)
+    const f = e.dataTransfer.files?.[0]
+    if (f && analyzing == null) void analyzeFile(f)
+  }
+
+  if (loadErr === 'notready') {
+    return (
+      <div className="page-grid" data-testid="dd-workbench">
+        <section className="panel full-span motion-item">
+          <PanelTitle icon={Bot} title="AI 尽调助手" />
+          <p className="muted-note">尽调后端接口尚未上线(并行开发中)。上线后这里会变成尽调工作台:把手头任何项目材料扔进来,AI 告诉你它是什么、归哪个尽调模块、还缺什么。</p>
+        </section>
+      </div>
+    )
+  }
+  if (data == null) {
+    return (
+      <div className="page-grid" data-testid="dd-workbench">
+        <section className="panel full-span motion-item">
+          <PanelTitle icon={Bot} title="AI 尽调助手" />
+          <p className="muted-note">{loadErr === 'fail' ? '尽调数据加载失败,稍后重试。' : '尽调数据加载中…'}</p>
+        </section>
+      </div>
+    )
+  }
+
+  const secOf = (key: string): DdSection =>
+    data.sections.find((s) => s.module === key)
+      ?? { module: key, module_cn: DD_MODULE_CN[key], content_md: '', gaps_md: '', flags_md: '', status: 'empty', updated_at: null, doc_count: 0 }
+  const hasAny = DD_MODULES.some((m) => secOf(m.key).status !== 'empty')
+  const isVirgin = !hasAny && data.documents.length === 0 // 整个尽调还没任何材料 → 大字引导空态
+  const active = secOf(activeModule)
+  const activeTag = DD_STATUS_TAG[active.status] ?? DD_STATUS_TAG.empty
+
+  return (
+    <div className="page-grid" data-testid="dd-workbench">
+      {/* 顶部:五模块进度卡 + 导出/上传 + 拖拽上传区 */}
+      <section className="panel full-span motion-item">
+        <div className="pd-reports-head">
+          <PanelTitle icon={Bot} title="AI 尽调助手" />
+          <div className="button-row" style={{ margin: 0 }}>
+            <button type="button" className="secondary-button" disabled={!hasAny} onClick={() => void exportMd()}
+              title={hasAny ? '把五个模块的底稿合成一份尽调报告下载' : '还没有任何模块内容,先上传一份材料'} data-testid="dd-export">
+              <Download size={15} /> 导出尽调报告
+            </button>
+            <button type="button" className="primary-button" disabled={!canWrite || analyzing != null}
+              onClick={() => fileRef.current?.click()} data-testid="dd-upload">
+              <Upload size={15} /> {analyzing != null ? '分析中…' : '上传尽调材料'}
+            </button>
+            <input ref={fileRef} type="file" hidden
+              onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ''; if (f) void analyzeFile(f) }} />
+          </div>
+        </div>
+        <p className="dd-lead">不用懂尽调:把手头任何项目材料交给 AI——它会告诉你这是什么、归哪个模块、为什么有用、还缺什么。AI 只写草稿,你确认了才算数。</p>
+        <div className="dd-progress-grid" data-testid="dd-progress">
+          {DD_MODULES.map((m) => {
+            const s = secOf(m.key)
+            const t = DD_STATUS_TAG[s.status] ?? DD_STATUS_TAG.empty
+            return (
+              <button key={m.key} type="button"
+                className={classNames('dd-progress-card', activeModule === m.key && 'is-active')}
+                onClick={() => setActiveModule(m.key)} data-testid={`dd-progress-${m.key}`}>
+                <strong>{m.cn}</strong>
+                <span className={`eq-tag ${t.tone}`}>{t.cn}</span>
+                <small>{s.doc_count > 0 ? `${s.doc_count} 份材料` : '暂无材料'}</small>
+              </button>
+            )
+          })}
+        </div>
+        {analyzing != null ? (
+          <div className="dd-drop is-busy" data-testid="dd-analyzing">
+            <AiProcessing messages={DD_MSGS} />
+            <p className="muted-note">正在分析「{analyzing}」,AI 马上告诉你它是什么、有什么用。</p>
+          </div>
+        ) : (
+          <div
+            className={classNames('dd-drop', dragOver && 'is-over', !canWrite && 'is-disabled')}
+            onDragOver={(e) => { e.preventDefault(); if (canWrite) setDragOver(true) }}
+            onDragLeave={() => setDragOver(false)}
+            onDrop={onDrop}
+            onClick={() => { if (canWrite) fileRef.current?.click() }}
+            role="button" tabIndex={0} data-testid="dd-drop"
+          >
+            {isVirgin ? (
+              <>
+                <p className="dd-drop-title">把手头任何项目材料拖进来</p>
+                <p className="dd-drop-sub">BP、财报、合同、访谈记录都行——AI 会告诉你它是什么、有什么用、还缺什么。你确认后它才会写进尽调底稿。</p>
+              </>
+            ) : (
+              <p className="dd-drop-sub">继续拖入新材料,或点击选择文件。AI 会判断它归哪个模块,并把要点补进底稿。</p>
+            )}
+          </div>
+        )}
+      </section>
+
+      {/* 模块底稿:Tabs 切换,每模块 = 底稿(md)+ 还缺什么 + 风险提示 */}
+      {!isVirgin && (
+        <section className="panel full-span motion-item" data-testid="dd-module-panel">
+          <div className="subtab-bar">
+            {DD_MODULES.map((m) => {
+              const s = secOf(m.key)
+              return (
+                <button key={m.key} type="button"
+                  className={classNames('subtab', activeModule === m.key && 'is-active')}
+                  onClick={() => setActiveModule(m.key)}>
+                  {m.cn}{s.status !== 'empty' ? ` · ${(DD_STATUS_TAG[s.status] ?? DD_STATUS_TAG.empty).cn}` : ''}
+                </button>
+              )
+            })}
+          </div>
+          <div className="dd-module-head">
+            <span className={`eq-tag ${activeTag.tone}`} data-testid="dd-module-status">{activeTag.cn}</span>
+            {active.updated_at ? <span className="muted-note">更新于 {dtmin(active.updated_at)}</span> : null}
+            {editModule !== activeModule && (
+              <div className="button-row" style={{ margin: 0 }}>
+                <button type="button" className="secondary-button" disabled={!canWrite}
+                  onClick={() => { setEditModule(activeModule); setEditText(active.content_md) }} data-testid="dd-edit">
+                  编辑
+                </button>
+                <button type="button" className="primary-button"
+                  disabled={!canWrite || active.status !== 'draft' || confirming}
+                  onClick={() => void confirmModule(activeModule)} data-testid="dd-confirm-section">
+                  <CheckCircle size={15} /> {active.status === 'confirmed' ? '已确认' : confirming ? '确认中…' : '确认此模块'}
+                </button>
+              </div>
+            )}
+          </div>
+          {editModule === activeModule ? (
+            <>
+              <textarea className="dd-edit-area" rows={16} value={editText}
+                onChange={(e) => setEditText(e.target.value)} data-testid="dd-edit-area" />
+              <div className="button-row" style={{ marginTop: 10 }}>
+                <button type="button" className="primary-button" disabled={savingEdit} onClick={() => void saveModule(activeModule)} data-testid="dd-save">
+                  <CheckCircle size={15} /> {savingEdit ? '保存中…' : '保存'}
+                </button>
+                <button type="button" className="secondary-button" disabled={savingEdit} onClick={() => setEditModule(null)}>取消</button>
+              </div>
+              <p className="muted-note">保存后该模块回到「草稿」,需再点「确认此模块」落定。</p>
+            </>
+          ) : active.content_md.trim() ? (
+            <Markdown text={active.content_md} />
+          ) : (
+            <p className="muted-note">「{DD_MODULE_CN[activeModule]}」还没有内容。上传一份相关材料,AI 会替你起草这一模块。</p>
+          )}
+          {active.gaps_md?.trim() ? (
+            <div className="dd-gap-card" data-testid="dd-gaps">
+              <h4><AlertTriangle size={15} /> 还缺什么</h4>
+              <Markdown text={active.gaps_md} />
+            </div>
+          ) : null}
+          {active.flags_md?.trim() ? (
+            <div className="dd-flag-card" data-testid="dd-flags">
+              <h4><AlertTriangle size={15} /> 风险提示</h4>
+              <Markdown text={active.flags_md} />
+            </div>
+          ) : null}
+        </section>
+      )}
+
+      {/* 材料清单:已归档文件 */}
+      {data.documents.length > 0 && (
+        <section className="panel full-span motion-item" data-testid="dd-documents">
+          <div className="pd-reports-head">
+            <h3>已归档尽调材料</h3>
+            <span className="muted-note">{data.documents.length} 份</span>
+          </div>
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr><th>文件名</th><th>材料类型</th><th>模块</th><th>AI 摘要</th><th>归档时间</th><th>操作</th></tr>
+              </thead>
+              <tbody>
+                {data.documents.map((d) => (
+                  <tr key={d.id}>
+                    <td>{d.filename}</td>
+                    <td><span className="eq-tag tone-blue">{d.doc_label || '—'}</span></td>
+                    <td>{DD_MODULE_CN[d.module] ?? d.module ?? '—'}</td>
+                    <td className="dd-doc-summary">{d.summary || '—'}</td>
+                    <td>{dtmin(d.created_at)}</td>
+                    <td className="eq-row-actions">
+                      <button type="button" className="link-button" onClick={() => void downloadDoc(d)}>下载</button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      )}
+
+      {pending && (
+        <DdConfirmModal
+          pending={pending}
+          committing={committing}
+          onModule={(m) => setPending((prev) => (prev ? { ...prev, module: m } : prev))}
+          onCommit={() => void commit()}
+          onClose={() => setPending(null)}
+        />
+      )}
+    </div>
+  )
+}
+
 function DetailPage({
   screen,
   canWrite,
@@ -5207,6 +5617,10 @@ function DetailPage({
                 <EquityChangeTable projectId={selectedId} canWrite={canWrite} onToast={onToast} />
               </section>
             </>
+          ) : section === '尽调' && selectedId != null ? (
+            <div className="full-span" data-testid="section-dd">
+              <DdWorkbench projectId={selectedId} projectName={entityName} canWrite={canWrite} onToast={onToast} />
+            </div>
           ) : section === '投后数据' && selectedId != null ? (
             <div className="full-span" data-testid="section-postdata">
               <PostdataDetailView projectId={selectedId} canWrite={canWrite} onToast={onToast} />
